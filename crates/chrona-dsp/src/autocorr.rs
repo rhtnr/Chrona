@@ -1,4 +1,8 @@
 //! FFT-based autocorrelation and peak location (spec §5.3).
+//!
+//! Known M1 limitation: [`fundamental_beat_lag`]'s 40 % integer-divisor walk can be
+//! defeated by extreme tic/toc loudness asymmetry. That case is definitively resolved
+//! by M2's phase-fold stage.
 
 use realfft::RealFftPlanner;
 
@@ -86,6 +90,36 @@ pub fn refine_peak_near(r: &[f32], expected_lag: f64, tolerance: f64) -> Option<
     find_peak_in_band(r, lo, hi)
 }
 
+/// Fundamental beat-period lag (spec §5.3): strongest peak in `[min_lag, max_lag]`,
+/// then repeatedly step down to any integer divisor (÷2, ÷3, ÷4) that holds a local
+/// peak with ≥ 40 % of the original candidate's value. Divisor peaks may lie below
+/// `min_lag` — the walk is exempt from the band (the band constrains the *search*,
+/// not the fundamental).
+pub fn fundamental_beat_lag(r: &[f32], min_lag: usize, max_lag: usize) -> Option<Peak> {
+    let start = find_peak_in_band(r, min_lag, max_lag)?;
+    let floor_value = 0.4 * start.value;
+    let mut current = start;
+    loop {
+        let mut stepped = false;
+        for d in 2..=4u32 {
+            let cand_lag = current.lag / d as f64;
+            if cand_lag < 8.0 {
+                continue; // too close to lag 0 to be a real beat period
+            }
+            if let Some(p) = refine_peak_near(r, cand_lag, 0.03)
+                && p.value >= floor_value
+            {
+                current = p;
+                stepped = true;
+                break; // restart divisor walk from the new, smaller lag
+            }
+        }
+        if !stepped {
+            return Some(current);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +192,43 @@ mod tests {
         let r = autocorrelate(&[0.0; 512]);
         assert!(r.iter().all(|v| v.is_finite()));
         assert!(find_peak_in_band(&r, 10, 100).is_none());
+    }
+
+    #[test]
+    fn asymmetric_tic_toc_resolves_to_beat_period() {
+        // Alternating 1.0 / 0.7 impulses every 300 samples: the strongest autocorr
+        // peak is the full oscillation (600), but the fundamental beat lag is 300.
+        let mut x = vec![0.0f32; 8192];
+        for (j, i) in (0..8192).step_by(300).enumerate() {
+            x[i] = if j % 2 == 0 { 1.0 } else { 0.7 };
+        }
+        let r = autocorrelate(&x);
+        let p = fundamental_beat_lag(&r, 120, 1080).unwrap();
+        assert!((p.lag - 300.0).abs() < 1.0, "lag {}", p.lag);
+    }
+
+    #[test]
+    fn uniform_train_is_its_own_fundamental() {
+        let mut x = vec![0.0f32; 8192];
+        for i in (0..8192).step_by(250) {
+            x[i] = 1.0;
+        }
+        let r = autocorrelate(&x);
+        let p = fundamental_beat_lag(&r, 120, 1080).unwrap();
+        assert!((p.lag - 250.0).abs() < 1.0, "lag {}", p.lag);
+    }
+
+    #[test]
+    fn triple_harmonic_walks_down() {
+        // Impulses every 200; strongest band peak may be 600 (3×) if band excludes 200?
+        // Band includes 200 — but force the walk by searching only [500, 1080] first:
+        // fundamental_beat_lag must still return ~200 via the divisor walk.
+        let mut x = vec![0.0f32; 8192];
+        for i in (0..8192).step_by(200) {
+            x[i] = 1.0;
+        }
+        let r = autocorrelate(&x);
+        let p = fundamental_beat_lag(&r, 500, 1080).unwrap();
+        assert!((p.lag - 200.0).abs() < 1.0, "lag {}", p.lag);
     }
 }
