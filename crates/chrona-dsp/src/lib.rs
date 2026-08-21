@@ -5,6 +5,7 @@ pub mod autocorr;
 pub mod bph;
 pub mod envelope;
 pub mod filter;
+pub mod period;
 pub mod synth;
 
 #[cfg(test)]
