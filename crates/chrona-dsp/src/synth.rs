@@ -2,6 +2,17 @@
 //! Ticks are 3 damped sine bursts (unlocking / impulse / drop, spec §2.1);
 //! unlocking→drop spacing comes from inverting the amplitude formula (spec §2.3).
 
+#[derive(Debug, thiserror::Error)]
+pub enum SynthError {
+    #[error(
+        "amplitude {amplitude_deg}° is below lift/2 ({lift_angle_deg}°/2); the amplitude formula is not invertible there"
+    )]
+    AmplitudeBelowLiftDomain {
+        amplitude_deg: f64,
+        lift_angle_deg: f64,
+    },
+}
+
 /// xorshift64* — tiny deterministic PRNG; no external dependency (spec §10 determinism).
 pub struct Rng(u64);
 
@@ -61,6 +72,9 @@ pub fn unlock_to_drop_dt_s(amplitude_deg: f64, lift_angle_deg: f64, t_osc_s: f64
 
 /// Add one damped sine burst at time `t0` (seconds).
 fn add_burst(x: &mut [f32], sr: f64, t0: f64, amp: f64, f_hz: f64, tau_s: f64) {
+    if t0 < 0.0 {
+        return;
+    }
     let start = (t0 * sr) as usize;
     let len = (tau_s * 6.0 * sr) as usize; // ~6τ ≈ −52 dB tail
     for i in 0..len {
@@ -70,7 +84,14 @@ fn add_burst(x: &mut [f32], sr: f64, t0: f64, amp: f64, f_hz: f64, tau_s: f64) {
     }
 }
 
-pub fn synthesize(cfg: &SynthConfig) -> Vec<f32> {
+pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
+    if cfg.amplitude_deg < cfg.lift_angle_deg / 2.0 {
+        return Err(SynthError::AmplitudeBelowLiftDomain {
+            amplitude_deg: cfg.amplitude_deg,
+            lift_angle_deg: cfg.lift_angle_deg,
+        });
+    }
+
     let sr = cfg.sample_rate_hz;
     let n = (cfg.duration_s * sr) as usize;
     let mut x = vec![0.0f32; n];
@@ -133,7 +154,7 @@ pub fn synthesize(cfg: &SynthConfig) -> Vec<f32> {
             *s *= g;
         }
     }
-    x
+    Ok(x)
 }
 
 #[cfg(test)]
@@ -146,9 +167,15 @@ mod tests {
             duration_s: 2.0,
             ..SynthConfig::default()
         };
-        assert_eq!(synthesize(&cfg), synthesize(&cfg));
+        assert_eq!(
+            synthesize(&cfg).expect("valid synth config"),
+            synthesize(&cfg).expect("valid synth config")
+        );
         let other = SynthConfig { seed: 2, ..cfg };
-        assert_ne!(synthesize(&cfg), synthesize(&other));
+        assert_ne!(
+            synthesize(&cfg).expect("valid synth config"),
+            synthesize(&other).expect("valid synth config")
+        );
     }
 
     #[test]
@@ -167,7 +194,7 @@ mod tests {
             snr_db: 60.0,         // near-clean so peaks dominate
             ..SynthConfig::default()
         };
-        let x = synthesize(&cfg);
+        let x = synthesize(&cfg).expect("valid synth config");
         let sr = cfg.sample_rate_hz;
         let t_beat = crate::bph::t_beat_s(cfg.bph) * (1.0 - cfg.rate_s_per_day / 86_400.0);
         // Find the absolute peak within each expected beat window; successive peak
@@ -200,9 +227,30 @@ mod tests {
             snr_db: 0.0,
             ..SynthConfig::default()
         };
-        let x = synthesize(&cfg);
+        let x = synthesize(&cfg).expect("valid synth config");
         assert!(x.iter().all(|s| s.is_finite()));
         let peak = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak <= 0.9 + 1e-6, "peak {peak}");
+    }
+
+    #[test]
+    fn amplitude_below_lift_domain_is_an_error() {
+        let cfg = SynthConfig {
+            amplitude_deg: 20.0,
+            lift_angle_deg: 52.0,
+            ..SynthConfig::default()
+        };
+        assert!(synthesize(&cfg).is_err());
+    }
+
+    #[test]
+    fn amplitude_at_exact_domain_boundary_is_ok() {
+        let cfg = SynthConfig {
+            amplitude_deg: 26.0,
+            lift_angle_deg: 52.0,
+            ..SynthConfig::default()
+        };
+        let x = synthesize(&cfg).expect("valid synth config");
+        assert!(x.iter().all(|s| s.is_finite()));
     }
 }
