@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/chrona-dsp"]
+members = ["crates/chrona-dsp", "crates/chrona-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -23,3 +23,10 @@ opt-level = 2
 
 [profile.test.package."*"]
 opt-level = 2
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

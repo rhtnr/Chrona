@@ -1,0 +1,25 @@
+[package]
+name = "chrona-cli"
+description = "Chrona timegrapher CLI: synthesize test signals, analyze WAV recordings"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "chrona"
+path = "src/main.rs"
+
+[dependencies]
+chrona-dsp = { path = "../chrona-dsp" }
+clap = { workspace = true }
+hound = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+
+[lints]
+workspace = true
