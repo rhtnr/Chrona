@@ -16,6 +16,8 @@ enum Cmd {
     Synth(commands::SynthArgs),
     /// Analyze a WAV recording of a mechanical watch
     Analyze(commands::AnalyzeArgs),
+    /// Run expectation files against their recordings (regression corpus)
+    Verify(commands::VerifyArgs),
 }
 
 fn main() {
@@ -44,6 +46,10 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 commands::print_human(&report);
             }
             Ok(if report.status == "ok" { 0 } else { 2 })
+        }
+        Cmd::Verify(a) => {
+            let failures = commands::run_verify(&a)?;
+            Ok(if failures == 0 { 0 } else { 1 })
         }
     }
 }

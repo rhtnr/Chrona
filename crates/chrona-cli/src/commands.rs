@@ -166,3 +166,74 @@ pub fn print_human(r: &AnalyzeReport) {
         ),
     }
 }
+
+#[derive(Args)]
+pub struct VerifyArgs {
+    /// Directory containing *.json expectations next to their WAV files
+    pub dir: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct Expectation {
+    file: String,
+    #[serde(default = "default_bph_mode")]
+    bph: String,
+    #[serde(default)]
+    ppm: f64,
+    expect_rate_s_per_day: f64,
+    tol_rate: f64,
+}
+
+fn default_bph_mode() -> String {
+    "auto".into()
+}
+
+/// Returns the number of failures.
+pub fn run_verify(a: &VerifyArgs) -> anyhow::Result<usize> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&a.dir)
+        .with_context(|| format!("read dir {}", a.dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        println!(
+            "verify: no expectations in {} — nothing to do",
+            a.dir.display()
+        );
+        return Ok(0);
+    }
+    let mut failures = 0usize;
+    for path in &entries {
+        let text = std::fs::read_to_string(path)?;
+        let exp: Expectation =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        let report = run_analyze(&AnalyzeArgs {
+            file: a.dir.join(&exp.file),
+            bph: exp.bph.clone(),
+            ppm: exp.ppm,
+            json: false,
+        })?;
+        let verdict = match report.rate_s_per_day {
+            Some(rate) if (rate - exp.expect_rate_s_per_day).abs() <= exp.tol_rate => {
+                format!(
+                    "PASS  rate {rate:+.2} s/d (want {:+.2} ± {})",
+                    exp.expect_rate_s_per_day, exp.tol_rate
+                )
+            }
+            Some(rate) => {
+                failures += 1;
+                format!(
+                    "FAIL  rate {rate:+.2} s/d (want {:+.2} ± {})",
+                    exp.expect_rate_s_per_day, exp.tol_rate
+                )
+            }
+            None => {
+                failures += 1;
+                format!("FAIL  no rate (status {})", report.status)
+            }
+        };
+        println!("{}: {verdict}", exp.file);
+    }
+    Ok(failures)
+}
