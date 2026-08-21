@@ -2,6 +2,7 @@
 //! push `f32` mono samples in, read typed estimates out.
 
 pub mod bph;
+pub mod envelope;
 pub mod filter;
 pub mod synth;
 
