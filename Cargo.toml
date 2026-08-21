@@ -23,10 +23,3 @@ opt-level = 2
 
 [profile.test.package."*"]
 opt-level = 2
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-
-[workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
