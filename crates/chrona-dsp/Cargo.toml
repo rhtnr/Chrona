@@ -1,0 +1,11 @@
+[package]
+name = "chrona-dsp"
+description = "Pure DSP core for the Chrona timegrapher: filters, envelope, beat-period estimation, metrics"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+realfft = { workspace = true }
+biquad = { workspace = true }
+thiserror = { workspace = true }
