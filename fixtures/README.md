@@ -2,13 +2,34 @@
 
 Regression recordings + expectations for `chrona verify fixtures/`.
 
-- One `<name>.json` expectation per recording (schema in the CLI: `commands.rs::Expectation`);
-  `file` is relative to this directory.
-- Committed WAVs: ≤ 60 s, 16-bit PCM, mono. Name as
-  `<movement>_<position>_<mic>.wav`, e.g. `eta2824_dial_up_contact_mic.wav`.
-- Real recordings land from M2 onward (spec §10): several movements × positions × mic
-  types, including deliberately bad laptop-mic captures and a quartz reference for
-  calibration tests. Where a hardware timegrapher reading exists, record it in the
-  expectation and note machine + settings in a comment field.
-- Synthetic cases don't get committed — `chrona synth` regenerates them (see
-  `crates/chrona-cli/tests/`).
+## Recording a fixture (spec §10)
+
+- 48 kHz mono, 60 s, 16-bit PCM (`--pcm16`-style format). Quiet room.
+- Mic against the case back or crown; a piezo contact pickup reaches Tier 3,
+  wired earbuds pressed to the crown work in a pinch, laptop mics usually give
+  Tier 1-2. Deliberately-bad captures are valuable — record them too.
+- Name as `<movement>_<position>_<mic>.wav`, e.g. `eta2824_dial_up_contact.wav`,
+  positions DU/DD/CU/CD/CL/CR.
+- If a hardware timegrapher reading exists (Weishi etc.), put its numbers in the
+  expectation and note machine + lift-angle setting in the JSON (any extra keys
+  are ignored by the runner).
+- A quartz-watch recording (≥ 5 min) doubles as the calibration reference:
+  `chrona calibrate quartz.wav`, then record the mechanical fixtures and put the
+  measured `ppm` in their expectations.
+
+## Expectation schema (one JSON per recording; `file` relative to this dir)
+
+```json
+{
+  "file": "eta2824_dial_up_contact.wav",
+  "bph": "auto",
+  "ppm": 12.5,
+  "expect_rate_s_per_day": 7.2,  "tol_rate": 1.0,
+  "expect_beat_error_ms": 0.3,   "tol_beat_error": 0.15,
+  "expect_amplitude_deg": 285.0, "tol_amplitude": 10.0
+}
+```
+
+`bph` takes auto | free | a number. The beat-error and amplitude pairs are
+optional — omit them for Tier-1 (weak-mic) fixtures. Synthetic cases are not
+committed; `chrona synth` regenerates them (see `crates/chrona-cli/tests/`).
