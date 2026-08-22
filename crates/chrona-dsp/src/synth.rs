@@ -254,6 +254,11 @@ pub fn synthesize_quartz(
     let noise_rms = 0.02f64;
     let tick_amp = noise_rms * 10f64.powf(snr_db / 20.0);
     let period = 1.0 * (1.0 + ppm_offset / 1e6);
+    if period <= 0.0 {
+        return Err(SynthError::InvalidConfig {
+            reason: format!("ppm_offset {ppm_offset} makes the tick period non-positive"),
+        });
+    }
     let mut k = 1u64;
     loop {
         let t = k as f64 * period;
@@ -263,6 +268,8 @@ pub fn synthesize_quartz(
         add_burst(&mut x, sr, t, tick_amp, 4_000.0, 0.0015);
         k += 1;
     }
+    // White noise at the configured floor. Uniform [−1,1) has RMS 1/√3, so scale
+    // by √3 to make `noise_rms` the actual RMS.
     let noise_gain = noise_rms * 3f64.sqrt();
     for s in x.iter_mut() {
         *s += (noise_gain * rng.next_f32() as f64) as f32;
@@ -468,5 +475,11 @@ mod tests {
             assert!((t_found - t).abs() < 5e-3, "tick {k} at {t_found} want {t}");
         }
         assert!(synthesize_quartz(f64::NAN, 48_000.0, 0.0, 30.0, 1).is_err());
+    }
+
+    #[test]
+    fn extreme_negative_ppm_is_an_error() {
+        assert!(synthesize_quartz(20.0, 48_000.0, -1_000_000.0, 30.0, 1).is_err());
+        assert!(synthesize_quartz(20.0, 48_000.0, -2_000_000.0, 30.0, 1).is_err());
     }
 }
