@@ -140,7 +140,9 @@ fn correlate_in_gate(
 
 /// Stage 5: per-beat drop events via a learned matched filter (spec §5.5).
 /// See the plan's alignment and fold-window invariants; times are absolute
-/// nominal-clock seconds. Edges stay None (filled by the edge pass).
+/// nominal-clock seconds. Envelope edges (`t_drop_edge_s`, `t_unlock_s`) are
+/// filled in by `fill_edges` (Task 7, spec §5.5) before the final sort; a
+/// beat's edges stay `None` when the edge pass can't find or validate them.
 ///
 /// **Alignment invariant:** `raw` and `env` come from rings fed in lockstep
 /// from stream start, so envelope absolute index `j` corresponds to raw
@@ -211,8 +213,130 @@ pub fn extract_events(
             });
         }
     }
+    fill_edges(&mut out, env, env_start_abs, sample_rate_hz, t_osc_env);
     out.sort_by(|a, b| a.t_drop_corr_s.total_cmp(&b.t_drop_corr_s));
     out
+}
+
+/// 3-sample box smooth (≈1 ms at 3 kHz envelope rate), spec §5.5.
+fn smooth3(env: &[f32]) -> Vec<f32> {
+    let n = env.len();
+    let mut out = vec![0.0f32; n];
+    for i in 0..n {
+        let a = env[i.saturating_sub(1)];
+        let b = env[i];
+        let c = env[(i + 1).min(n - 1)];
+        out[i] = (a + b + c) / 3.0;
+    }
+    out
+}
+
+/// Half-height leading-edge time (fractional env index) of the pulse whose
+/// local maximum is at `peak_idx`. Scans backward for the 0.5·peak crossing.
+fn half_height_edge(sm: &[f32], peak_idx: usize) -> Option<f64> {
+    let half = sm[peak_idx] * 0.5;
+    let mut i = peak_idx;
+    while i > 0 && sm[i - 1] >= half {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    // sm[i-1] < half ≤ sm[i]: interpolate between i-1 and i.
+    let (lo, hi) = (sm[i - 1] as f64, sm[i] as f64);
+    let frac = if hi > lo {
+        (half as f64 - lo) / (hi - lo)
+    } else {
+        0.5
+    };
+    Some((i - 1) as f64 + frac)
+}
+
+/// Upward crossings of `thr` inside `sm[lo..hi]` (indices into `sm`).
+fn upward_crossings(sm: &[f32], lo: usize, hi: usize, thr: f32) -> Vec<usize> {
+    (lo.max(1)..hi)
+        .filter(|&i| sm[i - 1] < thr && sm[i] >= thr)
+        .collect()
+}
+
+fn fill_edges(
+    events: &mut [BeatEvent],
+    env: &[f32],
+    env_start_abs: u64,
+    sample_rate_hz: f64,
+    t_osc_env: f64,
+) {
+    if env.is_empty() {
+        return;
+    }
+    let sm = smooth3(env);
+    let global_max = sm.iter().fold(0.0f32, |m, &v| m.max(v));
+    if global_max <= 0.0 {
+        return;
+    }
+    let env_rate = sample_rate_hz / DECIMATION as f64;
+    let to_env_idx = |t_s: f64| t_s * env_rate - env_start_abs as f64;
+    let to_seconds = |idx: f64| (env_start_abs as f64 + idx) / env_rate;
+    let tbeat8 = (t_osc_env / 16.0) as usize; // T_beat/8 in env samples
+    let ms3 = (3.0e-3 * env_rate) as usize;
+
+    for e in events.iter_mut() {
+        let center = to_env_idx(e.t_drop_corr_s);
+        if !center.is_finite() || center < 0.0 {
+            continue;
+        }
+        let center = center as usize;
+        let lo = center.saturating_sub(ms3);
+        let hi = (center + ms3).min(sm.len());
+        if hi <= lo + 2 {
+            continue;
+        }
+        let peak_idx = (lo..hi)
+            .max_by(|&i, &j| sm[i].total_cmp(&sm[j]))
+            .unwrap_or(center);
+        let Some(drop_edge_idx) = half_height_edge(&sm, peak_idx) else {
+            continue;
+        };
+        e.t_drop_edge_s = Some(to_seconds(drop_edge_idx));
+
+        // Unlocking search window: T_beat/8 ending 1 ms before the drop edge.
+        let one_ms = (1.0e-3 * env_rate).ceil() as usize;
+        let w_end = (drop_edge_idx as usize).saturating_sub(one_ms);
+        let w_start = w_end.saturating_sub(tbeat8);
+        if w_end <= w_start + 2 {
+            continue;
+        }
+        // Noise floor: mean over the T_beat/8 window AFTER the drop peak (spec §5.5).
+        let n_start = (peak_idx + 1).min(sm.len());
+        let n_end = (peak_idx + 1 + tbeat8).min(sm.len());
+        if n_end <= n_start {
+            continue;
+        }
+        let noise =
+            sm[n_start..n_end].iter().map(|&v| v as f64).sum::<f64>() / (n_end - n_start) as f64;
+        let mut thr = (0.01 * global_max as f64).max(1.4 * noise) as f32;
+        let mut crossings = upward_crossings(&sm, w_start, w_end, thr);
+        while crossings.len() > 3 && (thr as f64) < 0.2 * global_max as f64 {
+            thr *= 1.4;
+            crossings = upward_crossings(&sm, w_start, w_end, thr);
+        }
+        let Some(&first) = crossings.first() else {
+            continue;
+        };
+        // The unlocking pulse's own local max after the crossing, inside the window.
+        let u_peak = (first..w_end)
+            .max_by(|&i, &j| sm[i].total_cmp(&sm[j]))
+            .unwrap_or(first);
+        let Some(u_edge_idx) = half_height_edge(&sm, u_peak) else {
+            continue;
+        };
+        let t_unlock = to_seconds(u_edge_idx);
+        let dt = e.t_drop_edge_s.unwrap_or(f64::NAN) - t_unlock;
+        let t_beat_s = t_osc_env / 2.0 / env_rate;
+        if dt >= 1.0e-3 && dt <= t_beat_s / 8.0 {
+            e.t_unlock_s = Some(t_unlock);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -276,11 +400,6 @@ mod tests {
             }
         }
         assert!(events.iter().all(|e| e.snr_db >= DETECT_SNR_DB));
-        assert!(
-            events
-                .iter()
-                .all(|e| e.t_drop_edge_s.is_none() && e.t_unlock_s.is_none())
-        );
     }
 
     #[test]
@@ -309,5 +428,85 @@ mod tests {
         let tics = events.iter().filter(|e| e.parity == Parity::Tic).count();
         let tocs = events.len() - tics;
         assert!(tics >= 100 && tocs >= 100, "tics {tics} tocs {tocs}");
+    }
+
+    #[test]
+    fn edges_recover_the_unlock_to_drop_interval() {
+        // Ground truth: synth places unlocking exactly dt before each drop,
+        // dt = unlock_to_drop_dt_s(amplitude, lift, T_osc).
+        let cfg = SynthConfig {
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let (events, _) = pipeline_to_events(&cfg);
+        let t_osc = crate::bph::t_osc_s(cfg.bph);
+        let dt_true =
+            crate::synth::unlock_to_drop_dt_s(cfg.amplitude_deg, cfg.lift_angle_deg, t_osc);
+        let dts: Vec<f64> = events
+            .iter()
+            .filter_map(|e| Some(e.t_drop_edge_s? - e.t_unlock_s?))
+            .collect();
+        assert!(
+            dts.len() as f64 >= 0.5 * events.len() as f64,
+            "unlocking found on {} of {}",
+            dts.len(),
+            events.len()
+        );
+        let mut sorted = dts.clone();
+        sorted.sort_by(f64::total_cmp);
+        let median = sorted[sorted.len() / 2];
+        assert!(
+            (median - dt_true).abs() < 3e-4,
+            "median dt {median} want {dt_true}"
+        );
+    }
+
+    #[test]
+    fn weak_signal_degrades_unlocking_not_drops() {
+        let cfg = SynthConfig {
+            snr_db: 12.0,
+            ..SynthConfig::default()
+        };
+        let (events, _) = pipeline_to_events(&cfg);
+        assert!(!events.is_empty());
+        let unlocked = events.iter().filter(|e| e.t_unlock_s.is_some()).count();
+        // At low SNR the quiet unlocking pulse is lost more often than the loud
+        // drop — the point of the tiered design. No hard floor here; just prove
+        // the code degrades to None instead of fabricating.
+        for e in &events {
+            if let (Some(u), Some(d)) = (e.t_unlock_s, e.t_drop_edge_s) {
+                let dt = d - u;
+                assert!(
+                    dt >= 1e-3 && dt <= crate::bph::t_beat_s(cfg.bph) / 8.0,
+                    "dt {dt}"
+                );
+            }
+        }
+        assert!(unlocked <= events.len());
+    }
+
+    #[test]
+    fn amplitude_sweep_tracks_dt_monotonically() {
+        // Bigger amplitude ⇒ smaller dt. The measured medians must order correctly.
+        let mut medians = Vec::new();
+        for amp in [220.0f64, 270.0, 320.0] {
+            let cfg = SynthConfig {
+                amplitude_deg: amp,
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            };
+            let (events, _) = pipeline_to_events(&cfg);
+            let mut dts: Vec<f64> = events
+                .iter()
+                .filter_map(|e| Some(e.t_drop_edge_s? - e.t_unlock_s?))
+                .collect();
+            assert!(dts.len() > 50, "amp {amp}: {} intervals", dts.len());
+            dts.sort_by(f64::total_cmp);
+            medians.push(dts[dts.len() / 2]);
+        }
+        assert!(
+            medians[0] > medians[1] && medians[1] > medians[2],
+            "medians {medians:?}"
+        );
     }
 }

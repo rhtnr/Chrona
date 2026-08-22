@@ -50,6 +50,7 @@ pub fn fold_envelope(env: &[f32], t_osc_env: f64) -> Option<FoldProfile> {
     if !(t_osc_env.is_finite() && t_osc_env > 1.0) {
         return None;
     }
+    // events::extract_events recomputes this window arithmetic (cycles/usable/fold_start) — keep both sites in sync.
     let cycles = (env.len() as f64 / t_osc_env).floor() as usize;
     if cycles < 8 {
         return None;
