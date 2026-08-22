@@ -2,6 +2,7 @@
 //! band-passed signal, plus envelope-edge extraction (Task 7).
 
 use crate::envelope::DECIMATION;
+use crate::filter::Butterworth;
 use crate::fold::FoldProfile;
 
 /// Correlation-peak SNR (dB) below which a beat is not emitted.
@@ -143,6 +144,10 @@ fn correlate_in_gate(
 /// nominal-clock seconds. Envelope edges (`t_drop_edge_s`, `t_unlock_s`) are
 /// filled in by `fill_edges` (Task 7, spec §5.5) before the final sort; a
 /// beat's edges stay `None` when the edge pass can't find or validate them.
+/// `fill_edges` re-derives its own native-rate envelope from `raw` per
+/// event (see its doc comment) rather than using the decimated `env`, so
+/// `env` is passed to it only for the coarse, whole-stream `global_max`
+/// scale.
 ///
 /// **Alignment invariant:** `raw` and `env` come from rings fed in lockstep
 /// from stream start, so envelope absolute index `j` corresponds to raw
@@ -213,26 +218,14 @@ pub fn extract_events(
             });
         }
     }
-    fill_edges(&mut out, env, env_start_abs, sample_rate_hz, t_osc_env);
+    fill_edges(&mut out, raw, raw_start_abs, env, sample_rate_hz, t_osc_env);
     out.sort_by(|a, b| a.t_drop_corr_s.total_cmp(&b.t_drop_corr_s));
     out
 }
 
-/// 3-sample box smooth (≈1 ms at 3 kHz envelope rate), spec §5.5.
-fn smooth3(env: &[f32]) -> Vec<f32> {
-    let n = env.len();
-    let mut out = vec![0.0f32; n];
-    for i in 0..n {
-        let a = env[i.saturating_sub(1)];
-        let b = env[i];
-        let c = env[(i + 1).min(n - 1)];
-        out[i] = (a + b + c) / 3.0;
-    }
-    out
-}
-
-/// Half-height leading-edge time (fractional env index) of the pulse whose
-/// local maximum is at `peak_idx`. Scans backward for the 0.5·peak crossing.
+/// Half-height leading-edge time (fractional index into `sm`) of the pulse
+/// whose local maximum is at `peak_idx`. Scans backward for the 0.5·peak
+/// crossing.
 fn half_height_edge(sm: &[f32], peak_idx: usize) -> Option<f64> {
     let half = sm[peak_idx] * 0.5;
     let mut i = peak_idx;
@@ -259,80 +252,120 @@ fn upward_crossings(sm: &[f32], lo: usize, hi: usize, thr: f32) -> Vec<usize> {
         .collect()
 }
 
+/// Fills in `t_drop_edge_s`/`t_unlock_s` per event (Task 7, spec §5.5).
+///
+/// Half-height edge timing needs sub-millisecond precision: the amplitude
+/// formula's sensitivity to the unlock-to-drop interval Δt grows sharply as
+/// Δt shrinks (high amplitude), so a Δt bias of only ~0.1 ms can blow the
+/// amplitude gate's ±5° bar even though it easily clears this module's own
+/// ±0.3 ms bar (task-9 fix report: measured median bias 0.05–0.15 ms,
+/// growing with amplitude, on the pre-decimated 3 kHz envelope — a
+/// resolution ceiling that no amount of local interpolation cleverness
+/// removed). So instead of reusing the already-decimated `env`, each event
+/// gets its own small window of `raw` rectified and low-pass filtered fresh
+/// at native rate (same cutoff as `EnvelopeExtractor`, spec §5.2, just
+/// without its ÷16 decimation) immediately before edge-finding. `env` is
+/// only used for `global_max`, a coarse whole-stream scale for the
+/// threshold floor below — decimated resolution is fine for that.
 fn fill_edges(
     events: &mut [BeatEvent],
+    raw: &[f32],
+    raw_start_abs: u64,
     env: &[f32],
-    env_start_abs: u64,
     sample_rate_hz: f64,
     t_osc_env: f64,
 ) {
-    if env.is_empty() {
+    if raw.is_empty() || env.is_empty() {
         return;
     }
-    let sm = smooth3(env);
-    let global_max = sm.iter().fold(0.0f32, |m, &v| m.max(v));
+    let global_max = env.iter().fold(0.0f32, |m, &v| m.max(v));
     if global_max <= 0.0 {
         return;
     }
-    let env_rate = sample_rate_hz / DECIMATION as f64;
-    let to_env_idx = |t_s: f64| t_s * env_rate - env_start_abs as f64;
-    let to_seconds = |idx: f64| (env_start_abs as f64 + idx) / env_rate;
-    let tbeat8 = (t_osc_env / 16.0) as usize; // T_beat/8 in env samples
-    let ms3 = (3.0e-3 * env_rate) as usize;
+    let cutoff_hz = (0.45 * sample_rate_hz / DECIMATION as f64).min(1_500.0);
+    let tbeat8 = (t_osc_env / 16.0 * DECIMATION as f64) as usize; // T_beat/8, raw samples
+    let one_ms = (1.0e-3 * sample_rate_hz).ceil() as usize;
+    let ms3 = (3.0e-3 * sample_rate_hz) as usize;
+    // Each event gets a freshly-seeded filter (events aren't in stream order
+    // here — they're grouped by parity, sorted only after this pass), so its
+    // window needs enough lead-in for the filter's own state to settle
+    // before reaching the region actually used below.
+    let settle = (0.015 * sample_rate_hz) as usize;
+    let margin = tbeat8 + one_ms + ms3;
 
     for e in events.iter_mut() {
-        let center = to_env_idx(e.t_drop_corr_s);
-        if !center.is_finite() || center < 0.0 {
+        let center_f = e.t_drop_corr_s * sample_rate_hz - raw_start_abs as f64;
+        if !center_f.is_finite() || center_f < 0.0 {
             continue;
         }
-        let center = center as usize;
-        let lo = center.saturating_sub(ms3);
-        let hi = (center + ms3).min(sm.len());
+        let center = center_f as usize;
+        // Require the FULL window (settle pad + both margins); a beat within
+        // `margin+settle` of either end of `raw` gets no edges rather than a
+        // silently truncated (and potentially badly wrong) one -- same
+        // graceful-degrade-to-None philosophy as everywhere else here.
+        let need_lo = margin + settle;
+        if center < need_lo || center + margin > raw.len() {
+            continue;
+        }
+        let win_lo = center - need_lo;
+        let win_hi = center + margin;
+        let Ok(mut lp) = Butterworth::low_pass(sample_rate_hz, cutoff_hz) else {
+            continue;
+        };
+        let local: Vec<f32> = raw[win_lo..win_hi]
+            .iter()
+            .map(|&s| lp.process(s.abs()))
+            .collect();
+        let to_seconds =
+            |local_idx: f64| (raw_start_abs as f64 + win_lo as f64 + local_idx) / sample_rate_hz;
+        let center_local = center - win_lo;
+
+        let lo = center_local.saturating_sub(ms3);
+        let hi = (center_local + ms3).min(local.len());
         if hi <= lo + 2 {
             continue;
         }
         let peak_idx = (lo..hi)
-            .max_by(|&i, &j| sm[i].total_cmp(&sm[j]))
-            .unwrap_or(center);
-        let Some(drop_edge_idx) = half_height_edge(&sm, peak_idx) else {
+            .max_by(|&i, &j| local[i].total_cmp(&local[j]))
+            .unwrap_or(center_local);
+        let Some(drop_edge_idx) = half_height_edge(&local, peak_idx) else {
             continue;
         };
         e.t_drop_edge_s = Some(to_seconds(drop_edge_idx));
 
         // Unlocking search window: T_beat/8 ending 1 ms before the drop edge.
-        let one_ms = (1.0e-3 * env_rate).ceil() as usize;
         let w_end = (drop_edge_idx as usize).saturating_sub(one_ms);
         let w_start = w_end.saturating_sub(tbeat8);
         if w_end <= w_start + 2 {
             continue;
         }
         // Noise floor: mean over the T_beat/8 window AFTER the drop peak (spec §5.5).
-        let n_start = (peak_idx + 1).min(sm.len());
-        let n_end = (peak_idx + 1 + tbeat8).min(sm.len());
+        let n_start = (peak_idx + 1).min(local.len());
+        let n_end = (peak_idx + 1 + tbeat8).min(local.len());
         if n_end <= n_start {
             continue;
         }
         let noise =
-            sm[n_start..n_end].iter().map(|&v| v as f64).sum::<f64>() / (n_end - n_start) as f64;
+            local[n_start..n_end].iter().map(|&v| v as f64).sum::<f64>() / (n_end - n_start) as f64;
         let mut thr = (0.01 * global_max as f64).max(1.4 * noise) as f32;
-        let mut crossings = upward_crossings(&sm, w_start, w_end, thr);
+        let mut crossings = upward_crossings(&local, w_start, w_end, thr);
         while crossings.len() > 3 && (thr as f64) < 0.2 * global_max as f64 {
             thr *= 1.4;
-            crossings = upward_crossings(&sm, w_start, w_end, thr);
+            crossings = upward_crossings(&local, w_start, w_end, thr);
         }
         let Some(&first) = crossings.first() else {
             continue;
         };
         // The unlocking pulse's own local max after the crossing, inside the window.
         let u_peak = (first..w_end)
-            .max_by(|&i, &j| sm[i].total_cmp(&sm[j]))
+            .max_by(|&i, &j| local[i].total_cmp(&local[j]))
             .unwrap_or(first);
-        let Some(u_edge_idx) = half_height_edge(&sm, u_peak) else {
+        let Some(u_edge_idx) = half_height_edge(&local, u_peak) else {
             continue;
         };
         let t_unlock = to_seconds(u_edge_idx);
         let dt = e.t_drop_edge_s.unwrap_or(f64::NAN) - t_unlock;
-        let t_beat_s = t_osc_env / 2.0 / env_rate;
+        let t_beat_s = t_osc_env / 2.0 / (sample_rate_hz / DECIMATION as f64);
         if dt >= 1.0e-3 && dt <= t_beat_s / 8.0 {
             e.t_unlock_s = Some(t_unlock);
         }
