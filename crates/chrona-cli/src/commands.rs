@@ -205,7 +205,8 @@ pub fn run_verify(a: &VerifyArgs) -> anyhow::Result<usize> {
     }
     let mut failures = 0usize;
     for path in &entries {
-        let text = std::fs::read_to_string(path)?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let exp: Expectation =
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         let report = run_analyze(&AnalyzeArgs {
