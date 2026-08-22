@@ -109,6 +109,7 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
         sample_rate_hz: sr,
         bph_mode: parse_bph_mode(&a.bph)?,
         ppm_correction: a.ppm,
+        ..AnalyzerConfig::default()
     })?;
     analyzer.push_samples(&samples);
     let duration_s = samples.len() as f64 / sr;
@@ -129,7 +130,7 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
         Some(est) => AnalyzeReport {
             bph_detected: Some(est.bph_detected),
             bph_nominal: est.bph_nominal,
-            rate_s_per_day: est.seconds_per_day,
+            rate_s_per_day: est.rate_s_per_day,
             period_sigma_s: Some(est.period.sigma_s),
             window_s: Some(est.period.window_s),
             calibrated: est.calibrated,

@@ -1,16 +1,26 @@
-//! Streaming analyzer: precondition → envelope → period → rate (spec §5, stages 1–3 + 6).
+//! Streaming analyzer: precondition → envelope → period → fold → events → regression → amplitude → tier (spec §5, stages 1–7).
 
-use crate::envelope::EnvelopeExtractor;
+use crate::envelope::{DECIMATION, EnvelopeExtractor};
+use crate::events::{BeatEvent, extract_events};
 use crate::filter::{Butterworth, DcBlocker, FilterError};
+use crate::fold::fold_with_octave_guard;
+use crate::metrics::{AmplitudeGateFail, amplitude_from_events, regress_unlocking};
 use crate::period::{PeriodEstimate, PeriodEstimator};
+use crate::ring::SampleRing;
+use crate::tier::{Tier, assign_tier};
+
+#[derive(Debug, thiserror::Error)]
+pub enum AnalyzerError {
+    #[error(transparent)]
+    Filter(#[from] FilterError),
+    #[error("invalid analyzer config: {reason}")]
+    InvalidConfig { reason: String },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BphMode {
-    /// Detect and snap to the standard table (spec §2.2).
     Auto,
-    /// User-pinned nominal BPH.
     Fixed(u32),
-    /// Report detection only; no rate (no nominal reference — spec §3.1).
     Free,
 }
 
@@ -20,6 +30,10 @@ pub struct AnalyzerConfig {
     pub bph_mode: BphMode,
     /// Audio-clock correction in ppm (spec §3.4). 0.0 = uncalibrated.
     pub ppm_correction: f64,
+    /// Lift angle in degrees (spec §2.3; default 52, valid 10–90).
+    pub lift_angle_deg: f64,
+    /// Stage-6 averaging window in seconds (spec §2.3; default 30, valid 2–60).
+    pub averaging_s: f64,
 }
 
 impl Default for AnalyzerConfig {
@@ -28,19 +42,42 @@ impl Default for AnalyzerConfig {
             sample_rate_hz: 48_000.0,
             bph_mode: BphMode::Auto,
             ppm_correction: 0.0,
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateSource {
+    PeriodSlope,
+    UnlockingRegression,
+}
+
 #[derive(Debug, Clone, Copy)]
-pub struct RateEstimate {
-    pub period: PeriodEstimate,
-    /// Clock-corrected detected beats per hour.
+pub struct Quality {
+    pub detection_ratio: f64,
+    pub onset_jitter_ms: Option<f64>,
+    pub mean_beat_snr_db: Option<f64>,
+    pub unlocking_ratio: f64,
+    pub clipped_samples: u64,
+    pub amplitude_gate: Option<AmplitudeGateFail>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsSnapshot {
+    pub tier: Tier,
     pub bph_detected: f64,
-    /// The nominal reference in force (snapped, or the Fixed pin), if any.
     pub bph_nominal: Option<u32>,
-    /// Rate vs nominal, s/day, positive = fast. None when no defensible nominal (spec §3.1).
-    pub seconds_per_day: Option<f64>,
+    /// s/day, positive = fast; None when no defensible nominal (spec §3.1).
+    pub rate_s_per_day: Option<f64>,
+    pub rate_source: RateSource,
+    /// Only at tier ≥ T2.
+    pub beat_error_ms: Option<f64>,
+    /// Only at T3.
+    pub amplitude_deg: Option<f64>,
+    pub period: PeriodEstimate,
+    pub quality: Quality,
     pub calibrated: bool,
 }
 
@@ -50,70 +87,224 @@ pub struct Analyzer {
     hp: Butterworth,
     envelope: EnvelopeExtractor,
     period: PeriodEstimator,
+    raw_ring: SampleRing,
+    env_ring: SampleRing,
+    clipped: u64,
     scratch: Vec<f32>,
 }
 
 impl Analyzer {
-    pub fn new(config: AnalyzerConfig) -> Result<Self, FilterError> {
+    pub fn new(config: AnalyzerConfig) -> Result<Self, AnalyzerError> {
+        for (name, v, lo, hi) in [
+            ("lift_angle_deg", config.lift_angle_deg, 10.0, 90.0),
+            ("averaging_s", config.averaging_s, 2.0, 60.0),
+        ] {
+            if !v.is_finite() || !(lo..=hi).contains(&v) {
+                return Err(AnalyzerError::InvalidConfig {
+                    reason: format!("{name} = {v} outside [{lo}, {hi}]"),
+                });
+            }
+        }
         let envelope = EnvelopeExtractor::new(config.sample_rate_hz)?;
         let period = PeriodEstimator::new(envelope.envelope_rate_hz());
+        // Ring-capacity invariant: +DECIMATION keeps env_start·16 inside the raw ring
+        // (decimation-phase remainder ≤ 15) so the aligned copy in current() succeeds.
+        let raw_cap = (32.0 * config.sample_rate_hz) as usize + DECIMATION;
+        let env_cap = (32.0 * config.sample_rate_hz) as usize / DECIMATION;
         Ok(Analyzer {
             config,
             dc: DcBlocker::new(),
-            hp: Butterworth::high_pass(config.sample_rate_hz, 3_000.0)?, // spec §5.1
+            hp: Butterworth::high_pass(config.sample_rate_hz, 3_000.0)?,
             envelope,
             period,
+            raw_ring: SampleRing::new(raw_cap),
+            env_ring: SampleRing::new(env_cap),
+            clipped: 0,
             scratch: Vec::new(),
         })
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) {
+        self.clipped += samples.iter().filter(|s| s.abs() >= 0.999).count() as u64;
         self.scratch.clear();
         self.scratch.reserve(samples.len());
         for &s in samples {
             self.scratch.push(self.hp.process(self.dc.process(s)));
         }
         let filtered = std::mem::take(&mut self.scratch);
-        let mut env_out = Vec::with_capacity(filtered.len() / crate::envelope::DECIMATION + 1);
+        self.raw_ring.push_slice(&filtered);
+        let mut env_out = Vec::with_capacity(filtered.len() / DECIMATION + 1);
         self.envelope.process(&filtered, &mut env_out);
+        self.env_ring.push_slice(&env_out);
         self.period.push_envelope(&env_out);
-        self.scratch = filtered; // reuse the allocation next call
+        self.scratch = filtered;
     }
 
-    pub fn current(&self) -> Option<RateEstimate> {
-        let raw = self.period.estimate()?;
-        // Spec §3.4: sr_eff = sr_nom·(1 + ppm/1e6) ⇒ true seconds = nominal seconds / (1 + ppm/1e6).
+    pub fn current(&self) -> Option<MetricsSnapshot> {
+        let raw_est = self.period.estimate()?;
         let clock = 1.0 + self.config.ppm_correction / 1e6;
-        let period = PeriodEstimate {
-            t_osc_s: raw.t_osc_s / clock,
-            sigma_s: raw.sigma_s / clock,
-            window_s: raw.window_s,
-        };
-        let bph_detected = crate::bph::bph_from_t_osc(period.t_osc_s);
+        let sr = self.config.sample_rate_hz;
+        let env_rate = self.envelope.envelope_rate_hz();
 
-        let (bph_nominal, seconds_per_day) = match self.config.bph_mode {
+        let mut env_window = Vec::new();
+        self.env_ring
+            .copy_last(self.env_ring.len(), &mut env_window);
+        let env_start_abs = self.env_ring.start_index();
+
+        let folded = fold_with_octave_guard(&env_window, raw_est.t_osc_s * env_rate);
+        let (profile, halved) = match folded {
+            Some(p) => p,
+            None => return Some(self.tier1_snapshot(raw_est, clock, None)),
+        };
+        let halving = if halved { 2.0 } else { 1.0 };
+        let t_osc_nominal = raw_est.t_osc_s / halving;
+        let corrected = PeriodEstimate {
+            t_osc_s: t_osc_nominal / clock,
+            sigma_s: raw_est.sigma_s / halving / clock,
+            window_s: raw_est.window_s,
+        };
+
+        let mut raw_window = Vec::new();
+        let ok = self.raw_ring.copy_range_abs(
+            env_start_abs * DECIMATION as u64,
+            env_window.len() * DECIMATION,
+            &mut raw_window,
+        );
+        if !ok {
+            return Some(self.tier1_snapshot(raw_est, clock, Some(halving)));
+        }
+
+        let events = extract_events(
+            &raw_window,
+            env_start_abs * DECIMATION as u64,
+            &env_window,
+            env_start_abs,
+            sr,
+            &profile,
+        );
+        let newest_time = self.raw_ring.total_pushed() as f64 / sr;
+        let recent: Vec<BeatEvent> = events
+            .into_iter()
+            .filter(|e| e.t_drop_corr_s >= newest_time - self.config.averaging_s)
+            .collect();
+
+        let span = self
+            .config
+            .averaging_s
+            .min(env_window.len() as f64 / env_rate);
+        let expected = (span / (t_osc_nominal / 2.0)).round().max(1.0);
+        let detection_ratio = (recent.len() as f64 / expected).min(1.0);
+        let unlocking_ratio = if recent.is_empty() {
+            0.0
+        } else {
+            recent.iter().filter(|e| e.t_unlock_s.is_some()).count() as f64 / recent.len() as f64
+        };
+        let mean_beat_snr_db = if recent.is_empty() {
+            None
+        } else {
+            Some(recent.iter().map(|e| e.snr_db as f64).sum::<f64>() / recent.len() as f64)
+        };
+
+        let regression = regress_unlocking(&recent);
+        let amplitude = amplitude_from_events(&recent, t_osc_nominal, self.config.lift_angle_deg);
+        let onset_jitter_ms = regression.map(|r| r.jitter_ms / clock);
+        let tier = assign_tier(
+            detection_ratio,
+            onset_jitter_ms,
+            unlocking_ratio,
+            amplitude.is_ok(),
+        );
+
+        let bph_detected = crate::bph::bph_from_t_osc(corrected.t_osc_s);
+        let (bph_nominal, period_rate) = self.resolve_mode(bph_detected, corrected.t_osc_s);
+        // R2 (rate-source honesty gate): gate on the MODE-RESOLVED rate being
+        // present, not just a nominal existing — a Fixed-mode >3% mismatch
+        // resolves to (Some(nom), None) and must not be papered over with a
+        // regression-derived rate (see fixed_mode_rejects_gross_mismatch).
+        let (rate_s_per_day, rate_source) = match (bph_nominal, period_rate, regression) {
+            (Some(nom), Some(_), Some(r)) if tier >= Tier::T2 => {
+                let t_beat_nom = crate::bph::t_beat_s(nom);
+                let rate = 86_400.0 * (t_beat_nom - r.t_beat_s / clock) / t_beat_nom;
+                (Some(rate), RateSource::UnlockingRegression)
+            }
+            _ => (period_rate, RateSource::PeriodSlope),
+        };
+
+        Some(MetricsSnapshot {
+            tier,
+            bph_detected,
+            bph_nominal,
+            rate_s_per_day,
+            rate_source,
+            beat_error_ms: (tier >= Tier::T2)
+                .then(|| regression.map(|r| r.beat_error_ms / clock))
+                .flatten(),
+            amplitude_deg: (tier == Tier::T3)
+                .then(|| amplitude.as_ref().ok().map(|a| a.degrees))
+                .flatten(),
+            period: corrected,
+            quality: Quality {
+                detection_ratio,
+                onset_jitter_ms,
+                mean_beat_snr_db,
+                unlocking_ratio,
+                clipped_samples: self.clipped,
+                amplitude_gate: amplitude.err(),
+            },
+            calibrated: self.config.ppm_correction != 0.0,
+        })
+    }
+
+    /// Fallback when fold/alignment can't run yet: period metrics only.
+    fn tier1_snapshot(
+        &self,
+        raw_est: PeriodEstimate,
+        clock: f64,
+        halving: Option<f64>,
+    ) -> MetricsSnapshot {
+        let halving = halving.unwrap_or(1.0);
+        let corrected = PeriodEstimate {
+            t_osc_s: raw_est.t_osc_s / halving / clock,
+            sigma_s: raw_est.sigma_s / halving / clock,
+            window_s: raw_est.window_s,
+        };
+        let bph_detected = crate::bph::bph_from_t_osc(corrected.t_osc_s);
+        let (bph_nominal, rate) = self.resolve_mode(bph_detected, corrected.t_osc_s);
+        MetricsSnapshot {
+            tier: Tier::T1,
+            bph_detected,
+            bph_nominal,
+            rate_s_per_day: rate,
+            rate_source: RateSource::PeriodSlope,
+            beat_error_ms: None,
+            amplitude_deg: None,
+            period: corrected,
+            quality: Quality {
+                detection_ratio: 0.0,
+                onset_jitter_ms: None,
+                mean_beat_snr_db: None,
+                unlocking_ratio: 0.0,
+                clipped_samples: self.clipped,
+                amplitude_gate: None,
+            },
+            calibrated: self.config.ppm_correction != 0.0,
+        }
+    }
+
+    /// M1's BPH-mode honesty rules, unchanged (spec §3.1).
+    fn resolve_mode(&self, bph_detected: f64, t_osc_s: f64) -> (Option<u32>, Option<f64>) {
+        match self.config.bph_mode {
             BphMode::Free => (None, None),
             BphMode::Auto => match crate::bph::snap_to_table(bph_detected) {
-                Some(nom) => (
-                    Some(nom),
-                    Some(crate::bph::rate_s_per_day(period.t_osc_s, nom)),
-                ),
+                Some(nom) => (Some(nom), Some(crate::bph::rate_s_per_day(t_osc_s, nom))),
                 None => (None, None),
             },
             BphMode::Fixed(nom) => {
                 let dev = (bph_detected - nom as f64).abs() / nom as f64;
-                let rate = (dev <= 0.03).then(|| crate::bph::rate_s_per_day(period.t_osc_s, nom));
+                let rate = (dev <= 0.03).then(|| crate::bph::rate_s_per_day(t_osc_s, nom));
                 (Some(nom), rate)
             }
-        };
-
-        Some(RateEstimate {
-            period,
-            bph_detected,
-            bph_nominal,
-            seconds_per_day,
-            calibrated: self.config.ppm_correction != 0.0,
-        })
+        }
     }
 }
 
@@ -122,12 +313,13 @@ mod tests {
     use super::*;
     use crate::synth::{SynthConfig, synthesize};
 
-    fn analyze(cfg: &SynthConfig, mode: BphMode, ppm: f64) -> Option<RateEstimate> {
+    fn analyze(cfg: &SynthConfig, mode: BphMode, ppm: f64) -> Option<MetricsSnapshot> {
         let x = synthesize(cfg).expect("valid synth config");
         let mut a = Analyzer::new(AnalyzerConfig {
             sample_rate_hz: cfg.sample_rate_hz,
             bph_mode: mode,
             ppm_correction: ppm,
+            ..AnalyzerConfig::default()
         })
         .unwrap();
         a.push_samples(&x);
@@ -149,7 +341,7 @@ mod tests {
                 let est = analyze(&cfg, BphMode::Auto, 0.0)
                     .unwrap_or_else(|| panic!("no estimate: bph {bph} rate {rate}"));
                 assert_eq!(est.bph_nominal, Some(bph), "bph {bph} rate {rate}");
-                let got = est.seconds_per_day.expect("auto+snap must produce a rate");
+                let got = est.rate_s_per_day.expect("auto+snap must produce a rate");
                 assert!(
                     (got - rate).abs() < 0.5,
                     "bph {bph}: want {rate}, got {got}"
@@ -168,7 +360,7 @@ mod tests {
                 ..SynthConfig::default()
             };
             let est = analyze(&cfg, BphMode::Auto, 0.0).expect("10 dB must estimate");
-            let got = est.seconds_per_day.expect("rate");
+            let got = est.rate_s_per_day.expect("rate");
             assert!((got - rate).abs() < 1.0, "want {rate}, got {got}");
         }
     }
@@ -182,13 +374,13 @@ mod tests {
             ..SynthConfig::default()
         };
         let uncal = analyze(&cfg, BphMode::Auto, 0.0).unwrap();
-        assert!((uncal.seconds_per_day.unwrap() - apparent).abs() < 0.5);
+        assert!((uncal.rate_s_per_day.unwrap() - apparent).abs() < 0.5);
         assert!(!uncal.calibrated);
         let cal = analyze(&cfg, BphMode::Auto, 50.0).unwrap();
         assert!(
-            cal.seconds_per_day.unwrap().abs() < 0.5,
+            cal.rate_s_per_day.unwrap().abs() < 0.5,
             "corrected {:?}",
-            cal.seconds_per_day
+            cal.rate_s_per_day
         );
         assert!(cal.calibrated);
     }
@@ -197,7 +389,7 @@ mod tests {
     fn free_mode_reports_detection_but_no_rate() {
         let cfg = SynthConfig::default();
         let est = analyze(&cfg, BphMode::Free, 0.0).unwrap();
-        assert!(est.seconds_per_day.is_none());
+        assert!(est.rate_s_per_day.is_none());
         assert!(est.bph_nominal.is_none());
         assert!((est.bph_detected - 28_800.0).abs() < 30.0);
     }
@@ -206,9 +398,9 @@ mod tests {
     fn fixed_mode_rejects_gross_mismatch() {
         let cfg = SynthConfig::default(); // 28,800 bph signal
         let ok = analyze(&cfg, BphMode::Fixed(28_800), 0.0).unwrap();
-        assert!(ok.seconds_per_day.is_some());
+        assert!(ok.rate_s_per_day.is_some());
         let wrong = analyze(&cfg, BphMode::Fixed(18_000), 0.0).unwrap();
-        assert!(wrong.seconds_per_day.is_none(), "3 % mismatch guard");
+        assert!(wrong.rate_s_per_day.is_none(), "3 % mismatch guard");
         assert_eq!(wrong.bph_nominal, Some(18_000)); // the pin is still reported
     }
 
@@ -224,6 +416,7 @@ mod tests {
                 sample_rate_hz: cfg.sample_rate_hz,
                 bph_mode: BphMode::Auto,
                 ppm_correction: 0.0,
+                ..AnalyzerConfig::default()
             })
             .unwrap()
         };
@@ -242,5 +435,105 @@ mod tests {
         let mut a = Analyzer::new(AnalyzerConfig::default()).unwrap();
         a.push_samples(&vec![0.0f32; 48_000 * 10]);
         assert!(a.current().is_none());
+    }
+
+    #[test]
+    fn full_metrics_at_tier3() {
+        let cfg = SynthConfig {
+            beat_error_ms: 0.8,
+            amplitude_deg: 270.0,
+            rate_s_per_day: 12.0,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let est = analyze(&cfg, BphMode::Auto, 0.0).expect("snapshot");
+        assert_eq!(est.tier, crate::tier::Tier::T3);
+        assert_eq!(est.rate_source, RateSource::UnlockingRegression);
+        let be = est.beat_error_ms.expect("beat error at T3");
+        assert!((be - 0.8).abs() <= 0.1, "be {be}");
+        let amp = est.amplitude_deg.expect("amplitude at T3");
+        assert!((amp - 270.0).abs() <= 5.0, "amp {amp}");
+        let rate = est.rate_s_per_day.expect("rate");
+        assert!((rate - 12.0).abs() <= 0.3, "rate {rate}");
+        assert!(est.quality.detection_ratio > 0.8);
+    }
+
+    #[test]
+    fn degradation_order_as_snr_falls() {
+        let t3 = analyze(
+            &SynthConfig {
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            },
+            BphMode::Auto,
+            0.0,
+        )
+        .expect("30 dB");
+        assert_eq!(t3.tier, crate::tier::Tier::T3);
+        let low = analyze(
+            &SynthConfig {
+                snr_db: 10.0,
+                ..SynthConfig::default()
+            },
+            BphMode::Auto,
+            0.0,
+        )
+        .expect("10 dB");
+        assert!(low.tier <= crate::tier::Tier::T2, "tier {:?}", low.tier);
+        assert!(low.amplitude_deg.is_none(), "no fabricated amplitude");
+        assert!(low.rate_s_per_day.is_some(), "rate survives at low SNR");
+    }
+
+    #[test]
+    fn octave_error_is_corrected_end_to_end() {
+        // toc_gain 0.1 defeats the divisor walk; M1 would have reported 14400.
+        let cfg = SynthConfig {
+            toc_gain: 0.1,
+            snr_db: 35.0,
+            ..SynthConfig::default()
+        };
+        let est = analyze(&cfg, BphMode::Auto, 0.0).expect("snapshot");
+        assert_eq!(
+            est.bph_nominal,
+            Some(28_800),
+            "octave guard failed: {:?}",
+            est.bph_detected
+        );
+    }
+
+    #[test]
+    fn clip_counter_accumulates() {
+        let mut a = Analyzer::new(AnalyzerConfig::default()).unwrap();
+        a.push_samples(&vec![1.5f32; 100]);
+        a.push_samples(&vec![0.0f32; 48_000]);
+        // No beat → None, but the counter lives on the analyzer; push a synth
+        // signal and confirm it survives into the snapshot.
+        let x = synthesize(&SynthConfig::default()).unwrap();
+        a.push_samples(&x);
+        let est = a.current().expect("snapshot");
+        assert!(est.quality.clipped_samples >= 100);
+    }
+
+    #[test]
+    fn config_validation_rejects_bad_lift_and_averaging() {
+        for cfg in [
+            AnalyzerConfig {
+                lift_angle_deg: 5.0,
+                ..AnalyzerConfig::default()
+            },
+            AnalyzerConfig {
+                averaging_s: 100.0,
+                ..AnalyzerConfig::default()
+            },
+            AnalyzerConfig {
+                lift_angle_deg: f64::NAN,
+                ..AnalyzerConfig::default()
+            },
+        ] {
+            assert!(matches!(
+                Analyzer::new(cfg),
+                Err(AnalyzerError::InvalidConfig { .. })
+            ));
+        }
     }
 }

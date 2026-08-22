@@ -12,9 +12,13 @@ pub mod metrics;
 pub mod period;
 pub mod ring;
 pub mod synth;
+pub mod tier;
 
-pub use analyzer::{Analyzer, AnalyzerConfig, BphMode, RateEstimate};
+pub use analyzer::{
+    Analyzer, AnalyzerConfig, AnalyzerError, BphMode, MetricsSnapshot, Quality, RateSource,
+};
 pub use period::PeriodEstimate;
+pub use tier::Tier;
 
 #[cfg(test)]
 mod smoke {

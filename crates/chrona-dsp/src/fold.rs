@@ -226,7 +226,12 @@ pub fn fold_with_octave_guard(env: &[f32], t_osc_env: f64) -> Option<(FoldProfil
 
     if four_even
         && let Some(half) = fold_envelope(env, t_osc_env / 2.0)
-        && half.contrast >= 1.15 * full.contrast
+        // Backstop threshold is deliberately 1.0x, not stricter: with real (non-exact)
+        // period estimates the legitimate doubled-case margin measures ~1.12-1.20x
+        // (vs 1.3-2.9x on bit-exact periods), so any stricter factor vetoes correct
+        // halvings. False-positive defense is carried by the 4-even-cluster gate and
+        // the quarter-midpoint probe (measured 1.76x margin), not by this comparison.
+        && half.contrast >= full.contrast
     {
         return Some((half, true));
     }
