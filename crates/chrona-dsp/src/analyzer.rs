@@ -95,6 +95,11 @@ pub struct Analyzer {
 
 impl Analyzer {
     pub fn new(config: AnalyzerConfig) -> Result<Self, AnalyzerError> {
+        if !config.ppm_correction.is_finite() {
+            return Err(AnalyzerError::InvalidConfig {
+                reason: format!("ppm_correction = {} must be finite", config.ppm_correction),
+            });
+        }
         for (name, v, lo, hi) in [
             ("lift_angle_deg", config.lift_angle_deg, 10.0, 90.0),
             ("averaging_s", config.averaging_s, 2.0, 60.0),
@@ -107,8 +112,12 @@ impl Analyzer {
         }
         let envelope = EnvelopeExtractor::new(config.sample_rate_hz)?;
         let period = PeriodEstimator::new(envelope.envelope_rate_hz());
-        // Ring-capacity invariant: +DECIMATION keeps env_start·16 inside the raw ring
-        // (decimation-phase remainder ≤ 15) so the aligned copy in current() succeeds.
+        // Ring-capacity note: the aligned copy's start boundary in current() is safe by
+        // construction (env_start·16 is always ≥ the raw ring's retained start); its end
+        // boundary is handled there by trimming the trailing partial envelope sample
+        // (the envelope leads the raw stream, so a full env window can imply a raw range
+        // past what's been pushed). The +DECIMATION margin below is retained as harmless
+        // slack, not load-bearing.
         let raw_cap = (32.0 * config.sample_rate_hz) as usize + DECIMATION;
         let env_cap = (32.0 * config.sample_rate_hz) as usize / DECIMATION;
         Ok(Analyzer {
@@ -150,6 +159,18 @@ impl Analyzer {
         self.env_ring
             .copy_last(self.env_ring.len(), &mut env_window);
         let env_start_abs = self.env_ring.start_index();
+
+        // The envelope LEADS the raw stream (the extractor emits at decimation phase 0),
+        // so env_total = ceil(raw_total/16) and the newest env sample's 16-sample raw
+        // group may not be fully pushed yet. Drop it so the aligned copy stays inside
+        // the raw ring. Must happen BEFORE the fold: fold_envelope and extract_events
+        // derive cycles/fold_start from the same env.len() (events.rs fold-window invariant).
+        let usable = (self
+            .raw_ring
+            .total_pushed()
+            .saturating_sub(env_start_abs * DECIMATION as u64)
+            / DECIMATION as u64) as usize;
+        env_window.truncate(usable.min(env_window.len()));
 
         let folded = fold_with_octave_guard(&env_window, raw_est.t_osc_s * env_rate);
         let (profile, halved) = match folded {
@@ -502,6 +523,37 @@ mod tests {
     }
 
     #[test]
+    fn full_metrics_survive_any_decimation_phase() {
+        // Regression for C1: the envelope leads the raw stream (the
+        // extractor emits at decimation phase 0), so env_total =
+        // ceil(raw_total/16). Whenever raw total_pushed isn't a multiple of
+        // 16, the un-truncated env window's aligned raw copy reaches past
+        // raw_ring.total_pushed() and current() must not silently fall back
+        // to a tier1-only snapshot.
+        let cfg = SynthConfig {
+            beat_error_ms: 0.8,
+            amplitude_deg: 270.0,
+            rate_s_per_day: 12.0,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let x = synthesize(&cfg).expect("valid synth config");
+        let mut a = Analyzer::new(AnalyzerConfig {
+            sample_rate_hz: cfg.sample_rate_hz,
+            ..AnalyzerConfig::default()
+        })
+        .unwrap();
+        a.push_samples(&x);
+        a.push_samples(&[0.0f32; 7]); // total_pushed % 16 == 7
+        let est = a.current().expect("snapshot");
+        assert_eq!(est.tier, crate::tier::Tier::T3, "tier {:?}", est.tier);
+        let be = est.beat_error_ms.expect("beat error at T3");
+        assert!((be - 0.8).abs() <= 0.1, "be {be}");
+        let amp = est.amplitude_deg.expect("amplitude at T3");
+        assert!((amp - 270.0).abs() <= 5.0, "amp {amp}");
+    }
+
+    #[test]
     fn clip_counter_accumulates() {
         let mut a = Analyzer::new(AnalyzerConfig::default()).unwrap();
         a.push_samples(&vec![1.5f32; 100]);
@@ -512,6 +564,27 @@ mod tests {
         a.push_samples(&x);
         let est = a.current().expect("snapshot");
         assert!(est.quality.clipped_samples >= 100);
+        // This push sequence's total is % 16 == 4 — it was silently
+        // exercising the C1 tier1 fallback until fixed.
+        assert!(est.tier >= crate::tier::Tier::T2, "tier {:?}", est.tier);
+    }
+
+    #[test]
+    fn octave_guard_no_false_halving_end_to_end() {
+        // Real period estimate + moderate tic/toc asymmetry must not halve
+        // (false-positive guard for the R4 backstop loosening).
+        let cfg = SynthConfig {
+            toc_gain: 0.5,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let est = analyze(&cfg, BphMode::Auto, 0.0).expect("snapshot");
+        assert_eq!(
+            est.bph_nominal,
+            Some(28_800),
+            "false halving: {:?}",
+            est.bph_detected
+        );
     }
 
     #[test]
@@ -527,6 +600,10 @@ mod tests {
             },
             AnalyzerConfig {
                 lift_angle_deg: f64::NAN,
+                ..AnalyzerConfig::default()
+            },
+            AnalyzerConfig {
+                ppm_correction: f64::NAN,
                 ..AnalyzerConfig::default()
             },
         ] {

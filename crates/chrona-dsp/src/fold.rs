@@ -178,11 +178,16 @@ fn cluster_centroids(bins: &[f32], factor: f64) -> Vec<f64> {
 
 /// Fold with period-doubling detection (retires M1's octave-error limitation).
 ///
-/// Detection envelope (measured): fires reliably at SNR ≥ 30 dB for
-/// toc_gain ≥ 0.2, at ≥ 35 dB down to toc_gain 0.1, and for bph ≥ 14,400;
+/// Detection envelope (measured under a stricter 1.15x contrast backstop,
+/// since removed — see the backstop's own comment below; current 1.0x
+/// behavior is at least as permissive on true positives, so these figures
+/// remain a safe lower bound on what fires): fires reliably at SNR ≥ 30 dB
+/// for toc_gain ≥ 0.2, at ≥ 35 dB down to toc_gain 0.1, and for bph ≥ 14,400;
 /// below those (incl. bph 12,000, any SNR ≤ 20 dB) it declines to halve —
 /// the safe failure (rate stays correct; only the BPH label may read
-/// halved).
+/// halved). False-positive defense is unchanged by the backstop threshold:
+/// it's carried by the four-even-cluster shape gate and the quarter-midpoint
+/// probe below.
 pub fn fold_with_octave_guard(env: &[f32], t_osc_env: f64) -> Option<(FoldProfile, bool)> {
     let full = fold_envelope(env, t_osc_env)?;
     let (count, gaps) = significant_clusters(&full.bins);
