@@ -104,6 +104,128 @@ pub fn fold_envelope(env: &[f32], t_osc_env: f64) -> Option<FoldProfile> {
     })
 }
 
+/// Count clusters of bins above `median + 0.5·(max − median)`, treating the
+/// bin array as circular; returns cluster count and the circular gaps (in bins)
+/// between consecutive cluster centroids.
+fn significant_clusters(bins: &[f32]) -> (usize, Vec<f64>) {
+    let n = bins.len();
+    let mut sorted = bins.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[n / 2];
+    let max = sorted[n - 1];
+    let thr = median + 0.5 * (max - median);
+    let above: Vec<bool> = bins.iter().map(|&v| v > thr).collect();
+    if above.iter().all(|&b| b) || above.iter().all(|&b| !b) {
+        return (0, Vec::new());
+    }
+    // Walk the circle once, starting just after a below-threshold bin.
+    let start = (0..n).find(|&i| !above[i]).unwrap_or(0);
+    let mut centroids = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for k in 1..=n {
+        let i = (start + k) % n;
+        if above[i] {
+            run.push(k); // unwrapped position to keep centroids monotonic
+        } else if !run.is_empty() {
+            let c = run.iter().sum::<usize>() as f64 / run.len() as f64;
+            centroids.push(c);
+            run.clear();
+        }
+    }
+    let count = centroids.len();
+    let mut gaps = Vec::new();
+    if count >= 2 {
+        for w in centroids.windows(2) {
+            gaps.push(w[1] - w[0]);
+        }
+        gaps.push(n as f64 - (centroids[count - 1] - centroids[0])); // wrap gap
+    }
+    (count, gaps)
+}
+
+/// Absolute-bin centroids of clusters above `median + factor·(max −
+/// median)`, treating the bin array as circular (same threshold/run logic
+/// as `significant_clusters`, but exposing positions instead of gaps —
+/// needed to locate the quarter-cycle midpoints between two dominant
+/// clusters, see `fold_with_octave_guard`'s secondary-peak probe).
+fn cluster_centroids(bins: &[f32], factor: f64) -> Vec<f64> {
+    let n = bins.len();
+    let mut sorted = bins.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[n / 2];
+    let max = sorted[n - 1];
+    let thr = median + (factor as f32) * (max - median);
+    let above: Vec<bool> = bins.iter().map(|&v| v > thr).collect();
+    if above.iter().all(|&b| b) || above.iter().all(|&b| !b) {
+        return Vec::new();
+    }
+    let start = (0..n).find(|&i| !above[i]).unwrap_or(0);
+    let mut centroids = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for k in 1..=n {
+        let i = (start + k) % n;
+        if above[i] {
+            run.push(k);
+        } else if !run.is_empty() {
+            let c = run.iter().sum::<usize>() as f64 / run.len() as f64;
+            centroids.push((start as f64 + c).rem_euclid(n as f64));
+            run.clear();
+        }
+    }
+    centroids
+}
+
+/// Fold with period-doubling detection (retires M1's octave-error limitation).
+pub fn fold_with_octave_guard(env: &[f32], t_osc_env: f64) -> Option<(FoldProfile, bool)> {
+    let full = fold_envelope(env, t_osc_env)?;
+    let (count, gaps) = significant_clusters(&full.bins);
+    let quarter = NBINS as f64 / 4.0;
+    let four_even = count == 4 && gaps.iter().all(|g| (g - quarter).abs() < quarter / 4.0);
+
+    // A profile folded at 2·T_osc_true collapses, at the 0.5 threshold, to
+    // exactly two dominant antipodal clusters (the two strong tic peaks):
+    // measured evidence (task-5-report.md) shows the two attenuated toc
+    // peaks a quarter-cycle off each one can be *shorter* than the strong
+    // peaks' own unlock/impulse precursor bursts (spec §2.1), so no single
+    // global threshold recovers all four clusters evenly — lowering the
+    // factor either leaves the toc peaks undetected or also splits off the
+    // precursor bursts as spurious extra clusters. When the profile has
+    // that two-dominant-antipodal shape, probe narrow windows centered on
+    // the two quarter-cycle midpoints instead — far enough from each
+    // dominant peak's own short precursor skirt not to re-detect it — for
+    // a secondary bump clearly above the profile's noise floor.
+    let four_even = four_even || {
+        count == 2
+            && gaps.len() == 2
+            && gaps
+                .iter()
+                .all(|g| (g - 2.0 * quarter).abs() < quarter / 2.0)
+            && {
+                let centroids = cluster_centroids(&full.bins, 0.5);
+                let mut sorted = full.bins.clone();
+                sorted.sort_by(f32::total_cmp);
+                let floor = sorted[NBINS / 2] as f64;
+                let probe = (NBINS / 16) as i64;
+                centroids.len() == 2
+                    && centroids.iter().all(|&c| {
+                        let mid = (c + quarter).rem_euclid(NBINS as f64).round() as i64;
+                        let window_max = (-probe..=probe)
+                            .map(|d| full.bins[(mid + d).rem_euclid(NBINS as i64) as usize] as f64)
+                            .fold(0.0, f64::max);
+                        window_max > 1.8 * floor
+                    })
+            }
+    };
+
+    if four_even
+        && let Some(half) = fold_envelope(env, t_osc_env / 2.0)
+        && half.contrast >= full.contrast
+    {
+        return Some((half, true));
+    }
+    Some((full, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +294,56 @@ mod tests {
         assert!(fold_envelope(&env, 750.0).is_none()); // 1.3 cycles < 8
         assert!(fold_envelope(&env, f64::NAN).is_none());
         assert!(fold_envelope(&env, 0.0).is_none());
+    }
+
+    #[test]
+    fn octave_guard_halves_a_doubled_period() {
+        // toc_gain 0.1 defeats the 40% divisor walk upstream (beat-lag autocorr
+        // value ≈ 2g/(1+g²) ≈ 0.198 < 0.40), so the period stage would deliver
+        // 2·T_osc. The guard must recognize the 4-cluster fold and halve it.
+        let cfg = SynthConfig {
+            toc_gain: 0.1,
+            snr_db: 35.0,
+            ..SynthConfig::default()
+        };
+        let (env, env_rate) = envelope_of(&cfg);
+        let t_osc_true = crate::bph::t_osc_s(cfg.bph) * env_rate;
+        let (p, halved) = fold_with_octave_guard(&env, 2.0 * t_osc_true).expect("fold");
+        assert!(halved, "guard must detect the doubled period");
+        assert!(
+            (p.t_osc_env - t_osc_true).abs() / t_osc_true < 0.01,
+            "t_osc {}",
+            p.t_osc_env
+        );
+    }
+
+    #[test]
+    fn octave_guard_leaves_a_correct_period_alone() {
+        for cfg in [
+            SynthConfig {
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            },
+            SynthConfig {
+                beat_error_ms: 2.0,
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            },
+            SynthConfig {
+                toc_gain: 0.5,
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            },
+        ] {
+            let (env, env_rate) = envelope_of(&cfg);
+            let t_osc_env = crate::bph::t_osc_s(cfg.bph) * env_rate;
+            let (p, halved) = fold_with_octave_guard(&env, t_osc_env).expect("fold");
+            assert!(
+                !halved,
+                "false halving (be={} toc={})",
+                cfg.beat_error_ms, cfg.toc_gain
+            );
+            assert!((p.t_osc_env - t_osc_env).abs() < 1e-9);
+        }
     }
 }
