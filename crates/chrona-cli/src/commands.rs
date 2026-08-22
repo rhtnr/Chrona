@@ -155,6 +155,12 @@ pub fn print_human(r: &AnalyzeReport) {
                     println!("Rate: {rate:+.1} s/d{badge}");
                 }
                 // Spec §3.1: no defensible nominal → no rate, with the reason.
+                // In Fixed mode `bph_nominal` is pinned even when detection
+                // deviated too far to trust, so the reason differs from Auto/Free
+                // mode's true "nothing to compare against".
+                None if r.bph_nominal.is_some() => println!(
+                    "Rate: — (detected beat rate differs more than 3% from the pinned nominal)"
+                ),
                 None => println!("Rate: — (no nominal beat rate to compare against)"),
             }
             if let (Some(sig), Some(w)) = (r.period_sigma_s, r.window_s) {

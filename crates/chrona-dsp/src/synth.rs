@@ -11,6 +11,8 @@ pub enum SynthError {
         amplitude_deg: f64,
         lift_angle_deg: f64,
     },
+    #[error("invalid synth config: {reason}")]
+    InvalidConfig { reason: String },
 }
 
 /// xorshift64* — tiny deterministic PRNG; no external dependency (spec §10 determinism).
@@ -85,6 +87,44 @@ fn add_burst(x: &mut [f32], sr: f64, t0: f64, amp: f64, f_hz: f64, tau_s: f64) {
 }
 
 pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
+    // Every f64 knob must be finite: NaN compares false everywhere, which would
+    // silently defeat the range checks below and the beat-grid loop's exit test,
+    // hanging `synthesize` forever instead of erroring out.
+    let finite_fields = [
+        ("sample_rate_hz", cfg.sample_rate_hz),
+        ("duration_s", cfg.duration_s),
+        ("rate_s_per_day", cfg.rate_s_per_day),
+        ("beat_error_ms", cfg.beat_error_ms),
+        ("amplitude_deg", cfg.amplitude_deg),
+        ("lift_angle_deg", cfg.lift_angle_deg),
+        ("snr_db", cfg.snr_db),
+        ("hum_hz", cfg.hum_hz.unwrap_or(0.0)),
+    ];
+    for (name, v) in finite_fields {
+        if !v.is_finite() {
+            return Err(SynthError::InvalidConfig {
+                reason: format!("{name} must be finite, got {v}"),
+            });
+        }
+    }
+    // Both are already confirmed finite above, so a direct comparison is safe
+    // (and, unlike a negated one, doesn't trip clippy::neg_cmp_op_on_partial_ord).
+    if cfg.sample_rate_hz <= 0.0 {
+        return Err(SynthError::InvalidConfig {
+            reason: format!("sample_rate_hz must be > 0, got {}", cfg.sample_rate_hz),
+        });
+    }
+    if cfg.duration_s < 0.0 {
+        return Err(SynthError::InvalidConfig {
+            reason: format!("duration_s must be >= 0, got {}", cfg.duration_s),
+        });
+    }
+    if cfg.bph < 1 {
+        return Err(SynthError::InvalidConfig {
+            reason: format!("bph must be >= 1, got {}", cfg.bph),
+        });
+    }
+
     if cfg.amplitude_deg < cfg.lift_angle_deg / 2.0 {
         return Err(SynthError::AmplitudeBelowLiftDomain {
             amplitude_deg: cfg.amplitude_deg,
@@ -99,6 +139,16 @@ pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
 
     // Rate-adjusted beat period (spec §2.3: T̂ = T_nom·(1 − rate/86400)).
     let t_beat = crate::bph::t_beat_s(cfg.bph) * (1.0 - cfg.rate_s_per_day / 86_400.0);
+    // Finite by construction (bph >= 1 and rate_s_per_day is finite, both
+    // confirmed above), so this direct comparison is safe.
+    if t_beat <= 0.0 {
+        return Err(SynthError::InvalidConfig {
+            reason: format!(
+                "rate {} s/d makes the beat period non-positive",
+                cfg.rate_s_per_day
+            ),
+        });
+    }
     let t_osc = 2.0 * t_beat;
     let dt = unlock_to_drop_dt_s(cfg.amplitude_deg, cfg.lift_angle_deg, t_osc);
     let be = cfg.beat_error_ms / 1000.0;
@@ -252,5 +302,35 @@ mod tests {
         };
         let x = synthesize(&cfg).expect("valid synth config");
         assert!(x.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn nan_rate_is_an_error() {
+        let cfg = SynthConfig {
+            rate_s_per_day: f64::NAN,
+            ..SynthConfig::default()
+        };
+        assert!(synthesize(&cfg).is_err());
+    }
+
+    #[test]
+    fn rate_that_stalls_the_beat_grid_is_an_error() {
+        // rate_s_per_day = 86_400 drives t_beat to exactly zero (never mind
+        // faster-than-that, which would go negative) — the beat loop's exit
+        // condition would never be reached.
+        let cfg = SynthConfig {
+            rate_s_per_day: 86_400.0,
+            ..SynthConfig::default()
+        };
+        assert!(synthesize(&cfg).is_err());
+    }
+
+    #[test]
+    fn infinite_duration_is_an_error() {
+        let cfg = SynthConfig {
+            duration_s: f64::INFINITY,
+            ..SynthConfig::default()
+        };
+        assert!(synthesize(&cfg).is_err());
     }
 }
