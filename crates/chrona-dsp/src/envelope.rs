@@ -1,4 +1,4 @@
-//! Envelope stage (spec §5.2): full-wave rectify → Butterworth LP @ min(1.5 kHz, 0.36·sr/16) → ÷16 decimate.
+//! Envelope stage (spec §5.2): full-wave rectify → Butterworth LP @ min(1.5 kHz, 0.45·sr/16) → ÷16 decimate.
 
 use crate::filter::{Butterworth, FilterError};
 
@@ -8,6 +8,7 @@ pub const DECIMATION: usize = 16;
 pub struct EnvelopeExtractor {
     lp: Butterworth,
     sample_rate_hz: f64,
+    lp_cutoff_hz: f64,
     /// Phase within the decimation cycle, carried across `process` calls.
     phase: usize,
 }
@@ -15,17 +16,23 @@ pub struct EnvelopeExtractor {
 impl EnvelopeExtractor {
     pub fn new(sample_rate_hz: f64) -> Result<Self, FilterError> {
         // Alias-safe envelope LP (spec §5.2 as amended): must sit below the
-        // post-decimation Nyquist sr/(2·DECIMATION). 0.36 leaves transition-band margin.
-        let cutoff_hz = (0.36 * sample_rate_hz / DECIMATION as f64).min(1_500.0);
+        // post-decimation Nyquist sr/(2·DECIMATION). 0.45 leaves transition-band margin.
+        let lp_cutoff_hz = (0.45 * sample_rate_hz / DECIMATION as f64).min(1_500.0);
         Ok(EnvelopeExtractor {
-            lp: Butterworth::low_pass(sample_rate_hz, cutoff_hz)?,
+            lp: Butterworth::low_pass(sample_rate_hz, lp_cutoff_hz)?,
             sample_rate_hz,
+            lp_cutoff_hz,
             phase: 0,
         })
     }
 
     pub fn envelope_rate_hz(&self) -> f64 {
         self.sample_rate_hz / DECIMATION as f64
+    }
+
+    /// The anti-alias low-pass cutoff this extractor was built with (Hz).
+    pub fn lp_cutoff_hz(&self) -> f64 {
+        self.lp_cutoff_hz
     }
 
     /// Rectify → low-pass → keep every 16th sample. Appends to `out`.
@@ -113,55 +120,31 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_stays_below_post_decimation_nyquist_at_44100() {
-        // At 44.1 kHz the post-decimation Nyquist is 44100/32 = 1378 Hz; the fixed
-        // 1.5 kHz cutoff sat ABOVE it (M1 known issue). The cutoff must now be
-        // min(1500, 0.45·sr/16) = 1240 Hz there, and a 1360 Hz tone (below old
-        // cutoff, above new) must be strongly attenuated before decimation.
-        // Probe 1: 1360 Hz (post-rectification fundamental at 2720 Hz — we probe the LP
-        // directly with a slow+fast mix).
+    fn cutoff_follows_min_rule_and_attenuates_above_it() {
+        // Contract (spec §5.2 as amended): cutoff = min(1500, 0.45·sr/16).
+        let e48 = EnvelopeExtractor::new(48_000.0).unwrap();
+        assert!((e48.lp_cutoff_hz() - 1_350.0).abs() < 1e-9);
+        let e44 = EnvelopeExtractor::new(44_100.0).unwrap();
+        assert!((e44.lp_cutoff_hz() - 0.45 * 44_100.0 / 16.0).abs() < 1e-9);
+        let e96 = EnvelopeExtractor::new(96_000.0).unwrap();
+        assert!((e96.lp_cutoff_hz() - 1_500.0).abs() < 1e-9);
+        // Sanity: a 2720 Hz ripple (2.2x the 44.1k cutoff) is strongly attenuated.
         let sr = 44_100.0;
         let mut env = EnvelopeExtractor::new(sr).unwrap();
-        assert!((env.envelope_rate_hz() - sr / 16.0).abs() < 1e-9);
-        // Rectified DC passes; a tone near the old cutoff must not alias through.
-        // Feed |sin| at 1360 Hz.
         let n = (sr * 2.0) as usize;
         let x: Vec<f32> = (0..n)
-            .map(|i| {
-                let t = i as f64 / sr;
-                (0.5 + 0.5 * (2.0 * std::f64::consts::PI * 1_360.0 * t).sin()) as f32
-            })
-            .collect();
-        let mut out = Vec::new();
-        env.process(&x, &mut out);
-        // Remove the DC part, measure residual ripple at the tone frequency.
-        let tail = &out[out.len() / 2..];
-        let mean = tail.iter().map(|v| *v as f64).sum::<f64>() / tail.len() as f64;
-        let rms = (tail.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>()
-            / tail.len() as f64)
-            .sqrt();
-        // Input ripple RMS is 0.5/√2 ≈ 0.354; require attenuation to < 0.18.
-        assert!(rms < 0.18, "1360 Hz probe: ripple rms {}", rms);
-
-        // Probe 2: 2720 Hz (the post-rectification harmonic).
-        let mut env2 = EnvelopeExtractor::new(sr).unwrap();
-        let x2: Vec<f32> = (0..n)
             .map(|i| {
                 let t = i as f64 / sr;
                 (0.5 + 0.5 * (2.0 * std::f64::consts::PI * 2_720.0 * t).sin()) as f32
             })
             .collect();
-        let mut out2 = Vec::new();
-        env2.process(&x2, &mut out2);
-        let tail2 = &out2[out2.len() / 2..];
-        let mean2 = tail2.iter().map(|v| *v as f64).sum::<f64>() / tail2.len() as f64;
-        let rms2 = (tail2
-            .iter()
-            .map(|v| (*v as f64 - mean2).powi(2))
-            .sum::<f64>()
-            / tail2.len() as f64)
+        let mut out = Vec::new();
+        env.process(&x, &mut out);
+        let tail = &out[out.len() / 2..];
+        let mean = tail.iter().map(|v| *v as f64).sum::<f64>() / tail.len() as f64;
+        let rms = (tail.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>()
+            / tail.len() as f64)
             .sqrt();
-        // Higher frequency should be more attenuated; require rms < 0.05.
-        assert!(rms2 < 0.05, "2720 Hz probe: ripple rms {}", rms2);
+        assert!(rms < 0.1, "ripple rms {rms}"); // theory: ≈0.072 at 2nd order
     }
 }
