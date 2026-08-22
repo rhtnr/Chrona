@@ -85,6 +85,78 @@ pub fn regress_unlocking(events: &[BeatEvent]) -> Option<RegressionResult> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmplitudeGateFail {
+    /// Fewer than 8 unlock→drop intervals on either parity.
+    InsufficientEvents,
+    /// A_tic or A_toc outside the 135–360° validity band (spec §2.3).
+    OutOfRange,
+    /// |A_tic − A_toc| ≥ 60° (spec §2.3 agreement gate).
+    TicTocDisagree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AmplitudeResult {
+    pub degrees: f64,
+    pub tic_degrees: f64,
+    pub toc_degrees: f64,
+}
+
+fn median(v: &mut [f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
+/// Spec §2.3: A = L / (2·sin(π·Δt/T_osc)), gated 135–360° with 60° tic/toc agreement.
+pub fn amplitude_from_events(
+    events: &[BeatEvent],
+    t_osc_s: f64,
+    lift_angle_deg: f64,
+) -> Result<AmplitudeResult, AmplitudeGateFail> {
+    let mut dt_tic = Vec::new();
+    let mut dt_toc = Vec::new();
+    for e in events {
+        if let (Some(u), Some(d)) = (e.t_unlock_s, e.t_drop_edge_s) {
+            let dt = d - u;
+            if dt > 0.0 {
+                match e.parity {
+                    Parity::Tic => dt_tic.push(dt),
+                    Parity::Toc => dt_toc.push(dt),
+                }
+            }
+        }
+    }
+    if dt_tic.len() < 8 || dt_toc.len() < 8 {
+        return Err(AmplitudeGateFail::InsufficientEvents);
+    }
+    let amp_of = |dt: f64| {
+        let s = (std::f64::consts::PI * dt / t_osc_s).sin();
+        if s <= 0.0 {
+            f64::INFINITY
+        } else {
+            lift_angle_deg / (2.0 * s)
+        }
+    };
+    // Invariant: the vectors were just checked non-empty (len ≥ 8).
+    let tic = amp_of(median(&mut dt_tic).expect("non-empty by guard"));
+    let toc = amp_of(median(&mut dt_toc).expect("non-empty by guard"));
+    let in_range = |a: f64| (135.0..=360.0).contains(&a);
+    if !in_range(tic) || !in_range(toc) {
+        return Err(AmplitudeGateFail::OutOfRange);
+    }
+    if (tic - toc).abs() >= 60.0 {
+        return Err(AmplitudeGateFail::TicTocDisagree);
+    }
+    Ok(AmplitudeResult {
+        degrees: (tic + toc) / 2.0,
+        tic_degrees: tic,
+        toc_degrees: toc,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +283,74 @@ mod tests {
             r.beat_error_ms
         );
         assert!(r.jitter_ms < 1e-9);
+    }
+
+    #[test]
+    fn amplitude_sweep_meets_the_bar() {
+        // M2 bar: ±5° at 30 dB, averaged output.
+        for amp_true in [200.0f64, 240.0, 270.0, 300.0, 330.0] {
+            let cfg = SynthConfig {
+                amplitude_deg: amp_true,
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            };
+            let events = pipeline_to_events(&cfg);
+            let t_osc = crate::bph::t_osc_s(cfg.bph);
+            let a = amplitude_from_events(&events, t_osc, cfg.lift_angle_deg)
+                .unwrap_or_else(|g| panic!("amp {amp_true}: gate {g:?}"));
+            assert!(
+                (a.degrees - amp_true).abs() <= 5.0,
+                "amp {amp_true}: got {}",
+                a.degrees
+            );
+            assert!((a.tic_degrees - a.toc_degrees).abs() < 60.0);
+        }
+    }
+
+    fn fabricated(dt_tic_s: f64, dt_toc_s: f64, n_per_parity: usize) -> Vec<BeatEvent> {
+        (0..2 * n_per_parity)
+            .map(|k| {
+                let (parity, dt) = if k % 2 == 0 {
+                    (Parity::Tic, dt_tic_s)
+                } else {
+                    (Parity::Toc, dt_toc_s)
+                };
+                let t = 0.125 * k as f64;
+                BeatEvent {
+                    beat_index: k as i64,
+                    parity,
+                    t_drop_corr_s: t,
+                    snr_db: 20.0,
+                    t_drop_edge_s: Some(t),
+                    t_unlock_s: Some(t - dt),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn amplitude_gates_fire_correctly() {
+        let t_osc = 0.25;
+        let lift = 52.0;
+        let dt_for = |a: f64| crate::synth::unlock_to_drop_dt_s(a, lift, t_osc);
+        // Too few events per parity.
+        assert_eq!(
+            amplitude_from_events(&fabricated(dt_for(270.0), dt_for(270.0), 5), t_osc, lift),
+            Err(AmplitudeGateFail::InsufficientEvents)
+        );
+        // A = 100° is physically valid input but below the 135° display gate.
+        assert_eq!(
+            amplitude_from_events(&fabricated(dt_for(100.0), dt_for(100.0), 20), t_osc, lift),
+            Err(AmplitudeGateFail::OutOfRange)
+        );
+        // Tic 270° vs toc 200° → 70° disagreement > 60° gate.
+        assert_eq!(
+            amplitude_from_events(&fabricated(dt_for(270.0), dt_for(200.0), 20), t_osc, lift),
+            Err(AmplitudeGateFail::TicTocDisagree)
+        );
+        // Healthy case passes.
+        let ok = amplitude_from_events(&fabricated(dt_for(280.0), dt_for(275.0), 20), t_osc, lift)
+            .expect("healthy");
+        assert!((ok.degrees - 277.5).abs() < 1.0, "got {}", ok.degrees);
     }
 }
