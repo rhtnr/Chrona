@@ -57,8 +57,7 @@ pub fn fold_envelope(env: &[f32], t_osc_env: f64) -> Option<FoldProfile> {
     let usable = (cycles as f64 * t_osc_env) as usize;
     // Bucket every sample of the freshest `usable` window by phase.
     let start = env.len() - usable;
-    let mut buckets: Vec<Vec<f32>> =
-        (0..NBINS).map(|_| Vec::with_capacity(cycles + 1)).collect();
+    let mut buckets: Vec<Vec<f32>> = (0..NBINS).map(|_| Vec::with_capacity(cycles + 1)).collect();
     for (j, &v) in env[start..].iter().enumerate() {
         let phase = (j as f64).rem_euclid(t_osc_env) / t_osc_env;
         let bin = ((phase * NBINS as f64) as usize).min(NBINS - 1);
