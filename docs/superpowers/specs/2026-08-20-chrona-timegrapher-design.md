@@ -3,6 +3,7 @@
 - **Date:** 2026-08-20
 - **Status:** Approved design (egui native GUI, full tiered metric scope)
 - **Amended:** 2026-08-22 — §5.2 envelope LP cutoff, §5.3 divisor threshold, Hann-taper note (M1 final review; see docs/superpowers/notes/m1-followups.md)
+- **Amended:** 2026-08-22 — §5.5 edge timing on native-rate envelope (M2 Task 9 measurement; see plan T9 fix round)
 - **Repo:** empty at time of writing; this spec is the project's founding document
 
 ## 1. Overview
@@ -262,8 +263,11 @@ dual-licensed), then extended with the matched-filter gate and tier system.
      interpolation of the correlation peak (48 kHz sample = 20.8 µs; interpolation takes
      per-event resolution well below that, and regression over hundreds of beats averages
      the rest)
-   - **Unlocking pulse:** search the `T_beat/8` window *before* each drop anchor on the
-     smoothed (~1 ms) envelope; noise floor from the `T_beat/8` window *after* the peak;
+   - **Unlocking pulse:** search the `T_beat/8` window *before* each drop anchor on a
+     native-sample-rate envelope (rectify → the §5.2 low-pass, undecimated — M2
+     measurement showed the ÷16-decimated envelope is a resolution ceiling for sub-ms
+     edge timing; edges are timed at half-height of each pulse's local max so the LP
+     delay cancels in Δt); noise floor from the `T_beat/8` window *after* the peak;
      threshold `max(1 % of global max, 1.4 × noise)`, escalating ×1.4 while below 20 % of
      max; leading-edge timestamp
 6. **Metrics (§2.3):** rate via least-squares over a sliding window of unlocking

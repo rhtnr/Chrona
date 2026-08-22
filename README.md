@@ -24,9 +24,9 @@ cargo run -p chrona-cli -- analyze demo.wav --lift 52
 cargo run -p chrona-cli -- calibrate quartz.wav
 ```
 
-Rate readings carry an `[uncalibrated timebase]` badge until you supply `--ppm` — consumer
-audio clocks are off by up to ±100 ppm and 1 s/day is only 11.6 ppm; calibration tooling
-arrives in a later milestone.
+Rate readings carry an `[uncalibrated timebase]` badge until you supply `--ppm` — measure
+yours with `chrona calibrate` against any quartz watch (consumer audio clocks are off by
+up to ±100 ppm; 1 s/day is only 11.6 ppm).
 
 Metrics are tiered by signal quality (spec §3.1): Tier 1 = rate only, Tier 2 adds beat error, Tier 3 adds amplitude — weak signals show "—" with the reason instead of fabricated numbers.
 

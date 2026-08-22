@@ -53,7 +53,7 @@ fn verify_checks_beat_error_and_amplitude_when_present() {
         ])
         .assert()
         .success();
-    let good = r#"{"file":"m.wav","bph":"auto","expect_rate_s_per_day":5.0,"tol_rate":1.0,
+    let good = r#"{"file":"m.wav","bph":"auto","lift":52.0,"expect_rate_s_per_day":5.0,"tol_rate":1.0,
         "expect_beat_error_ms":0.8,"tol_beat_error":0.15,
         "expect_amplitude_deg":270.0,"tol_amplitude":6.0}"#;
     std::fs::write(dir.path().join("good.json"), good).unwrap();

@@ -71,6 +71,8 @@ pub struct MetricsSnapshot {
     pub bph_nominal: Option<u32>,
     /// s/day, positive = fast; None when no defensible nominal (spec §3.1).
     pub rate_s_per_day: Option<f64>,
+    /// Which estimator produced rate_s_per_day. Meaningful only when
+    /// rate_s_per_day is Some; reads PeriodSlope otherwise.
     pub rate_source: RateSource,
     /// Only at tier ≥ T2.
     pub beat_error_ms: Option<f64>,

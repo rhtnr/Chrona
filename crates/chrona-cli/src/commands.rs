@@ -309,6 +309,8 @@ struct Expectation {
     bph: String,
     #[serde(default)]
     ppm: f64,
+    #[serde(default = "default_lift")]
+    lift: f64,
     expect_rate_s_per_day: f64,
     tol_rate: f64,
     #[serde(default)]
@@ -323,6 +325,10 @@ struct Expectation {
 
 fn default_bph_mode() -> String {
     "auto".into()
+}
+
+fn default_lift() -> f64 {
+    52.0
 }
 
 /// Returns the number of failures.
@@ -350,7 +356,7 @@ pub fn run_verify(a: &VerifyArgs) -> anyhow::Result<usize> {
             file: a.dir.join(&exp.file),
             bph: exp.bph.clone(),
             ppm: exp.ppm,
-            lift: 52.0,
+            lift: exp.lift,
             averaging: 30.0,
             json: false,
         })?;
@@ -378,10 +384,11 @@ pub fn run_verify(a: &VerifyArgs) -> anyhow::Result<usize> {
             }
         };
 
-        // Beat error check
-        if let Some(expect_be) = exp.expect_beat_error_ms
-            && let Some(tol_be) = exp.tol_beat_error
-        {
+        // Beat error check. Presence of `expect_beat_error_ms` alone triggers
+        // the check; a missing `tol_beat_error` defaults to 0.15 ms (see
+        // fixtures/README's schema).
+        if let Some(expect_be) = exp.expect_beat_error_ms {
+            let tol_be = exp.tol_beat_error.unwrap_or(0.15);
             match report.beat_error_ms {
                 Some(be) if (be - expect_be).abs() <= tol_be => {
                     verdict.push_str(&format!(" be={be:.2}"));
@@ -400,10 +407,11 @@ pub fn run_verify(a: &VerifyArgs) -> anyhow::Result<usize> {
             }
         }
 
-        // Amplitude check
-        if let Some(expect_amp) = exp.expect_amplitude_deg
-            && let Some(tol_amp) = exp.tol_amplitude
-        {
+        // Amplitude check. Presence of `expect_amplitude_deg` alone triggers
+        // the check; a missing `tol_amplitude` defaults to 10.0° (see
+        // fixtures/README's schema).
+        if let Some(expect_amp) = exp.expect_amplitude_deg {
+            let tol_amp = exp.tol_amplitude.unwrap_or(10.0);
             match report.amplitude_deg {
                 Some(amp) if (amp - expect_amp).abs() <= tol_amp => {
                     verdict.push_str(&format!(" amp={amp:.0}"));

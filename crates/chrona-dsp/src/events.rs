@@ -515,7 +515,11 @@ mod tests {
                 );
             }
         }
-        assert!(unlocked <= events.len());
+        assert!(
+            unlocked < events.len(),
+            "at 12 dB some unlocking pulses must be lost (unlocked {unlocked} of {})",
+            events.len()
+        );
     }
 
     #[test]
