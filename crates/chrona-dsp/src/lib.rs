@@ -6,7 +6,9 @@ pub mod autocorr;
 pub mod bph;
 pub mod envelope;
 pub mod filter;
+pub mod fold;
 pub mod period;
+pub mod ring;
 pub mod synth;
 
 pub use analyzer::{Analyzer, AnalyzerConfig, BphMode, RateEstimate};
