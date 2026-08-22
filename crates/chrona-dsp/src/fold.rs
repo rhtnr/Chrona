@@ -176,6 +176,12 @@ fn cluster_centroids(bins: &[f32], factor: f64) -> Vec<f64> {
 }
 
 /// Fold with period-doubling detection (retires M1's octave-error limitation).
+///
+/// Detection envelope (measured): fires reliably at SNR ≥ 30 dB for
+/// toc_gain ≥ 0.2, at ≥ 35 dB down to toc_gain 0.1, and for bph ≥ 14,400;
+/// below those (incl. bph 12,000, any SNR ≤ 20 dB) it declines to halve —
+/// the safe failure (rate stays correct; only the BPH label may read
+/// doubled).
 pub fn fold_with_octave_guard(env: &[f32], t_osc_env: f64) -> Option<(FoldProfile, bool)> {
     let full = fold_envelope(env, t_osc_env)?;
     let (count, gaps) = significant_clusters(&full.bins);
@@ -219,7 +225,7 @@ pub fn fold_with_octave_guard(env: &[f32], t_osc_env: f64) -> Option<(FoldProfil
 
     if four_even
         && let Some(half) = fold_envelope(env, t_osc_env / 2.0)
-        && half.contrast >= full.contrast
+        && half.contrast >= 1.15 * full.contrast
     {
         return Some((half, true));
     }
@@ -345,5 +351,24 @@ mod tests {
             );
             assert!((p.t_osc_env - t_osc_env).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn octave_guard_probe_rejects_moderate_asymmetry_at_correct_period() {
+        // toc_gain 0.6: the 2-dominant-cluster shape gate DOES engage, so only the
+        // quarter-midpoint probe (threshold 1.8x floor, ±NBINS/16 window) stands
+        // between a correct period and a false halving. Pins those constants.
+        let cfg = SynthConfig {
+            toc_gain: 0.6,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let (env, env_rate) = envelope_of(&cfg);
+        let t_osc_env = crate::bph::t_osc_s(cfg.bph) * env_rate;
+        let (_, halved) = fold_with_octave_guard(&env, t_osc_env).expect("fold");
+        assert!(
+            !halved,
+            "probe must reject correct-period moderate asymmetry"
+        );
     }
 }
