@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod events;
 pub mod filter;
 pub mod fold;
+pub mod metrics;
 pub mod period;
 pub mod ring;
 pub mod synth;
