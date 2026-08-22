@@ -6,6 +6,7 @@
 
 use realfft::RealFftPlanner;
 
+#[derive(Debug, Clone, Copy)]
 pub struct Peak {
     /// Fractional lag in samples (parabolically refined).
     pub lag: f64,
@@ -230,5 +231,29 @@ mod tests {
         let r = autocorrelate(&x);
         let p = fundamental_beat_lag(&r, 500, 1080).unwrap();
         assert!((p.lag - 200.0).abs() < 1.0, "lag {}", p.lag);
+    }
+
+    #[test]
+    fn parabolic_clamp_engages_on_pathological_shape() {
+        // A flat-topped two-sample plateau makes the parabola degenerate; the
+        // refined lag must stay within ±0.5 of the integer peak (clamp engaged
+        // or denominator guard returns 0 offset) — never fly off.
+        let mut r = vec![0.0f32; 64];
+        r[0] = 1.0;
+        r[30] = 0.5;
+        r[31] = 0.5; // plateau
+        let p = find_peak_in_band(&r, 10, 60).unwrap();
+        assert!((p.lag - 30.0).abs() <= 0.5, "lag {}", p.lag);
+    }
+
+    #[test]
+    fn non_power_of_two_length_matches_naive() {
+        let mut rng = crate::synth::Rng::new(11);
+        let x: Vec<f32> = (0..1000).map(|_| rng.next_f32()).collect(); // pads 2000→2048
+        let fast = autocorrelate(&x);
+        let slow = naive_autocorr(&x);
+        for (i, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "lag {i}: {a} vs {b}");
+        }
     }
 }

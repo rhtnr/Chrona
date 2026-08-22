@@ -20,6 +20,7 @@ pub struct PeriodEstimate {
     pub window_s: f64,
 }
 
+#[derive(Debug)]
 pub struct PeriodEstimator {
     env_rate_hz: f64,
     ring: VecDeque<f32>,
@@ -27,8 +28,11 @@ pub struct PeriodEstimator {
 }
 
 impl PeriodEstimator {
+    /// Create a new period estimator.
+    ///
+    /// `envelope_rate_hz` is the DECIMATED envelope rate (`sample_rate/16`), not the audio rate.
     pub fn new(envelope_rate_hz: f64) -> Self {
-        let capacity = (WINDOWS_S[3] * envelope_rate_hz) as usize;
+        let capacity = ((WINDOWS_S[3] * envelope_rate_hz) as usize).max(1);
         PeriodEstimator {
             env_rate_hz: envelope_rate_hz,
             ring: VecDeque::with_capacity(capacity),
@@ -45,6 +49,9 @@ impl PeriodEstimator {
         }
     }
 
+    /// Estimate the beat period from buffered envelope data.
+    ///
+    /// Returns `None` both when there is not yet enough data (< 4 s of envelope) and when nothing passes the σ gate — callers must not distinguish the two.
     pub fn estimate(&self) -> Option<PeriodEstimate> {
         for &window_s in WINDOWS_S.iter().rev() {
             let n = (window_s * self.env_rate_hz) as usize;
@@ -89,6 +96,7 @@ impl PeriodEstimator {
         let mut ks: Vec<f64> = Vec::new();
         let mut lags: Vec<f64> = Vec::new();
         for k in 1..=max_k {
+            // invariant: tolerance · K_max < 0.5 (0.005·64 = 0.32), else the search window reaches the neighboring beat peak at k ≥ 0.5/tolerance and the fit re-acquires the >1 % bias fixed in M1.
             if let Some(p) = refine_peak_near(&r, k as f64 * t_hat, 0.005) {
                 ks.push(k as f64);
                 lags.push(p.lag);
@@ -159,6 +167,7 @@ mod tests {
         let est = estimate_for(&cfg).expect("beat error must not break estimation");
         let rel = (est.t_osc_s - 0.250).abs() / 0.250;
         assert!(rel < 6e-6, "rel err {rel}");
+        assert!(est.window_s >= 16.0, "window {}", est.window_s);
     }
 
     #[test]
