@@ -181,7 +181,7 @@ fn cluster_centroids(bins: &[f32], factor: f64) -> Vec<f64> {
 /// toc_gain ≥ 0.2, at ≥ 35 dB down to toc_gain 0.1, and for bph ≥ 14,400;
 /// below those (incl. bph 12,000, any SNR ≤ 20 dB) it declines to halve —
 /// the safe failure (rate stays correct; only the BPH label may read
-/// doubled).
+/// halved).
 pub fn fold_with_octave_guard(env: &[f32], t_osc_env: f64) -> Option<(FoldProfile, bool)> {
     let full = fold_envelope(env, t_osc_env)?;
     let (count, gaps) = significant_clusters(&full.bins);
