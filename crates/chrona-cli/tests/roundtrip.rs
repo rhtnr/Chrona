@@ -181,7 +181,11 @@ fn lift_flag_scales_amplitude_only() {
         v40["amplitude_deg"].as_f64().unwrap(),
     );
     // Amplitude scales ~linearly with lift; rate must not move.
-    assert!((a52 - a40).abs() > 30.0, "a52 {a52} a40 {a40}");
+    let expected_a40 = a52 * 40.0 / 52.0;
+    assert!(
+        (a40 - expected_a40).abs() < 6.0,
+        "a52 {a52} a40 {a40} expected {expected_a40}"
+    );
     assert!(
         (v52["rate_s_per_day"].as_f64().unwrap() - v40["rate_s_per_day"].as_f64().unwrap()).abs()
             < 0.2
