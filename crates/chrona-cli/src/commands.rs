@@ -66,6 +66,12 @@ pub struct AnalyzeArgs {
     /// Audio-clock correction in ppm (spec §3.4)
     #[arg(long, default_value_t = 0.0)]
     pub ppm: f64,
+    /// Lift angle in degrees (amplitude only; spec §2.3). Default 52.
+    #[arg(long, default_value_t = 52.0)]
+    pub lift: f64,
+    /// Metrics averaging window, seconds (2-60).
+    #[arg(long, default_value_t = 30.0)]
+    pub averaging: f64,
     #[arg(long)]
     pub json: bool,
 }
@@ -87,6 +93,25 @@ pub struct AnalyzeReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_s: Option<f64>,
     pub calibrated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beat_error_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amplitude_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amplitude_gate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onset_jitter_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlocking_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_beat_snr_db: Option<f64>,
+    pub clipped_samples: u64,
 }
 
 pub fn parse_bph_mode(s: &str) -> anyhow::Result<BphMode> {
@@ -109,7 +134,8 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
         sample_rate_hz: sr,
         bph_mode: parse_bph_mode(&a.bph)?,
         ppm_correction: a.ppm,
-        ..AnalyzerConfig::default()
+        lift_angle_deg: a.lift,
+        averaging_s: a.averaging,
     })?;
     analyzer.push_samples(&samples);
     let duration_s = samples.len() as f64 / sr;
@@ -124,6 +150,16 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
         period_sigma_s: None,
         window_s: None,
         calibrated: a.ppm != 0.0,
+        tier: None,
+        rate_source: None,
+        beat_error_ms: None,
+        amplitude_deg: None,
+        amplitude_gate: None,
+        detection_ratio: None,
+        onset_jitter_ms: None,
+        unlocking_ratio: None,
+        mean_beat_snr_db: None,
+        clipped_samples: 0,
     };
     Ok(match analyzer.current() {
         None => base("no_beat"),
@@ -134,6 +170,26 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
             period_sigma_s: Some(est.period.sigma_s),
             window_s: Some(est.period.window_s),
             calibrated: est.calibrated,
+            tier: Some(match est.tier {
+                chrona_dsp::Tier::T1 => "T1",
+                chrona_dsp::Tier::T2 => "T2",
+                chrona_dsp::Tier::T3 => "T3",
+            }),
+            rate_source: est
+                .rate_s_per_day
+                .is_some()
+                .then_some(match est.rate_source {
+                    chrona_dsp::RateSource::PeriodSlope => "period_slope",
+                    chrona_dsp::RateSource::UnlockingRegression => "unlocking_regression",
+                }),
+            beat_error_ms: est.beat_error_ms,
+            amplitude_deg: est.amplitude_deg,
+            amplitude_gate: est.quality.amplitude_gate.map(|g| format!("{g:?}")),
+            detection_ratio: Some(est.quality.detection_ratio),
+            onset_jitter_ms: est.quality.onset_jitter_ms,
+            unlocking_ratio: Some(est.quality.unlocking_ratio),
+            mean_beat_snr_db: est.quality.mean_beat_snr_db,
+            clipped_samples: est.quality.clipped_samples,
             ..base("ok")
         },
     })
@@ -174,6 +230,30 @@ pub fn print_human(r: &AnalyzeReport) {
             if let (Some(sig), Some(w)) = (r.period_sigma_s, r.window_s) {
                 println!("Period σ: {:.1} µs over {w:.0} s window", sig * 1e6);
             }
+            if let Some(t) = r.tier {
+                println!("Signal tier: {t}");
+            }
+            match r.beat_error_ms {
+                Some(be) => println!("Beat error: {be:.1} ms"),
+                None => println!(
+                    "Beat error: — (needs Tier 2: ≥60% of beats detected with ≤0.5 ms jitter)"
+                ),
+            }
+            match r.amplitude_deg {
+                Some(a) => println!("Amplitude: {a:.0}°"),
+                None => match &r.amplitude_gate {
+                    Some(g) => println!("Amplitude: — (gate: {g})"),
+                    None => println!(
+                        "Amplitude: — (needs Tier 3: unlocking pulse resolved — try a contact mic)"
+                    ),
+                },
+            }
+            if r.clipped_samples > 0 {
+                println!(
+                    "WARNING: {} clipped samples — reduce input gain",
+                    r.clipped_samples
+                );
+            }
         }
         _ => println!(
             "No beat found — is a watch near the microphone? (try `chrona` Mic Doctor in a later milestone)"
@@ -196,6 +276,14 @@ struct Expectation {
     ppm: f64,
     expect_rate_s_per_day: f64,
     tol_rate: f64,
+    #[serde(default)]
+    expect_beat_error_ms: Option<f64>,
+    #[serde(default)]
+    tol_beat_error: Option<f64>,
+    #[serde(default)]
+    expect_amplitude_deg: Option<f64>,
+    #[serde(default)]
+    tol_amplitude: Option<f64>,
 }
 
 fn default_bph_mode() -> String {
@@ -227,27 +315,81 @@ pub fn run_verify(a: &VerifyArgs) -> anyhow::Result<usize> {
             file: a.dir.join(&exp.file),
             bph: exp.bph.clone(),
             ppm: exp.ppm,
+            lift: 52.0,
+            averaging: 30.0,
             json: false,
         })?;
-        let verdict = match report.rate_s_per_day {
+        let mut verdict = String::new();
+        let mut passed = true;
+
+        // Rate check
+        match report.rate_s_per_day {
             Some(rate) if (rate - exp.expect_rate_s_per_day).abs() <= exp.tol_rate => {
-                format!(
+                verdict.push_str(&format!(
                     "PASS  rate {rate:+.2} s/d (want {:+.2} ± {})",
                     exp.expect_rate_s_per_day, exp.tol_rate
-                )
+                ));
             }
             Some(rate) => {
-                failures += 1;
-                format!(
+                passed = false;
+                verdict.push_str(&format!(
                     "FAIL  rate {rate:+.2} s/d (want {:+.2} ± {})",
                     exp.expect_rate_s_per_day, exp.tol_rate
-                )
+                ));
             }
             None => {
-                failures += 1;
-                format!("FAIL  no rate (status {})", report.status)
+                passed = false;
+                verdict.push_str(&format!("FAIL  no rate (status {})", report.status));
             }
         };
+
+        // Beat error check
+        if let Some(expect_be) = exp.expect_beat_error_ms
+            && let Some(tol_be) = exp.tol_beat_error
+        {
+            match report.beat_error_ms {
+                Some(be) if (be - expect_be).abs() <= tol_be => {
+                    verdict.push_str(&format!(" be={be:.2}"));
+                }
+                Some(be) => {
+                    passed = false;
+                    verdict.push_str(&format!(
+                        " FAIL be {be:.2} (want {expect_be:.2} ± {tol_be})"
+                    ));
+                }
+                None => {
+                    passed = false;
+                    let tier = report.tier.unwrap_or("unknown");
+                    verdict.push_str(&format!(" FAIL no beat_error (tier {tier})"));
+                }
+            }
+        }
+
+        // Amplitude check
+        if let Some(expect_amp) = exp.expect_amplitude_deg
+            && let Some(tol_amp) = exp.tol_amplitude
+        {
+            match report.amplitude_deg {
+                Some(amp) if (amp - expect_amp).abs() <= tol_amp => {
+                    verdict.push_str(&format!(" amp={amp:.0}"));
+                }
+                Some(amp) => {
+                    passed = false;
+                    verdict.push_str(&format!(
+                        " FAIL amp {amp:.0} (want {expect_amp:.0} ± {tol_amp})"
+                    ));
+                }
+                None => {
+                    passed = false;
+                    let tier = report.tier.unwrap_or("unknown");
+                    verdict.push_str(&format!(" FAIL no amplitude (tier {tier})"));
+                }
+            }
+        }
+
+        if !passed {
+            failures += 1;
+        }
         println!("{}: {verdict}", exp.file);
     }
     Ok(failures)

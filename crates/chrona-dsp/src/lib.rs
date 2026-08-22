@@ -17,6 +17,7 @@ pub mod tier;
 pub use analyzer::{
     Analyzer, AnalyzerConfig, AnalyzerError, BphMode, MetricsSnapshot, Quality, RateSource,
 };
+pub use metrics::AmplitudeGateFail;
 pub use period::PeriodEstimate;
 pub use tier::Tier;
 
