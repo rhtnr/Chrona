@@ -18,6 +18,8 @@ enum Cmd {
     Analyze(commands::AnalyzeArgs),
     /// Run expectation files against their recordings (regression corpus)
     Verify(commands::VerifyArgs),
+    /// Measure the audio clock's ppm error from a quartz-watch recording
+    Calibrate(commands::CalibrateArgs),
 }
 
 fn main() {
@@ -51,5 +53,20 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             let failures = commands::run_verify(&a)?;
             Ok(if failures == 0 { 0 } else { 1 })
         }
+        Cmd::Calibrate(a) => match commands::run_calibrate(&a) {
+            Ok(report) => {
+                if a.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    commands::print_cal_human(&report);
+                }
+                Ok(0)
+            }
+            Err(e) if e.downcast_ref::<chrona_dsp::cal::CalError>().is_some() => {
+                eprintln!("calibration failed: {e:#}");
+                Ok(2)
+            }
+            Err(e) => Err(e),
+        },
     }
 }

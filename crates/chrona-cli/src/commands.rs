@@ -262,6 +262,41 @@ pub fn print_human(r: &AnalyzeReport) {
 }
 
 #[derive(Args)]
+pub struct CalibrateArgs {
+    /// WAV recording of a quartz watch (≥ 5 minutes)
+    pub file: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Serialize)]
+pub struct CalReport {
+    pub ppm: f64,
+    pub residual_ppm: f64,
+    pub events: usize,
+    pub duration_s: f64,
+}
+
+pub fn run_calibrate(a: &CalibrateArgs) -> anyhow::Result<CalReport> {
+    let (samples, sr) = crate::wav::read_mono(&a.file)?;
+    let r = chrona_dsp::cal::calibrate_quartz(&samples, sr)?;
+    Ok(CalReport {
+        ppm: r.ppm,
+        residual_ppm: r.residual_ppm,
+        events: r.events,
+        duration_s: r.duration_s,
+    })
+}
+
+pub fn print_cal_human(r: &CalReport) {
+    println!(
+        "Timebase: {:+.1} ppm (±{:.2}) from {} ticks over {:.0} s",
+        r.ppm, r.residual_ppm, r.events, r.duration_s
+    );
+    println!("Use it: chrona analyze <watch.wav> --ppm {:.1}", r.ppm);
+}
+
+#[derive(Args)]
 pub struct VerifyArgs {
     /// Directory containing *.json expectations next to their WAV files
     pub dir: PathBuf,
