@@ -48,6 +48,8 @@ pub struct SynthConfig {
     pub snr_db: f64,
     pub hum_hz: Option<f64>,
     pub seed: u64,
+    /// Gain applied to every burst of odd-index (toc) beats; 1.0 = symmetric. Values ≪ 1 model extreme tic/toc asymmetry (octave-guard testing).
+    pub toc_gain: f64,
 }
 
 impl Default for SynthConfig {
@@ -63,6 +65,7 @@ impl Default for SynthConfig {
             snr_db: 30.0,
             hum_hz: None,
             seed: 1,
+            toc_gain: 1.0,
         }
     }
 }
@@ -99,6 +102,7 @@ pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
         ("lift_angle_deg", cfg.lift_angle_deg),
         ("snr_db", cfg.snr_db),
         ("hum_hz", cfg.hum_hz.unwrap_or(0.0)),
+        ("toc_gain", cfg.toc_gain),
     ];
     for (name, v) in finite_fields {
         if !v.is_finite() {
@@ -122,6 +126,12 @@ pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
     if cfg.bph < 1 {
         return Err(SynthError::InvalidConfig {
             reason: format!("bph must be >= 1, got {}", cfg.bph),
+        });
+    }
+
+    if cfg.toc_gain <= 0.0 {
+        return Err(SynthError::InvalidConfig {
+            reason: format!("toc_gain {} must be > 0", cfg.toc_gain),
         });
     }
 
@@ -170,9 +180,11 @@ pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
         let t_unlock = t_drop - dt;
         let impulse_jitter = 0.15 * dt * rng.next_f32() as f64;
         let t_impulse = t_unlock + 0.4 * dt + impulse_jitter;
-        add_burst(&mut x, sr, t_unlock, tick_amp * 0.35, 5_200.0, 0.0008);
-        add_burst(&mut x, sr, t_impulse, tick_amp * 0.25, 6_500.0, 0.0006);
-        add_burst(&mut x, sr, t_drop, tick_amp, 7_800.0, 0.0012);
+        #[allow(clippy::manual_is_multiple_of)]
+        let g = if k % 2 == 0 { 1.0 } else { cfg.toc_gain };
+        add_burst(&mut x, sr, t_unlock, tick_amp * 0.35 * g, 5_200.0, 0.0008);
+        add_burst(&mut x, sr, t_impulse, tick_amp * 0.25 * g, 6_500.0, 0.0006);
+        add_burst(&mut x, sr, t_drop, tick_amp * g, 7_800.0, 0.0012);
         k += 1;
     }
 
@@ -197,6 +209,64 @@ pub fn synthesize(cfg: &SynthConfig) -> Result<Vec<f32>, SynthError> {
     }
 
     // Normalize to ≤ 0.9 peak, preserving ratios (never clip the synthetic ADC).
+    let peak = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    if peak > 0.9 {
+        let g = 0.9 / peak;
+        for s in x.iter_mut() {
+            *s *= g;
+        }
+    }
+    Ok(x)
+}
+
+/// 1 Hz quartz stepper reference for timebase calibration (spec §3.4).
+/// The tick grid's true period is `1.0 · (1 + ppm_offset/1e6)` in nominal-clock
+/// seconds — i.e. what a perfect quartz looks like through an ADC that is
+/// `ppm_offset` ppm fast.
+pub fn synthesize_quartz(
+    duration_s: f64,
+    sample_rate_hz: f64,
+    ppm_offset: f64,
+    snr_db: f64,
+    seed: u64,
+) -> Result<Vec<f32>, SynthError> {
+    for (name, v) in [
+        ("duration_s", duration_s),
+        ("sample_rate_hz", sample_rate_hz),
+        ("ppm_offset", ppm_offset),
+        ("snr_db", snr_db),
+    ] {
+        if !v.is_finite() {
+            return Err(SynthError::InvalidConfig {
+                reason: format!("{name} is not finite"),
+            });
+        }
+    }
+    if sample_rate_hz <= 0.0 || duration_s < 0.0 {
+        return Err(SynthError::InvalidConfig {
+            reason: "sample_rate_hz must be > 0 and duration_s >= 0".into(),
+        });
+    }
+    let sr = sample_rate_hz;
+    let n = (duration_s * sr) as usize;
+    let mut x = vec![0.0f32; n];
+    let mut rng = Rng::new(seed);
+    let noise_rms = 0.02f64;
+    let tick_amp = noise_rms * 10f64.powf(snr_db / 20.0);
+    let period = 1.0 * (1.0 + ppm_offset / 1e6);
+    let mut k = 1u64;
+    loop {
+        let t = k as f64 * period;
+        if t + 0.02 >= duration_s {
+            break;
+        }
+        add_burst(&mut x, sr, t, tick_amp, 4_000.0, 0.0015);
+        k += 1;
+    }
+    let noise_gain = noise_rms * 3f64.sqrt();
+    for s in x.iter_mut() {
+        *s += (noise_gain * rng.next_f32() as f64) as f32;
+    }
     let peak = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     if peak > 0.9 {
         let g = 0.9 / peak;
@@ -332,5 +402,71 @@ mod tests {
             ..SynthConfig::default()
         };
         assert!(synthesize(&cfg).is_err());
+    }
+
+    #[test]
+    fn toc_gain_scales_alternate_beats() {
+        let strong = SynthConfig {
+            duration_s: 4.0,
+            snr_db: 50.0,
+            ..SynthConfig::default()
+        };
+        let weak = SynthConfig {
+            toc_gain: 0.1,
+            ..strong
+        };
+        let (xs, xw) = (synthesize(&strong).unwrap(), synthesize(&weak).unwrap());
+        let sr = strong.sample_rate_hz;
+        let t_beat = crate::bph::t_beat_s(strong.bph);
+        // Peak amplitude around beat 4 (k=3, toc: k%2==1 with drops at (k+1)·t_beat
+        // ⇒ beat index k=3 → drop at 4·t_beat) must shrink ~10x; beat 5 (tic) must not.
+        let peak_near = |x: &[f32], t: f64| {
+            let (lo, hi) = (((t - 0.01) * sr) as usize, ((t + 0.01) * sr) as usize);
+            x[lo..hi].iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        let toc_t = 4.0 * t_beat;
+        let tic_t = 5.0 * t_beat;
+        assert!(
+            peak_near(&xw, toc_t) < 0.25 * peak_near(&xs, toc_t),
+            "toc not attenuated"
+        );
+        assert!(
+            peak_near(&xw, tic_t) > 0.8 * peak_near(&xs, tic_t),
+            "tic wrongly attenuated"
+        );
+    }
+
+    #[test]
+    fn toc_gain_must_be_finite_and_positive() {
+        let bad = SynthConfig {
+            toc_gain: f64::NAN,
+            ..SynthConfig::default()
+        };
+        assert!(synthesize(&bad).is_err());
+        let bad2 = SynthConfig {
+            toc_gain: 0.0,
+            ..SynthConfig::default()
+        };
+        assert!(synthesize(&bad2).is_err());
+    }
+
+    #[test]
+    fn quartz_ticks_land_on_the_ppm_stretched_grid() {
+        let x = synthesize_quartz(20.0, 48_000.0, 100.0, 40.0, 3).unwrap();
+        let sr = 48_000.0;
+        let period = 1.0 * (1.0 + 100.0 / 1e6);
+        for k in 1..=18u32 {
+            let t = k as f64 * period;
+            let (lo, hi) = (((t - 0.02) * sr) as usize, ((t + 0.02) * sr) as usize);
+            let (idx, v) = x[lo..hi]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .unwrap();
+            assert!(v.abs() > 0.05, "tick {k} missing");
+            let t_found = (lo + idx) as f64 / sr;
+            assert!((t_found - t).abs() < 5e-3, "tick {k} at {t_found} want {t}");
+        }
+        assert!(synthesize_quartz(f64::NAN, 48_000.0, 0.0, 30.0, 1).is_err());
     }
 }

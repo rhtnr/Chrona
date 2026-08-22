@@ -100,3 +100,24 @@ fn missing_file_is_an_error() {
         .assert()
         .code(1);
 }
+
+#[test]
+fn pcm16_synth_roundtrips_through_the_int_read_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("t16.wav");
+    chrona()
+        .args(["synth", wav.to_str().unwrap(), "--rate", "10.0", "--pcm16"])
+        .assert()
+        .success();
+    let out = chrona()
+        .args(["analyze", wav.to_str().unwrap(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["status"], "ok");
+    let rate = v["rate_s_per_day"].as_f64().unwrap();
+    assert!((rate - 10.0).abs() < 0.5, "rate {rate}");
+}

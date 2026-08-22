@@ -27,6 +27,9 @@ pub struct SynthArgs {
     pub duration: f64,
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
+    /// Write 16-bit PCM instead of 32-bit float
+    #[arg(long)]
+    pub pcm16: bool,
     /// Add mains hum at this frequency (e.g. 50 or 60)
     #[arg(long)]
     pub hum: Option<f64>,
@@ -46,7 +49,11 @@ pub fn run_synth(a: &SynthArgs) -> anyhow::Result<()> {
         ..SynthConfig::default()
     };
     let samples = synthesize(&cfg).map_err(|e| anyhow::anyhow!(e))?;
-    crate::wav::write_mono_f32(&a.out, &samples, cfg.sample_rate_hz)
+    if a.pcm16 {
+        crate::wav::write_mono_i16(&a.out, &samples, cfg.sample_rate_hz)
+    } else {
+        crate::wav::write_mono_f32(&a.out, &samples, cfg.sample_rate_hz)
+    }
 }
 
 #[derive(Args)]

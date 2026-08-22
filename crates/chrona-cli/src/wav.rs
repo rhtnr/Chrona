@@ -39,3 +39,19 @@ pub fn write_mono_f32(path: &Path, samples: &[f32], sample_rate_hz: f64) -> anyh
     w.finalize()?;
     Ok(())
 }
+
+pub fn write_mono_i16(path: &Path, samples: &[f32], sample_rate_hz: f64) -> anyhow::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: sample_rate_hz as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("create {}", path.display()))?;
+    for &s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * 32_767.0) as i16)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
