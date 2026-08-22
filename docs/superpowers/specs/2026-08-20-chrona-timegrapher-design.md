@@ -2,6 +2,7 @@
 
 - **Date:** 2026-08-20
 - **Status:** Approved design (egui native GUI, full tiered metric scope)
+- **Amended:** 2026-08-22 — §5.2 envelope LP cutoff, §5.3 divisor threshold, Hann-taper note (M1 final review; see docs/superpowers/notes/m1-followups.md)
 - **Repo:** empty at time of writing; this spec is the project's founding document
 
 ## 1. Overview
@@ -243,12 +244,11 @@ dual-licensed), then extended with the matched-filter gate and tier system.
 
 1. **Precondition:** DC removal; 2nd-order Butterworth high-pass at 3 kHz (biquad);
    optional low-pass ~16 kHz.
-2. **Envelope:** full-wave rectify → low-pass (~2–3 kHz) → decimate. Mean removal + Hann
-   edge taper per analysis window. Optional noise gate at 2× running median.
+2. **Envelope:** full-wave rectify → low-pass at `min(1.5 kHz, 0.45 · sr/16)` (must sit below the post-decimation Nyquist of `sr/32`) → decimate ×16. Mean removal + Hann edge taper per analysis window (M1 ships mean removal only; the Hann taper was reviewed as unnecessary at current accuracy margins and is deliberately omitted — revisit only if real-corpus σ regresses.). Optional noise gate at 2× running median.
 3. **Beat-period estimation:** over stepped windows (~4, 8, 16, 32 s — keep the longest
    whose fit passes), autocorrelation via FFT → power spectrum → IFFT; search the
    full-oscillation lag band (1–12 Hz oscillators); shape-validating peak detector;
-   harmonic disambiguation via integer-divisor peaks (≥ 90 % of fundamental) and octave
+   harmonic disambiguation via integer-divisor peaks (≥ 40 % of the original candidate — beat error smears the beat-period peak, so the spec's original 90 % rejected real watches; ratified in M1 review) and octave
    checks; iterative per-cycle refinement (±2 %). **σ gate:** accept when period σ <
    period/10⁴. Snap to the BPH table unless free mode.
 4. **Phase fold / tic-toc separation:** fold the envelope at `T_osc`; stack cycles with a
