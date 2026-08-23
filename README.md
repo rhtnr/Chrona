@@ -4,7 +4,17 @@ A cross-platform software timegrapher in Rust: listen to a mechanical watch and 
 rate (s/day), beat error (ms), and amplitude (°) — with honest, signal-aware confidence
 instead of fabricated numbers on weak microphones.
 
-Status: M3 (live app with microphone input, record/replay, real-time UI). Design: docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md.
+**Status:** milestones M1 (headless DSP pipeline), M2 (full metrics + calibration), and
+M3 (live app: microphone capture, real-time instrument UI, record/replay) are complete.
+Next up is M4: Mic Doctor, calibration wizard UI, scope view, position summaries/export.
+The binding design document is
+[docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md](docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md);
+known debt and deferred work live in [docs/superpowers/notes/](docs/superpowers/notes/).
+
+Runs on macOS, Windows, and Linux. Rust stable (pinned via `rust-toolchain.toml`).
+On Linux you need ALSA plus the usual GUI development packages — the exact apt list is in
+[.github/workflows/ci.yml](.github/workflows/ci.yml). On macOS the first live-mic run
+triggers the system microphone-permission prompt (attributed to your terminal app).
 
 ## App
 
@@ -12,12 +22,20 @@ Live app (microphone), or a hardware-free demo:
 
 ```sh
 cargo run -p chrona-app
-cargo run -p chrona-app -- --simulate --rate 12 --beat-error 0.8
+cargo run -p chrona-app -- --simulate --rate 12 --beat-error 0.8 --amplitude 270
 ```
 
-Before any release, run the complete manual test protocol in docs/manual-testing.md.
+The instrument view shows the tier badge, rate / beat error / amplitude / BPH numerals,
+and a two-color paper tape (tic/toc) with an adjustable ±1/±2/±5 ms wrap. Controls cover
+input device, lift-angle presets, averaging window, BPH mode, and per-device timebase
+correction (persisted). Sessions can be recorded to WAV + JSON sidecar and replayed
+bit-faithfully. `--headless-seconds N` prints the metrics line and exits (used by CI).
 
-## Try it
+Before any release, run the complete manual test protocol in
+[docs/manual-testing.md](docs/manual-testing.md) — live-mic behavior can only be
+verified by a human with a real watch.
+
+## CLI
 
 ```sh
 # Generate a synthetic 21,600 bph watch running +12.5 s/d fast, then analyze it:
@@ -39,7 +57,32 @@ Rate readings carry an `[uncalibrated timebase]` badge until you supply `--ppm` 
 yours with `chrona calibrate` against any quartz watch (consumer audio clocks are off by
 up to ±100 ppm; 1 s/day is only 11.6 ppm).
 
-Metrics are tiered by signal quality (spec §3.1): Tier 1 = rate only, Tier 2 adds beat error, Tier 3 adds amplitude — weak signals show "—" with the reason instead of fabricated numbers.
+Metrics are tiered by signal quality (spec §3.1): Tier 1 = rate only, Tier 2 adds beat
+error, Tier 3 adds amplitude — weak signals show "—" with the reason instead of
+fabricated numbers.
+
+## Development
+
+Workspace crates:
+
+| Crate | Role |
+|---|---|
+| `chrona-dsp` | Analyzer core: envelope, period estimation, fold, matched filter, metrics, tiers, calibration, synthesizer |
+| `chrona-audio` | cpal capture, device enumeration, callback-safe ring feed |
+| `chrona-session` | WAV + JSON-sidecar recording, replay, config store |
+| `chrona-cli` | `synth` / `analyze` / `verify` / `calibrate` |
+| `chrona-app` | egui/eframe live app: engine thread, presenters, instrument UI |
+
+```sh
+cargo test --workspace                          # fast suite (hardware-free)
+cargo test -p chrona-dsp --release -- --ignored # stress matrix + perf bars
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+CI runs the fast suite on Linux/macOS/Windows plus the release-mode stress job on Linux.
+See [AGENTS.md](AGENTS.md) for the project's working conventions (binding spec, frozen
+constants, test discipline).
 
 ## License
 
