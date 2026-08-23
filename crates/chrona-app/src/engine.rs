@@ -136,11 +136,11 @@ pub struct HealthView {
 /// How urgently a [`Banner`] should read (spec §4). `Info` for notices that
 /// don't need alarm styling (e.g. "recording stopped: source changed",
 /// replay's "using recorded settings…"), `Warn` for recoverable/degraded-
-/// but-continuing conditions (every banner `pick_banner` derives from
-/// `HealthView` — mic error, silence, clipping, overruns — plus "saved
-/// input device unavailable … using default input"), `Error` for genuine
-/// failures/faults (every `failed to *` / `invalid *` string, and the
-/// thread-panic banner).
+/// but-continuing conditions (`pick_banner`'s silence/clipping/overruns
+/// notices, plus "saved input device unavailable … using default input"),
+/// `Error` for genuine failures/faults (every `failed to *` / `invalid *`
+/// string, the thread-panic banner, and `pick_banner`'s mic-capture-error
+/// banner — a dead/failing stream is a fault, not a transient notice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerSeverity {
     Info,

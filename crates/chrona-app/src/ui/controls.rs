@@ -51,10 +51,14 @@ const SILENT_BANNER_S: f64 = 3.0;
 /// a time (controller ruling).
 ///
 /// `engine_banner`, when present, is returned as-is (severity included) —
-/// the engine already classified it per the spec §4 mapping. Every banner
-/// `pick_banner` itself derives from `h` (mic error, silence, clipping,
-/// overruns) is `BannerSeverity::Warn` (spec §4: health-derived banners are
-/// always Warn).
+/// the engine already classified it per the spec §4 mapping. Of the banners
+/// `pick_banner` itself derives from `h`: `last_error` (a dead/failing
+/// capture stream) is `BannerSeverity::Error` (spec §4: "stream/config/fault
+/// errors = Error" — M3's semantics, where the last_error banner outranks
+/// and covers the dead-stream freeze, depend on it reading as an error);
+/// silence, clipping, and overruns are all `BannerSeverity::Warn` (spec §4
+/// deliberately reclassifies these — clipping in particular — as transient
+/// health notices, not faults).
 ///
 /// PURE: all temporal/stateful judgment — "clipped within the last 5s"
 /// tolerating counter resets (see `ClipTracker`), debounced retries — is the
@@ -69,7 +73,7 @@ pub fn pick_banner(
     }
     if let Some(msg) = &h.last_error {
         return Some(Banner {
-            severity: BannerSeverity::Warn,
+            severity: BannerSeverity::Error,
             text: format!("audio error: {msg} (reconnecting)"),
         });
     }
@@ -537,8 +541,9 @@ mod tests {
         );
 
         // B. Without an engine_banner, a mic capture error outranks
-        // silence/clipping/overruns even when all are present at once.
-        // Every banner pick_banner derives from HealthView itself is Warn.
+        // silence/clipping/overruns even when all are present at once, and
+        // is itself Error severity (a dead/failing stream is a fault, not a
+        // notice — unlike silence/clipping/overruns below, which are Warn).
         let everything_else_too = HealthView {
             last_error: Some("device disconnected".to_string()),
             silent_for_s: 10.0,
@@ -548,7 +553,7 @@ mod tests {
         assert_eq!(
             pick_banner(None, &everything_else_too, SourceKind::Mic),
             Some(Banner {
-                severity: BannerSeverity::Warn,
+                severity: BannerSeverity::Error,
                 text: "audio error: device disconnected (reconnecting)".to_string(),
             }),
         );
