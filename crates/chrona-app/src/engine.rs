@@ -306,9 +306,22 @@ impl SourceRuntime {
     /// sidecar is `None` here same as there) so replaying a file through
     /// this app reproduces what the `chrona` CLI's `replay` subcommand
     /// would report on the same file. The `Some(String)` return is an info
-    /// message describing the restored values, for the caller to publish as
-    /// a banner; UI config changes made during replay still work as normal
-    /// afterwards (they rebuild the analyzer same as any other change).
+    /// message describing the *applied* (post-clamp) values, for the caller
+    /// to publish as a banner; UI config changes made during replay still
+    /// work as normal afterwards (they rebuild the analyzer same as any
+    /// other change).
+    ///
+    /// The sidecar's `lift_angle_deg`/`ppm_correction` are clamped rather
+    /// than applied raw: a hand-edited (or otherwise corrupted) sidecar
+    /// could carry a `lift_angle_deg` outside `Analyzer::new`'s `[10, 90]`
+    /// domain, which — applied raw — would leave `*config` holding that bad
+    /// value even though the caller's subsequent `build_analyzer` rejects
+    /// it (this function only ever fails on `SessionReader::open`, never on
+    /// the config it writes). Every later config change starts from that
+    /// same poisoned `*config` (see `apply_config`'s `let mut candidate =
+    /// *config`), so it would keep failing validation — for the *same*
+    /// reason — until the user happened to fix the one bad field. Clamping
+    /// here means `*config` is always left analyzer-valid.
     fn build(
         spec: &SourceSpec,
         config: &mut EngineConfig,
@@ -352,12 +365,34 @@ impl SourceRuntime {
                         if let Some(mode) = parse_sidecar_bph_mode(&m.bph_mode) {
                             config.bph_mode = mode;
                         }
-                        config.lift_angle_deg = m.lift_angle_deg;
-                        config.ppm_correction = m.ppm_correction;
-                        format!(
-                            "replay: using recorded settings (lift {:.1}°, ppm {:.1})",
-                            m.lift_angle_deg, m.ppm_correction
-                        )
+                        // Clamped, not applied raw — see this fn's doc
+                        // comment. `f64::clamp` already saturates a
+                        // (finite-but-huge or ±infinite) out-of-domain
+                        // value to the nearest bound; a `NaN` lift can't
+                        // survive the JSON round trip in the first place
+                        // (no JSON literal for it, and serde_json won't
+                        // serialize one), so the bare clamp is sufficient
+                        // here.
+                        let lift = m.lift_angle_deg.clamp(10.0, 90.0);
+                        config.lift_angle_deg = lift;
+                        // ppm has no analyzer-side range (`Analyzer::new`
+                        // only requires it finite), so an out-of-[-500,500]
+                        // value wouldn't wedge the config the way an
+                        // out-of-range lift would — this clamp is UI/sanity
+                        // consistency with `ppm_control`'s own DragValue
+                        // range, not a build-safety fix. Non-finite instead
+                        // leaves `config.ppm_correction` untouched (no
+                        // sensible clamp target for it) rather than
+                        // poisoning the live config with a value
+                        // `Analyzer::new`'s dedicated finiteness check would
+                        // reject outright.
+                        let ppm = if m.ppm_correction.is_finite() {
+                            m.ppm_correction.clamp(-500.0, 500.0)
+                        } else {
+                            config.ppm_correction
+                        };
+                        config.ppm_correction = ppm;
+                        format!("replay: using recorded settings (lift {lift:.1}°, ppm {ppm:.1})")
                     });
                     (
                         SourceRuntime::Replay {
@@ -1079,6 +1114,59 @@ mod tests {
         assert_eq!(
             info.as_deref(),
             Some("replay: using recorded settings (lift 44.0°, ppm 7.5)")
+        );
+    }
+
+    #[test]
+    fn replay_source_clamps_out_of_range_sidecar_lift() {
+        // A hand-edited (or otherwise corrupted) sidecar can carry a
+        // lift_angle_deg outside Analyzer::new's [10, 90] domain. Applied
+        // raw, `config` would end up holding that bad value even though
+        // `SourceRuntime::build` itself only ever fails on
+        // `SessionReader::open` (never on the config it writes) — the
+        // caller's later `build_analyzer` would then reject it, leaving
+        // `config` wedged (see `SourceRuntime::build`'s doc comment).
+        // Confirms the clamp lands (5.0 -> 10.0), the info banner reports
+        // the applied (post-clamp) value rather than the raw 5.0, and the
+        // clamped config is actually analyzer-buildable.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = SessionMeta {
+            schema_version: 1,
+            device_name: "TestMic".to_string(),
+            sample_rate_hz: 48_000.0,
+            ppm_correction: 0.0,
+            lift_angle_deg: 5.0,
+            bph_mode: "auto".to_string(),
+            position: None,
+            started_unix_s: 1_700_000_000,
+            app_version: "test".to_string(),
+        };
+        let mut w = SessionWriter::create(dir.path(), meta).unwrap();
+        w.push(&vec![0.0f32; 4_800]).unwrap();
+        let wav_path = w.finalize().unwrap();
+
+        let mut config = EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: BphMode::Auto,
+            ppm_correction: 0.0,
+        };
+        let (source, info) =
+            SourceRuntime::build(&SourceSpec::ReplayFile { path: wav_path }, &mut config)
+                .expect("replay build succeeds even with an out-of-range sidecar lift");
+        assert_eq!(source.kind(), SourceKind::Replay);
+        assert_eq!(
+            config.lift_angle_deg, 10.0,
+            "clamped into Analyzer::new's [10, 90] domain"
+        );
+        assert_eq!(
+            info.as_deref(),
+            Some("replay: using recorded settings (lift 10.0°, ppm 0.0)"),
+            "banner reports the applied (post-clamp) value, not the raw 5.0"
+        );
+        assert!(
+            build_analyzer(&config, source.sample_rate_hz()).is_ok(),
+            "clamped config must be analyzer-valid — the whole point of clamping"
         );
     }
 

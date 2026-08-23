@@ -54,11 +54,15 @@ pub fn default_recordings_dir() -> Option<PathBuf> {
 /// moment it sent `StartRecording`), and no snapshot field carries the
 /// active replay's source path at all (`SourceRuntime::Replay` doesn't
 /// retain it). Both are set optimistically when this panel sends the
-/// corresponding control message and self-correct from the next snapshot
-/// otherwise (see `session_panel`'s first lines) — a failed switch/start
-/// just leaves them unused rather than lying, since the snapshot that would
-/// make them visible (`recording_path.is_some()` / `source_kind == Replay`)
-/// never arrives.
+/// corresponding control message, and neither is corrected against the
+/// snapshot afterwards (a snapshot-driven reset would race the engine's
+/// confirmation — see `session_panel`'s doc comment for `recording_started_
+/// at` specifically). A failed switch/start just leaves the optimistic
+/// value unused rather than lying, since each is only ever *displayed*
+/// behind the snapshot condition that would make it visible
+/// (`recording_started_at` behind `snap.recording.is_some()`, `replay_name`
+/// behind `source_kind == Replay`) — see `record_controls`' and
+/// `replay_mode_line`'s doc comments for the exact residuals.
 #[derive(Debug, Clone, Default)]
 pub struct SessionPanelState {
     pub position: String,
@@ -82,15 +86,18 @@ pub fn session_panel(
     recordings_dir: &Path,
     last_device: &Option<String>,
 ) {
-    // Self-correcting: whatever the reason recording isn't active per the
-    // engine's own snapshot — an explicit stop, a mid-recording source
-    // switch the engine auto-stopped (T7's recording-safe switching), or a
-    // start that failed — the elapsed clock resets rather than trusting our
-    // own optimistic toggle state.
-    if snap.recording.is_none() {
-        state.recording_started_at = None;
-    }
-
+    // `recording_started_at` is owned entirely by `record_controls`' own
+    // click handlers (Record sets it, Stop clears it) — there is
+    // deliberately no "reset it whenever snap.recording is None" check
+    // here. `snap` lags the click that sends StartRecording/StopRecording
+    // by up to a full engine tick (~50 ms) before the confirming snapshot
+    // publishes; a blanket reset gated on `snap.recording` would fire on
+    // any repaint during that window (egui repaints often, and the engine
+    // itself requests one on every ~10 Hz publish) and wipe the `Some`
+    // the click just set, permanently — nothing would ever set it again
+    // until the next Stop, so the elapsed label would wedge at "00:00" for
+    // the rest of the recording. See `record_controls`' doc comment for
+    // the (harmless) residuals of *not* having this reset.
     ui.horizontal(|ui| {
         if snap.source_kind != SourceKind::Replay {
             record_controls(ui, state, engine, snap, recordings_dir);
@@ -118,6 +125,20 @@ pub fn session_panel(
 /// Record toggle button, position quick-picks + free text, and the live
 /// `● REC <filename> <mm:ss>` indicator. Only called for Mic/Simulate
 /// sources (behavior contract: recording isn't offered while replaying).
+///
+/// `state.recording_started_at` is written only here — the Record click
+/// sets it, the Stop click clears it — never reset elsewhere (see
+/// `session_panel`'s doc comment on why a snapshot-driven reset would
+/// race). Two residuals of that:
+/// - A `StartRecording` the engine rejects (e.g. an uncreatable
+///   `recordings_dir`) leaves `recording_started_at` set even though
+///   `snap.recording` stays `None` — inert, since the elapsed label below
+///   only renders `if let Some(path) = &snap.recording`; the next Record
+///   click overwrites it with a fresh `Instant` regardless.
+/// - Clicking Stop clears it immediately (not gated on the engine's
+///   confirmation), so for the handful of frames until `snap.recording`
+///   itself catches up to `None`, the REC label can still render with
+///   elapsed pinned at `00:00` — a brief, harmless "stopping…" flicker.
 fn record_controls(
     ui: &mut egui::Ui,
     state: &mut SessionPanelState,
@@ -182,6 +203,14 @@ fn record_controls(
 /// The blue "REPLAY <name>" mode line (controller ruling: lives here, not
 /// in the health-banner slot) plus "· done" once `replay_done`, and the
 /// "Back to live" button.
+///
+/// `state.replay_name` is set optimistically by the "Open recording…"
+/// handler before the engine confirms the switch. If `SwitchSource` then
+/// fails (bad/corrupt WAV), `source_kind` never becomes `Replay`, so this
+/// function is simply never called — the stale name sits unused until the
+/// next successful pick overwrites it (same "only visible behind the
+/// condition that proves it's live" shape as `record_controls`' elapsed
+/// clock).
 fn replay_mode_line(
     ui: &mut egui::Ui,
     state: &mut SessionPanelState,
