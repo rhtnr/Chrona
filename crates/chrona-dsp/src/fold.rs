@@ -382,4 +382,79 @@ mod tests {
             "probe must reject correct-period moderate asymmetry"
         );
     }
+
+    /// M2 final-review mandate: the octave guard's false-positive defense had
+    /// never been stress-tested against REAL period estimates. This matrix
+    /// drives the full Analyzer (estimator → fold → guard) and requires ZERO
+    /// false halvings. Slow (~64 pipelines): run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "slow stress matrix; CI runs it in the ignored-tests job"]
+    fn octave_guard_false_positive_stress_matrix() {
+        use crate::analyzer::{Analyzer, AnalyzerConfig};
+        use crate::synth::{SynthConfig, synthesize};
+        let mut failures = Vec::new();
+        for seed in 1..=8u64 {
+            for toc_gain in [0.3f64, 0.5, 0.7, 1.0] {
+                for snr_db in [20.0f64, 30.0] {
+                    let cfg = SynthConfig {
+                        seed,
+                        toc_gain,
+                        snr_db,
+                        ..SynthConfig::default()
+                    };
+                    let x = synthesize(&cfg).expect("valid synth config");
+                    let mut a = Analyzer::new(AnalyzerConfig::default()).expect("config");
+                    a.push_samples(&x);
+                    match a.current() {
+                        Some(est) => {
+                            if est.bph_nominal != Some(28_800) {
+                                failures.push(format!(
+                                    "seed {seed} toc {toc_gain} snr {snr_db}: bph {:?} (detected {:.1})",
+                                    est.bph_nominal, est.bph_detected
+                                ));
+                            }
+                        }
+                        None => failures.push(format!(
+                            "seed {seed} toc {toc_gain} snr {snr_db}: no estimate"
+                        )),
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "false halvings / misreads:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// True-positive floor: the doubled-period correction must keep firing at
+    /// the envelope points the guard documents (35 dB, toc_gain 0.1) across seeds.
+    #[test]
+    #[ignore = "slow; CI runs it in the ignored-tests job"]
+    fn octave_guard_true_positive_holds_across_seeds() {
+        use crate::analyzer::{Analyzer, AnalyzerConfig};
+        use crate::synth::{SynthConfig, synthesize};
+        let mut failures = Vec::new();
+        for seed in 1..=6u64 {
+            let cfg = SynthConfig {
+                seed,
+                toc_gain: 0.1,
+                snr_db: 35.0,
+                ..SynthConfig::default()
+            };
+            let x = synthesize(&cfg).expect("valid synth config");
+            let mut a = Analyzer::new(AnalyzerConfig::default()).expect("config");
+            a.push_samples(&x);
+            match a.current() {
+                Some(est) if est.bph_nominal == Some(28_800) => {}
+                other => failures.push(format!("seed {seed}: {:?}", other.map(|e| e.bph_nominal))),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "declined halvings:\n{}",
+            failures.join("\n")
+        );
+    }
 }
