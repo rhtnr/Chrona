@@ -52,43 +52,50 @@ fn wrap_signed(value: f64, period: f64) -> f64 {
 ///
 /// Events without `t_unlock_s` are dropped — they can't be placed on the
 /// tape, and don't count against `max_beats`. Only the newest (up to)
-/// `max_beats` of the remaining events are kept; `beat_x` spans `0..=1`
-/// across whatever beat-index range that surviving window actually covers,
-/// so a run of un-unlocked beats shows as a gap rather than compressing
-/// its neighbors together.
+/// `max_beats` of the remaining events are kept.
+///
+/// `beat_x` is a CONSTANT-VELOCITY strip-chart coordinate, not a rescale
+/// to whatever's currently on screen: the newest surviving event is
+/// pinned to `beat_x = 1.0` (the right edge) and each beat back from it
+/// steps left by a FIXED `1 / (max_beats − 1)`, so one beat's distance
+/// from the right edge depends only on how many newer beats have arrived
+/// since — never on how many events happen to be in this particular
+/// call's window. That distinction matters because
+/// `chrona_dsp::Analyzer::tape_events()` is capped to its 32 s ring (a few
+/// hundred beats at typical rates), so a `max_beats` sized for the full
+/// display (e.g. 800) routinely never saturates; normalizing against the
+/// window's own observed span would make the whole trace visibly rescale
+/// on every call as events arrive, rather than scroll. An unsaturated
+/// window instead just leaves blank tape to the left of the oldest
+/// plotted dot — the same way a real strip-chart recorder's paper is
+/// blank until the pen has been running long enough to reach it.
 ///
 /// **Precondition:** `events` must already be time-ascending — the
 /// contract `chrona_dsp::Analyzer::tape_events()` guarantees for its
 /// output. This function does not sort.
 pub fn tape_dots(events: &[TapeEvent], p: &TapeParams) -> Vec<TapeDot> {
-    let unlocked: Vec<TapeEvent> = events
+    let unlocked: Vec<(TapeEvent, f64)> = events
         .iter()
-        .copied()
-        .filter(|e| e.t_unlock_s.is_some())
+        .filter_map(|e| Some((*e, e.t_unlock_s?)))
         .collect();
-    let Some(anchor) = unlocked.first().copied() else {
+    let Some(&(anchor, t_0)) = unlocked.first() else {
         return Vec::new();
     };
-    let t_0 = anchor
-        .t_unlock_s
-        .expect("unlocked events all carry t_unlock_s");
     let beat_index_0 = anchor.beat_index;
     let t_beat_nom = chrona_dsp::bph::t_beat_s(p.bph_nominal);
 
     let start = unlocked.len().saturating_sub(p.max_beats);
     let windowed = &unlocked[start..];
-    let k_first = windowed.first().map_or(0, |e| e.beat_index);
-    let k_last = windowed.last().map_or(0, |e| e.beat_index);
-    let k_span = (k_last - k_first).max(1) as f64;
+    let k_newest = windowed.last().map_or(0, |(e, _)| e.beat_index);
+    let denom = p.max_beats.saturating_sub(1).max(1) as f64;
 
     windowed
         .iter()
-        .map(|e| {
-            let t_unlock = e.t_unlock_s.expect("unlocked events all carry t_unlock_s");
+        .map(|&(e, t_unlock)| {
             let k = e.beat_index - beat_index_0;
             let dev_ms = ((t_unlock - t_0) - k as f64 * t_beat_nom) * 1_000.0;
             TapeDot {
-                beat_x: (e.beat_index - k_first) as f64 / k_span,
+                beat_x: 1.0 - (k_newest - e.beat_index) as f64 / denom,
                 dev_y: wrap_signed(dev_ms, p.wrap_ms) / p.wrap_ms,
                 is_tic: e.parity == Parity::Tic,
             }
@@ -194,6 +201,32 @@ mod tests {
         );
         assert_eq!(dots.len(), 800);
         assert!(dots.first().unwrap().beat_x >= 0.0 && dots.last().unwrap().beat_x <= 1.0);
+    }
+
+    #[test]
+    fn beat_x_advances_at_constant_velocity_anchored_right() {
+        let t_beat = 0.125;
+        let events: Vec<TapeEvent> = (0..100)
+            .map(|k| ev(k, 5.0 + k as f64 * t_beat, k % 2 == 0))
+            .collect();
+        let p = TapeParams {
+            bph_nominal: 28_800,
+            wrap_ms: 10.0,
+            max_beats: 800,
+        };
+        let dots = tape_dots(&events, &p);
+        assert!(
+            (dots.last().unwrap().beat_x - 1.0).abs() < 1e-12,
+            "newest anchors at 1.0"
+        );
+        let step = 1.0 / 799.0;
+        for w in dots.windows(2) {
+            assert!(
+                ((w[1].beat_x - w[0].beat_x) - step).abs() < 1e-12,
+                "constant velocity"
+            );
+        }
+        assert!((dots.first().unwrap().beat_x - (1.0 - 99.0 * step)).abs() < 1e-12);
     }
 
     #[test]
