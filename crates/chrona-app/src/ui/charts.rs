@@ -407,7 +407,6 @@ fn empty_state(painter: &egui::Painter, rect: egui::Rect, palette: &Palette, tex
 /// gridlines + axis labels + rotated axis title + tic/toc dots + rate-trend
 /// line — plus the wheel-zoom/drag-pan interactions (mockup: `drawBeat` +
 /// `bindPanZoom`).
-#[allow(clippy::too_many_arguments)]
 fn beat_trace_panel(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -494,16 +493,26 @@ fn beat_trace_panel(
     if response.hovered() {
         // egui 0.36 exposes `smooth_scroll_delta`, not the brief's
         // tentative `raw_scroll_delta` (no such field exists on this
-        // version's `InputState`). Sign choice: egui's positive Y means
-        // "content moves down" (its own doc comment), which we read as the
-        // same "scrolling down/back" gesture as the mockup's positive
-        // `deltaY` — so positive here zooms OUT (mockup: `deltaY > 0 ?
-        // 1.15 : 1/1.15`), matching typical map/chart wheel-zoom feel.
+        // version's `InputState`).
+        //
+        // Sign: egui's `smooth_scroll_delta.y` is positive when the
+        // CONTENT moves down — i.e. the user scrolled UP — the opposite
+        // sign of DOM `deltaY` for the same physical gesture. This is
+        // confirmed by egui's own `WheelState::smooth_wheel_delta` doc
+        // comment (`wheel_state.rs`) AND, unambiguously, by
+        // `ScrollArea`'s own application of it (`scroll_area.rs`):
+        // `scrolling_up = ... && scroll_delta > 0.0`, then
+        // `state.offset -= scroll_delta` — positive delta DECREASES the
+        // scroll offset, i.e. scrolls UP/toward the top. DOM's `deltaY`
+        // is the opposite: positive increases `scrollTop`, i.e. scrolls
+        // DOWN/toward the bottom. The mockup's `deltaY > 0` (scroll down)
+        // zooms OUT, so the equivalent egui gesture is `smooth_scroll_
+        // delta.y < 0` (also "scroll down" in DOM terms) zooming OUT.
         let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll_y > 0.0 {
-            view.zoom(1.15);
-        } else if scroll_y < 0.0 {
-            view.zoom(1.0 / 1.15);
+        if scroll_y < 0.0 {
+            view.zoom(1.15); // DOM-equivalent "scroll down" → zoom OUT
+        } else if scroll_y > 0.0 {
+            view.zoom(1.0 / 1.15); // DOM-equivalent "scroll up" → zoom IN
         }
     }
     if response.dragged() && plot.width() > 0.0 {
@@ -525,7 +534,6 @@ fn beat_trace_panel(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_beat_gridlines(
     painter: &egui::Painter,
     plot: egui::Rect,
@@ -632,7 +640,6 @@ fn amp_header_row(ui: &mut egui::Ui, palette: &Palette) {
 /// state (reusing `ui::cards::amplitude_cell`'s gate-reason caption), or
 /// the lo/mid/hi gridlines + the gap-broken amplitude polyline, on the
 /// SAME time window as the beat trace above (mockup: "same time scale").
-#[allow(clippy::too_many_arguments)]
 fn amplitude_panel(
     ui: &mut egui::Ui,
     palette: &Palette,
