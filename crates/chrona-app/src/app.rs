@@ -1,7 +1,8 @@
 //! The eframe application shell. Owns a live `Engine`, seeded from CLI flags
-//! and the persisted `ConfigStore`, and renders the instrument view (T8)
-//! behind a top controls row + health banner strip (T9) and a record &
-//! replay panel (T10).
+//! and the persisted `ConfigStore`, and renders the redesigned toolbar
+//! (`ui::toolbar::toolbar_row`, M4a Task 6) + health banner strip above the
+//! M3 instrument view (T8) and record & replay panel (T10) — both still
+//! carry their own M4a redesigns in later tasks.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,8 +18,8 @@ use crate::history::HistoryIndex;
 use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
-    ClipTracker, ControlsState, SessionPanelState, TapeUiState, controls_row,
-    default_recordings_dir, pick_banner, session_panel,
+    AddWatchModalState, BphComboItem, ClipTracker, ControlsState, SessionPanelState, TapeUiState,
+    ToolbarCtx, ToolbarState, default_recordings_dir, pick_banner, session_panel, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -33,10 +34,12 @@ pub struct ChronaApp {
     tape_ui: TapeUiState,
     controls: ControlsState,
     config: ConfigStore,
-    /// The active theme, applied to `cc.egui_ctx` at startup. Not yet read
-    /// anywhere else — the toolbar toggle that flips it and re-applies via
-    /// `theme::apply_style` lands in a later M4a task (spec §1).
-    #[allow(dead_code)]
+    /// The active theme, applied to `cc.egui_ctx` at startup and flipped by
+    /// the toolbar's theme-toggle button (M4a Task 6:
+    /// `ui::toolbar::toolbar_row`), which re-applies it via
+    /// `theme::apply_style` and persists the choice into `config.theme`
+    /// immediately (not the debounced save the continuous-drag controls
+    /// use).
     theme: Theme,
     /// M4a beat-trace accumulators (design spec §10/§11): fed from every
     /// snapshot alongside the M3 tape below, spanning up to
@@ -47,7 +50,7 @@ pub struct ChronaApp {
     amp_accum: AmpAccum,
     /// The beat-trace chart's pan/zoom/follow state (design spec §10).
     /// Not yet read anywhere else — the chart's pan/zoom controls land in
-    /// a later M4a task (Task 7/8), same as `theme` above.
+    /// a later M4a task (Task 8).
     #[allow(dead_code)]
     trace_view: TraceView,
     /// Set the moment the config first goes dirty (not refreshed on every
@@ -64,17 +67,31 @@ pub struct ChronaApp {
     recordings_dir: PathBuf,
     /// The session-history index (spec §7), scanned once from
     /// `recordings_dir` at startup and kept current afterwards by
-    /// `session_panel`'s upsert-on-finalize hook (which is the only place
-    /// this is read so far — nothing yet renders its contents; the history
-    /// table and position-comparison card land in a later M4a task,
-    /// Task 9).
+    /// `session_panel`'s upsert-on-finalize hook. Read by the toolbar's
+    /// Export button (M4a Task 6: `export_enabled`) to gate on whether the
+    /// selected watch has any recorded sessions; the history table and
+    /// position-comparison card land in a later M4a task.
     history: HistoryIndex,
+    /// Toolbar-owned state (M4a Task 6) that doesn't belong on
+    /// `ControlsState`/`ConfigStore`: the selected watch (seeded from, and
+    /// kept mirrored into, `config.last_watch`), the active BPH combo row,
+    /// the add-watch modal, and the export-report request flag the
+    /// toolbar's Export button sets — nothing consumes it yet (see the
+    /// `export_requested` stub in `ChronaApp::ui`; Task 9 wires the real
+    /// export).
+    toolbar: ToolbarState,
 }
 
 impl ChronaApp {
     pub fn new(cc: &eframe::CreationContext<'_>, flags: AppFlags) -> Self {
         let config = ConfigStore::load_default();
         let controls = ControlsState::from_config(&config);
+        let toolbar = ToolbarState {
+            selected_watch: config.last_watch.clone(),
+            bph_selection: BphComboItem::Auto,
+            add_watch_modal: AddWatchModalState::default(),
+            export_requested: false,
+        };
 
         let theme = theme::theme_from_config(config.theme.as_deref());
         theme::install_fonts(&cc.egui_ctx);
@@ -120,6 +137,7 @@ impl ChronaApp {
             session: SessionPanelState::default(),
             recordings_dir,
             history,
+            toolbar,
         }
     }
 
@@ -180,31 +198,14 @@ impl eframe::App for ChronaApp {
             snap.metrics.as_ref().and_then(|m| m.amplitude_deg),
         );
 
-        egui::Panel::top("chrona_top").show(ui, |ui| {
-            ui.heading("Chrona");
-            if controls_row(ui, &mut self.controls, &self.engine, &mut self.config) {
-                self.dirty_since.get_or_insert_with(Instant::now);
-            }
-            ui.separator();
-            session_panel(
-                ui,
-                &mut self.session,
-                &self.engine,
-                &snap,
-                &self.recordings_dir,
-                &self.controls.selected_device,
-                &mut self.history,
-            );
-        });
-
-        self.maybe_retry_mic(snap.health.last_error.is_some());
-        self.maybe_save_config();
-
         // Clip windowing (controller ruling: "delta over last 5s",
         // tolerating the counter resetting on analyzer rebuild) happens
         // here, outside the pure `pick_banner`; the windowed count is
         // spliced into a copy of the snapshot's health before deciding the
-        // banner.
+        // banner. Computed before the top panel (not after, as M3 did) so
+        // the banner can render inside it, directly below the toolbar (M4a
+        // Task 6 behavior contract — a temporary placement; a later task
+        // gives it a permanent home in the redesigned layout).
         let windowed_clipped = self
             .clip_tracker
             .observe(snap.health.clipped, Instant::now());
@@ -214,27 +215,78 @@ impl eframe::App for ChronaApp {
         };
         let banner = pick_banner(snap.banner.as_ref(), &health_for_banner, snap.source_kind);
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(banner) = &banner {
-                render_banner(ui, banner);
+        egui::Panel::top("chrona_top").show(ui, |ui| {
+            let dirty = toolbar_row(
+                ui,
+                &mut self.controls,
+                &self.engine,
+                &mut self.config,
+                &mut self.theme,
+                &mut self.toolbar,
+                ToolbarCtx {
+                    session: &mut self.session,
+                    snap: &snap,
+                    recordings_dir: &self.recordings_dir,
+                    history: &self.history,
+                },
+            );
+            if dirty {
+                self.dirty_since.get_or_insert_with(Instant::now);
             }
+
+            let palette = theme::Palette::of(self.theme);
+            if let Some(banner) = &banner {
+                render_banner(ui, palette, banner);
+            }
+
+            ui.separator();
+            session_panel(
+                ui,
+                &mut self.session,
+                &self.engine,
+                &snap,
+                &self.controls.selected_device,
+                &mut self.history,
+            );
+        });
+
+        if self.toolbar.export_requested {
+            // Task 9 wires the real export flow; for now this just clears
+            // the flag `ui::toolbar::toolbar_row`'s Export button sets so
+            // a stale request isn't reprocessed on a later frame.
+            self.toolbar.export_requested = false;
+        }
+
+        self.maybe_retry_mic(snap.health.last_error.is_some());
+        self.maybe_save_config();
+
+        egui::CentralPanel::default().show(ui, |ui| {
             crate::ui::instrument_view(ui, &snap, &mut self.tape_ui);
         });
     }
 }
 
-/// Paints one banner as a filled, full-width strip above the instrument.
-fn render_banner(ui: &mut egui::Ui, banner: &Banner) {
-    let color = match banner.severity {
-        BannerSeverity::Error => egui::Color32::from_rgb(140, 30, 30),
-        BannerSeverity::Warn => egui::Color32::from_rgb(140, 100, 20),
-        BannerSeverity::Info => egui::Color32::from_gray(55),
-    };
-    egui::Frame::new()
-        .fill(color)
-        .inner_margin(6.0)
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(&banner.text).color(egui::Color32::WHITE));
-        });
+/// Paints one banner (M4a Task 6 severity → color mapping, spec §4): `Info`
+/// is `palette.accent` text, `Warn` is `palette.warnfg` text on a
+/// `palette.warnbg`-filled strip, `Error` is `palette.rec` text — replacing
+/// M3's flat red/amber/gray fills for every severity.
+fn render_banner(ui: &mut egui::Ui, palette: &theme::Palette, banner: &Banner) {
+    match banner.severity {
+        BannerSeverity::Warn => {
+            egui::Frame::new()
+                .fill(palette.warnbg)
+                .corner_radius(6)
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(&banner.text).color(palette.warnfg));
+                });
+        }
+        BannerSeverity::Info => {
+            ui.label(egui::RichText::new(&banner.text).color(palette.accent));
+        }
+        BannerSeverity::Error => {
+            ui.label(egui::RichText::new(&banner.text).color(palette.rec));
+        }
+    }
     ui.add_space(4.0);
 }

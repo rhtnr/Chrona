@@ -1,8 +1,12 @@
-//! Controls row (T9): device picker, analysis knobs (lift/averaging/BPH
-//! mode/ppm), health banners, and `ConfigStore` persistence wiring. The two
-//! pure decision functions (`to_bph_mode`, `pick_banner`) are TDD'd first,
-//! below; the egui-facing rendering functions come after and are exercised
-//! only by `cargo build` + the workspace test suite (no window in CI).
+//! Controls state + shared helpers, consumed by `ui::toolbar::toolbar_row`
+//! (M4a Task 6, which replaced the M3 controls row this module used to
+//! render): the BPH mode decision function, health-banner precedence,
+//! `ConfigStore`-seeded per-control state, and the device picker (still
+//! rendered here verbatim — "existing device list/refresh logic" per the
+//! Task 6 brief — and called from the toolbar). The pure decision functions
+//! (`to_bph_mode`, `pick_banner`) are TDD'd first, below; `device_picker`'s
+//! egui-facing rendering comes after and is exercised only by `cargo build`
+//! + the workspace test suite (no window in CI).
 
 use std::time::{Duration, Instant};
 
@@ -154,9 +158,6 @@ pub struct ControlsState {
 /// show up).
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Lift-angle preset menu (behavior contract), degrees.
-const LIFT_PRESETS: [f64; 7] = [52.0, 38.0, 42.0, 44.0, 50.0, 53.0, 55.0];
-
 /// Config files are hand-editable; TOML has literal `inf`/`nan`. Gate on
 /// finiteness first (f64::clamp propagates NaN), then clamp to the same
 /// ranges the sidecar-restore path enforces (engine.rs).
@@ -211,18 +212,6 @@ impl ControlsState {
     }
 }
 
-/// Resolves the currently selected device id to its display name, for the
-/// `device_ppm` config key (behavior contract: keyed by device name, not
-/// the opaque id — a name survives round-tripping through the config file
-/// more legibly, matching `ConfigStore`'s own convention).
-fn current_device_name(controls: &ControlsState) -> Option<String> {
-    controls
-        .selected_device
-        .as_ref()
-        .and_then(|id| controls.devices.iter().find(|d| &d.id == id))
-        .map(|d| d.name.clone())
-}
-
 /// True iff the *set* of device ids differs — used to gate replacing
 /// `controls.devices` on a poll so an unchanged device list (the common
 /// case, polled every 2s) doesn't flicker the open combo box.
@@ -233,41 +222,17 @@ fn device_ids_changed(old: &[DeviceInfo], new: &[DeviceInfo]) -> bool {
 }
 
 // ---------------------------------------------------------------------
-// Rendering: the controls row. Exercised by `cargo build` + the workspace
-// test suite; no window in CI, so nothing here is unit-tested directly —
-// see the module doc comment.
+// Rendering: the device picker (called from `ui::toolbar::toolbar_row`).
+// Exercised by `cargo build` + the workspace test suite; no window in CI,
+// so nothing here is unit-tested directly — see the module doc comment.
 // ---------------------------------------------------------------------
-
-/// Renders the full controls row (device picker, lift, averaging, BPH
-/// mode, ppm). Returns `true` iff a persisted `ConfigStore` field changed
-/// this frame, so `app.rs` can mark it dirty for the debounced save.
-pub fn controls_row(
-    ui: &mut egui::Ui,
-    controls: &mut ControlsState,
-    engine: &Engine,
-    config: &mut ConfigStore,
-) -> bool {
-    ui.horizontal(|ui| {
-        let mut dirty = false;
-        dirty |= device_picker(ui, controls, engine, config);
-        ui.separator();
-        dirty |= lift_control(ui, controls, engine, config);
-        ui.separator();
-        averaging_control(ui, controls, engine);
-        ui.separator();
-        bph_mode_selector(ui, controls, engine);
-        ui.separator();
-        dirty |= ppm_control(ui, controls, engine, config);
-        dirty
-    })
-    .inner
-}
 
 /// Refresh button + auto-refresh-every-2s, plus the device combo itself.
 /// Selecting a device (or "System default") sends `SwitchSource`, persists
 /// `last_device`, and applies + sends that device's saved ppm (behavior
-/// contract).
-fn device_picker(
+/// contract). `pub(crate)`, not `pub`: reused by the toolbar (M4a Task 6)
+/// but not otherwise part of this module's public surface.
+pub(crate) fn device_picker(
     ui: &mut egui::Ui,
     controls: &mut ControlsState,
     engine: &Engine,
@@ -341,143 +306,6 @@ fn select_device(
         .unwrap_or(0.0);
     controls.ppm = ppm;
     engine.send(ControlMsg::SetPpm(ppm));
-}
-
-/// Lift `DragValue` (10-90 degrees) plus the preset menu.
-fn lift_control(
-    ui: &mut egui::Ui,
-    controls: &mut ControlsState,
-    engine: &Engine,
-    config: &mut ConfigStore,
-) -> bool {
-    let mut dirty = ui
-        .add(
-            egui::DragValue::new(&mut controls.lift)
-                .range(10.0..=90.0)
-                .suffix("°"),
-        )
-        .changed();
-
-    egui::ComboBox::from_id_salt("lift_presets")
-        .selected_text("Presets")
-        .show_ui(ui, |ui| {
-            for preset in LIFT_PRESETS {
-                if ui.button(format!("{preset:.0}°")).clicked() {
-                    controls.lift = preset;
-                    dirty = true;
-                }
-            }
-        });
-
-    if dirty {
-        engine.send(ControlMsg::SetLift(controls.lift));
-        config.default_lift_deg = controls.lift;
-    }
-    dirty
-}
-
-/// Averaging `Slider` (2-60s). Not persisted — `ConfigStore` has no field
-/// for it.
-fn averaging_control(ui: &mut egui::Ui, controls: &mut ControlsState, engine: &Engine) {
-    if ui
-        .add(egui::Slider::new(&mut controls.averaging, 2.0..=60.0).text("Averaging (s)"))
-        .changed()
-    {
-        engine.send(ControlMsg::SetAveraging(controls.averaging));
-    }
-}
-
-/// BPH mode selector (Auto/Free/Fixed) plus the Fixed text buffer, red-
-/// outlined while unparseable. `SetBphMode` is only ever sent when
-/// `to_bph_mode` succeeds (behavior contract) — an invalid Fixed edit sends
-/// nothing.
-fn bph_mode_selector(ui: &mut egui::Ui, controls: &mut ControlsState, engine: &Engine) {
-    let current_label = match &controls.bph_mode_ui {
-        BphModeUi::Auto => "Auto",
-        BphModeUi::Free => "Free",
-        BphModeUi::Fixed(_) => "Fixed",
-    };
-    let mut changed = false;
-    egui::ComboBox::from_id_salt("bph_mode")
-        .selected_text(current_label)
-        .show_ui(ui, |ui| {
-            if ui
-                .selectable_label(matches!(controls.bph_mode_ui, BphModeUi::Auto), "Auto")
-                .clicked()
-                && !matches!(controls.bph_mode_ui, BphModeUi::Auto)
-            {
-                controls.bph_mode_ui = BphModeUi::Auto;
-                changed = true;
-            }
-            if ui
-                .selectable_label(matches!(controls.bph_mode_ui, BphModeUi::Free), "Free")
-                .clicked()
-                && !matches!(controls.bph_mode_ui, BphModeUi::Free)
-            {
-                controls.bph_mode_ui = BphModeUi::Free;
-                changed = true;
-            }
-            if ui
-                .selectable_label(matches!(controls.bph_mode_ui, BphModeUi::Fixed(_)), "Fixed")
-                .clicked()
-                && !matches!(controls.bph_mode_ui, BphModeUi::Fixed(_))
-            {
-                controls.bph_mode_ui = BphModeUi::Fixed("28800".to_string());
-                changed = true;
-            }
-        });
-
-    if let BphModeUi::Fixed(text) = &mut controls.bph_mode_ui {
-        let invalid = text.trim().parse::<u32>().is_err();
-        ui.scope(|ui| {
-            if invalid {
-                let stroke = egui::Stroke::new(1.0, egui::Color32::RED);
-                ui.visuals_mut().widgets.inactive.bg_stroke = stroke;
-                ui.visuals_mut().widgets.hovered.bg_stroke = stroke;
-                ui.visuals_mut().widgets.active.bg_stroke = stroke;
-            }
-            if ui
-                .add(egui::TextEdit::singleline(text).desired_width(60.0))
-                .changed()
-            {
-                changed = true;
-            }
-        });
-    }
-
-    if changed && let Some(mode) = to_bph_mode(&controls.bph_mode_ui) {
-        engine.send(ControlMsg::SetBphMode(mode));
-    }
-}
-
-/// ppm `DragValue` (+-500, 0.1 step). Persisted into
-/// `config.device_ppm[current device name]` — skipped (but still sent live)
-/// on "System default", same reasoning as `select_device`.
-fn ppm_control(
-    ui: &mut egui::Ui,
-    controls: &mut ControlsState,
-    engine: &Engine,
-    config: &mut ConfigStore,
-) -> bool {
-    let changed = ui
-        .add(
-            egui::DragValue::new(&mut controls.ppm)
-                .range(-500.0..=500.0)
-                .speed(0.1)
-                .suffix(" ppm"),
-        )
-        .changed();
-    if !changed {
-        return false;
-    }
-    engine.send(ControlMsg::SetPpm(controls.ppm));
-    match current_device_name(controls) {
-        Some(name) => {
-            config.device_ppm.insert(name, controls.ppm);
-            true
-        }
-        None => false,
-    }
 }
 
 #[cfg(test)]

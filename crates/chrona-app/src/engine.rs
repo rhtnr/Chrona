@@ -411,8 +411,8 @@ impl SourceRuntime {
                         // only requires it finite), so an out-of-[-500,500]
                         // value wouldn't wedge the config the way an
                         // out-of-range lift would — this clamp is UI/sanity
-                        // consistency with `ppm_control`'s own DragValue
-                        // range, not a build-safety fix. Non-finite instead
+                        // consistency with `ui::controls::sanitize_ppm`'s
+                        // own range, not a build-safety fix. Non-finite instead
                         // leaves `config.ppm_correction` untouched (no
                         // sensible clamp target for it) rather than
                         // poisoning the live config with a value
