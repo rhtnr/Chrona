@@ -95,11 +95,13 @@ fn control_messages_rebuild_without_deadlock() {
 fn non_turbo_pacing_survives_a_control_message_burst() {
     // I2: the two tests above only ever exercise `start_with_turbo(..,
     // true)`, never the real (non-turbo) wall-clock-paced path this fix
-    // touches directly. This doesn't measure the cadence precisely (the
-    // public snapshot has no elapsed-ticks counter to assert against) but
-    // does confirm the pacing rewrite doesn't hang or deadlock — including
-    // under a burst of control messages, which is exactly the scenario I2
-    // guards against inflating the tick cadence for.
+    // touches directly. This doesn't measure the tick cadence precisely
+    // (the public snapshot has no elapsed-ticks counter to assert
+    // against), but does confirm the pacing rewrite doesn't hang or
+    // deadlock under a burst of control messages — the exact scenario I2
+    // guards against inflating the cadence for — and, via the invalid
+    // message appended below, that the burst is actually drained and
+    // published by the non-turbo path rather than merely not wedging it.
     let mut eng = Engine::start(
         SourceSpec::Simulate {
             rate: 0.0,
@@ -118,10 +120,22 @@ fn non_turbo_pacing_survives_a_control_message_burst() {
     for _ in 0..20 {
         eng.send(ControlMsg::SetLift(52.0));
     }
+    // One invalid message closes out the burst: `averaging_s` must be in
+    // [2, 60] (`AnalyzerConfig`'s own validation), so `Analyzer::new`
+    // rejects 999 and `apply_config` sets `error_banner`. The default
+    // snapshot's banner is always `None`, so seeing it `Some` after the
+    // wait below is proof this specific message was actually drained and
+    // published by the non-turbo path — not just evidence the thread
+    // didn't hang.
+    eng.send(ControlMsg::SetAveraging(999.0));
     // ~10 Hz publish cadence: 1 s is generous headroom for at least one
     // real (non-default) snapshot to land even on a loaded machine.
     std::thread::sleep(std::time::Duration::from_secs(1));
     let snap = eng.snapshot();
     assert!(matches!(snap.source_kind, SourceKind::Simulate));
+    assert!(
+        snap.error_banner.is_some(),
+        "invalid SetAveraging never surfaced — burst wasn't drained/published"
+    );
     drop(eng); // Shutdown + join must complete (test would hang otherwise)
 }

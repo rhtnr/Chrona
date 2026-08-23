@@ -694,18 +694,20 @@ fn engine_loop(
                                 // teeing the old source's (now
                                 // semantically wrong, possibly
                                 // different-rate) audio into the WAV —
-                                // stop and finalize it. Unconditional and
-                                // best-effort: harmless when nothing was
-                                // recording, and the single banner slot is
-                                // fine carrying this info-grade notice for
-                                // M3 (`writer.take()` is a no-op if it was
-                                // already `None`).
+                                // stop and finalize it, and say so. When
+                                // nothing was recording, a successful
+                                // switch clears any stale error as usual
+                                // (this banner would otherwise be a false
+                                // "recording stopped" notice every time
+                                // the source changes).
                                 if let Some(w) = writer.take() {
                                     let _ = w.finalize();
+                                    recording_path = None;
+                                    error_banner =
+                                        Some("recording stopped: source changed".to_string());
+                                } else {
+                                    error_banner = None;
                                 }
-                                recording_path = None;
-                                error_banner =
-                                    Some("recording stopped: source changed".to_string());
                             }
                             Err(e) => {
                                 error_banner = Some(format!("invalid config for new source: {e}"))
