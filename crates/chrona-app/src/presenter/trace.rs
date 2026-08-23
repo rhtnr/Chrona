@@ -121,6 +121,23 @@ impl BeatAccum {
     /// t_unlock_prev)/T_beat))` — the rounding rides through detection
     /// gaps — then `offset_ms_i = (k_i·T_beat − (t_unlock_i − t0)) ·
     /// 1000.0`.
+    ///
+    /// Accepted edge (spec-accepted — the §14 "wrap preset ±1 ms (M3) is
+    /// dropped" trade-off): the `round` above only misfires — snapping to
+    /// the wrong integer beat count — when the accumulated drift between
+    /// two consecutive KEPT events exceeds `T_beat/2`. That drift is
+    /// `gap_beats · T_beat · rate_s_per_day / 86_400` (the nominal gap in
+    /// beats times the watch's rate error, converted from s/day); since
+    /// `T_beat` cancels against the `T_beat/2` tolerance, the misfire
+    /// condition reduces to `gap_beats × rate_s_per_day > 43_200` — e.g. a
+    /// ~90 s detection gap on a +60 s/d watch at 28,800 bph — or, at the
+    /// 72,000 bph extreme, where `T_beat/2` (25 ms) already equals the
+    /// widest wrap preset's ±25 ms radius (`WRAP_PRESETS_MS`'s `50.0`
+    /// entry). Effect: a one-beat grid slip, visible as a cosmetic
+    /// wrap-scale artifact in the chart; the grid is self-consistent again
+    /// immediately afterward. This is an accepted limit of anchoring the
+    /// grid on elapsed TIME alone (see this struct's own doc comment
+    /// above), not a bug to fix here.
     pub fn extend(&mut self, events: &[TapeEvent], bph_nominal: Option<u32>) {
         if bph_nominal != self.bph_nominal {
             self.reset();
