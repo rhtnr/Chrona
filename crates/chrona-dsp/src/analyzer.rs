@@ -1106,9 +1106,19 @@ mod tests {
         );
         times.sort();
         let p50 = times[times.len() / 2];
+        // 10 ms carries ~2x margin on a dev machine (p50 ≈ 4.4 ms measured);
+        // shared CI runners are ~3x slower (12.9 ms observed on a 2-core
+        // GitHub runner), so CI (env var set by all major CI providers) gets
+        // a 30 ms bar. Both bars catch the regression class this test
+        // guards: per-poll full re-extraction costs ~90 ms on any hardware.
+        let bar_ms = if std::env::var_os("CI").is_some() {
+            30
+        } else {
+            10
+        };
         assert!(
-            p50 < std::time::Duration::from_millis(10),
-            "p50 {p50:?} (bar: 10 ms release)"
+            p50 < std::time::Duration::from_millis(bar_ms),
+            "p50 {p50:?} (bar: {bar_ms} ms release)"
         );
     }
 }
