@@ -150,10 +150,18 @@ const LIFT_PRESETS: [f64; 7] = [52.0, 38.0, 42.0, 44.0, 50.0, 53.0, 55.0];
 /// finiteness first (f64::clamp propagates NaN), then clamp to the same
 /// ranges the sidecar-restore path enforces (engine.rs).
 fn sanitize_lift(lift: f64) -> f64 {
-    if lift.is_finite() { lift.clamp(10.0, 90.0) } else { 52.0 }
+    if lift.is_finite() {
+        lift.clamp(10.0, 90.0)
+    } else {
+        52.0
+    }
 }
 fn sanitize_ppm(ppm: f64) -> f64 {
-    if ppm.is_finite() { ppm.clamp(-500.0, 500.0) } else { 0.0 }
+    if ppm.is_finite() {
+        ppm.clamp(-500.0, 500.0)
+    } else {
+        0.0
+    }
 }
 
 impl ControlsState {
