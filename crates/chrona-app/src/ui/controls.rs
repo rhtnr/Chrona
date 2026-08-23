@@ -103,6 +103,27 @@ pub fn pick_banner(
     None
 }
 
+/// Resolves which banner the transient app-side slot (M4a Task 9:
+/// `ChronaApp::app_banner` — currently only the Export-report success/
+/// failure notice) shows this frame, against the engine-truth banner
+/// already resolved by `pick_banner` (live health/capture faults, explicit
+/// engine notices — spec §4). Engine truth always outranks a UI notice
+/// (behavior contract): a real fault must never be silently covered on
+/// screen by e.g. "report saved", so `app_banner` is only ever returned
+/// when `engine_banner_present` is `false` this frame. PURE — takes
+/// presence as a plain `bool` rather than `Banner` itself so this has no
+/// dependency on the engine banner's own fields, just its precedence.
+pub fn resolve_app_banner(
+    engine_banner_present: bool,
+    app_banner: Option<&(BannerSeverity, String)>,
+) -> Option<&(BannerSeverity, String)> {
+    if engine_banner_present {
+        None
+    } else {
+        app_banner
+    }
+}
+
 /// Trailing window `ClipTracker` treats a clip as still "current" for.
 const CLIP_WINDOW_S: f64 = 5.0;
 
@@ -457,6 +478,34 @@ mod tests {
         assert_eq!(
             pick_banner(None, &HealthView::default(), SourceKind::Mic),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_app_banner_precedence() {
+        let app = (
+            BannerSeverity::Info,
+            "report saved to report.html".to_string(),
+        );
+        assert_eq!(
+            resolve_app_banner(true, Some(&app)),
+            None,
+            "engine truth outranks a UI notice, even when both are present"
+        );
+        assert_eq!(
+            resolve_app_banner(false, Some(&app)),
+            Some(&app),
+            "no engine banner this frame: the app notice gets its turn"
+        );
+        assert_eq!(
+            resolve_app_banner(false, None),
+            None,
+            "nothing to show when there's no app notice either"
+        );
+        assert_eq!(
+            resolve_app_banner(true, None),
+            None,
+            "engine banner present and no app notice: still nothing from this slot"
         );
     }
 

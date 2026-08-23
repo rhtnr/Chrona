@@ -8,13 +8,19 @@
 mod cards;
 mod charts;
 mod controls;
+mod history_ui;
 mod modals;
 mod strip;
 mod toolbar;
 
 pub use cards::metrics_cards;
 pub use charts::{ChartsCtx, ChartsUiState, charts_section};
-pub use controls::{BphModeUi, ClipTracker, ControlsState, pick_banner, to_bph_mode};
+pub use controls::{
+    BphModeUi, ClipTracker, ControlsState, pick_banner, resolve_app_banner, to_bph_mode,
+};
+pub use history_ui::{
+    BottomGridCtx, ComparisonRow, bottom_grid, comparison_rows, session_time_label,
+};
 pub use modals::{AddWatchModalState, HelpTopicId, render_help_modal};
 pub use strip::{
     SessionPanelState, StripCtx, default_recordings_dir, position_strip, rec_elapsed_label,

@@ -76,7 +76,7 @@ pub fn export_enabled(selected_watch: Option<&str>, has_sessions: bool) -> bool 
 /// `ControlsState::bph_mode_ui`, which only ever holds the free-text
 /// buffer for the `Other…` case — see `apply_bph_selection`), the add-watch
 /// modal, and the export-report request flag the Export button sets
-/// (nothing consumes it yet; Task 9 wires the real export).
+/// (consumed each frame by `ChronaApp::run_export`, M4a Task 9).
 pub struct ToolbarState {
     pub selected_watch: Option<String>,
     pub bph_selection: BphComboItem,
@@ -531,8 +531,8 @@ fn open_recording_button(
 
 /// Export button: enabled iff `export_enabled` (a watch selected AND it has
 /// recorded sessions), disabled otherwise with the behavior contract's
-/// tooltip. A click only sets `export_requested` — Task 9 consumes it
-/// (`ChronaApp::ui`'s stub).
+/// tooltip. A click only sets `export_requested`; `ChronaApp::run_export`
+/// (M4a Task 9) consumes it on the next frame.
 fn export_button(
     ui: &mut egui::Ui,
     palette: &Palette,

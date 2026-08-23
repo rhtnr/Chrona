@@ -349,8 +349,7 @@ mod tests {
         assert!(html.contains("chrona"), "must credit the app");
         assert!(html.contains("0.9.0-test"), "must include the app version");
         assert!(
-            html.contains("&lt;b&gt;Tag &amp; Co&lt;/b&gt;")
-                || html.contains("&lt;b&gt;Test&lt;/b&gt;"),
+            html.contains("&lt;b&gt;Test&lt;/b&gt;"),
             "watch name must be escaped somewhere in the doc"
         );
         assert!(

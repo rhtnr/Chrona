@@ -3,7 +3,11 @@
 //! (`ui::toolbar::toolbar_row`, M4a Task 6) + health banner, the position/
 //! session strip and metric cards (`ui::strip`/`ui::cards`, M4a Task 7),
 //! above the beat-trace/amplitude charts (`ui::charts::charts_section`,
-//! M4a Task 8) that replaced M3's paper tape.
+//! M4a Task 8) that replaced M3's paper tape, and — completing the
+//! mockup's layout — the session-history/position-comparison cards
+//! (`ui::history_ui::bottom_grid`, M4a Task 9) below them, plus the
+//! Export-report flow (`run_export`) and the app-side notice banner that
+//! reports its outcome.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,17 +16,16 @@ use chrona_session::ConfigStore;
 use eframe::egui;
 
 use crate::AppFlags;
-use crate::engine::{
-    Banner, BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec,
-};
-use crate::history::{HistoryIndex, POSITIONS};
+use crate::engine::{BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec};
+use crate::export::{ReportInput, default_report_name, render_report};
+use crate::history::{HistoryIndex, POSITIONS, PositionRates, SessionEntry, position_rates};
 use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
-    AddWatchModalState, BphComboItem, ChartsCtx, ChartsUiState, ClipTracker, ControlsState,
-    HelpTopicId, SessionPanelState, StripCtx, ToolbarCtx, ToolbarState, charts_section,
-    default_recordings_dir, metrics_cards, pick_banner, position_strip, render_help_modal,
-    toolbar_row,
+    AddWatchModalState, BottomGridCtx, BphComboItem, BphModeUi, ChartsCtx, ChartsUiState,
+    ClipTracker, ControlsState, HelpTopicId, SessionPanelState, StripCtx, ToolbarCtx, ToolbarState,
+    bottom_grid, charts_section, default_recordings_dir, metrics_cards, pick_banner,
+    position_strip, render_help_modal, resolve_app_banner, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -73,25 +76,27 @@ pub struct ChronaApp {
     /// `recordings_dir` at startup and kept current afterwards by
     /// `ui::strip::position_strip`'s upsert-on-finalize hook. Read by the
     /// toolbar's Export button (M4a Task 6: `export_enabled`) to gate on
-    /// whether the selected watch has any recorded sessions; the history
-    /// table and position-comparison card land in a later M4a task.
+    /// whether the selected watch has any recorded sessions, by
+    /// `run_export` to build the report, and by `ui::history_ui::
+    /// bottom_grid` (M4a Task 9) for the session-history table and
+    /// position-comparison card.
     history: HistoryIndex,
     /// Toolbar-owned state (M4a Task 6) that doesn't belong on
     /// `ControlsState`/`ConfigStore`: the selected watch (seeded from, and
     /// kept mirrored into, `config.last_watch`), the active BPH combo row,
     /// the add-watch modal, and the export-report request flag the
-    /// toolbar's Export button sets — nothing consumes it yet (see the
-    /// `export_requested` stub in `ChronaApp::ui`; Task 9 wires the real
-    /// export).
+    /// toolbar's Export button sets — consumed each frame by `run_export`
+    /// (M4a Task 9).
     toolbar: ToolbarState,
     /// Index into `history::POSITIONS` — the position selected in the
     /// redesigned segmented control (M4a Task 7; replaces the old M3
     /// session-panel free-text position field). Threaded into the
     /// toolbar's Record button as `meta_position` (`ui::toolbar::
-    /// record_stop_button`) and, later, into Task 9's position-comparison
-    /// highlight. Chosen as a `usize` index (rather than storing the code
-    /// `&'static str` itself) so it stays trivially `Copy`/`Default`-able
-    /// and index-aligned with `history::PositionRates::by_code`, the same
+    /// record_stop_button`) and into the position-comparison card's accent
+    /// highlight (M4a Task 9: `ui::history_ui::comparison_rows`). Chosen
+    /// as a `usize` index (rather than storing the code `&'static str`
+    /// itself) so it stays trivially `Copy`/`Default`-able and
+    /// index-aligned with `history::PositionRates::by_code`, the same
     /// convention that struct already uses. Defaults to `0` (`"DU"`).
     selected_position: usize,
     /// Which metric's help modal is open, if any (M4a Task 7); `None` most
@@ -99,6 +104,25 @@ pub struct ChronaApp {
     /// (`ui::cards::metrics_cards`'s return value) and cleared by
     /// `ui::modals::render_help_modal` (✕, click-outside, or Esc).
     open_help: Option<HelpTopicId>,
+    /// A transient app-side notice (M4a Task 9, spec §9) — currently only
+    /// the Export-report success/failure outcome (`run_export`) — shown in
+    /// the same banner strip as the engine's own banner, but ONLY when the
+    /// engine has none to show this frame
+    /// (`ui::controls::resolve_app_banner`: engine truth always outranks a
+    /// UI notice, since a live fault must never be silently covered by
+    /// e.g. "report saved").
+    ///
+    /// Cleared on the next user action: `ChronaApp::ui` reads `ui.input(|i|
+    /// i.pointer.any_click())` once per frame and clears this field before
+    /// any button handling runs that frame, so a notice set LATER in that
+    /// SAME frame (e.g. by the very click that triggered the export)
+    /// survives — only a DIFFERENT, later frame's click wipes a stale one.
+    /// This is intentionally coarser than "cleared only by a click that
+    /// sends a `ControlMsg` or opens a dialog" (it also clears on, say, a
+    /// metrics-card "?" click): auditing every individual button handler
+    /// for this one slot isn't worth the risk of missing one and leaving a
+    /// stale banner stuck forever.
+    app_banner: Option<(BannerSeverity, String)>,
 }
 
 impl ChronaApp {
@@ -159,6 +183,7 @@ impl ChronaApp {
             toolbar,
             selected_position: 0,
             open_help: None,
+            app_banner: None,
         }
     }
 
@@ -194,6 +219,63 @@ impl ChronaApp {
             device_id: self.controls.selected_device.clone(),
         }));
         self.next_mic_retry = Some(now + MIC_RETRY_INTERVAL);
+    }
+
+    /// Runs the Export-report flow (M4a Task 9, spec §9), once
+    /// `toolbar.export_requested` was set this frame
+    /// (`ui::toolbar::export_button`, gated by `ui::toolbar::
+    /// export_enabled` — a watch must already be selected with at least
+    /// one recorded session, so `selected_watch` below is always `Some`
+    /// in practice; the early return is defensive, not expected): a
+    /// native save dialog seeded with `export::default_report_name`, then
+    /// `export::render_report` + `std::fs::write` for the selected
+    /// watch's report. A cancelled dialog (`save_file()` returns `None`)
+    /// is silent — same as `ui::toolbar::open_recording_button`'s
+    /// cancelled pick — never an error banner. Sets `self.app_banner` on
+    /// both real outcomes: `Info` with "report saved to <file name>", or
+    /// `Error` with the write failure's message — never the engine's own
+    /// banner slot (see `app_banner`'s doc comment for why the two stay
+    /// separate).
+    fn run_export(&mut self) {
+        let Some(watch) = self.toolbar.selected_watch.clone() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(default_report_name(&watch, now))
+            .save_file()
+        else {
+            return;
+        };
+
+        let rates = position_rates(&self.history, &watch);
+        let sessions: Vec<&SessionEntry> = self.history.for_watch(&watch).collect();
+        let bph_mode = bph_mode_report_label(&self.controls.bph_mode_ui);
+        let input = ReportInput {
+            watch: &watch,
+            app_version: env!("CARGO_PKG_VERSION"),
+            lift_deg: self.controls.lift,
+            bph_mode: &bph_mode,
+            averaging_s: self.controls.averaging,
+            ppm: self.controls.ppm,
+            rates: &rates,
+            sessions: &sessions,
+            exported_unix_s: now,
+        };
+        let html = render_report(&input);
+        self.app_banner = Some(match std::fs::write(&path, html) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                (BannerSeverity::Info, format!("report saved to {name}"))
+            }
+            Err(e) => (BannerSeverity::Error, format!("failed to save report: {e}")),
+        });
     }
 }
 
@@ -236,6 +318,14 @@ impl eframe::App for ChronaApp {
         };
         let banner = pick_banner(snap.banner.as_ref(), &health_for_banner, snap.source_kind);
 
+        // M4a Task 9: clear the transient app-side notice on the next user
+        // action, before any of this frame's button handling runs — see
+        // `app_banner`'s doc comment for the exact rule and why a click
+        // anywhere (not just a narrower "sends a ControlMsg" set) is used.
+        if ui.input(|i| i.pointer.any_click()) {
+            self.app_banner = None;
+        }
+
         egui::Panel::top("chrona_top").show(ui, |ui| {
             let selected_position_code = POSITIONS[self.selected_position].0;
             let dirty = toolbar_row(
@@ -258,8 +348,11 @@ impl eframe::App for ChronaApp {
             }
 
             let palette = theme::Palette::of(self.theme);
-            if let Some(banner) = &banner {
-                render_banner(ui, palette, banner);
+            let shown_app_banner = resolve_app_banner(banner.is_some(), self.app_banner.as_ref());
+            match (&banner, shown_app_banner) {
+                (Some(b), _) => render_banner(ui, palette, b.severity, &b.text),
+                (None, Some((severity, text))) => render_banner(ui, palette, *severity, text),
+                (None, None) => {}
             }
 
             ui.separator();
@@ -291,10 +384,10 @@ impl eframe::App for ChronaApp {
         });
 
         if self.toolbar.export_requested {
-            // Task 9 wires the real export flow; for now this just clears
-            // the flag `ui::toolbar::toolbar_row`'s Export button sets so
-            // a stale request isn't reprocessed on a later frame.
+            // Cleared up front so a stale request is never reprocessed on
+            // a later frame, regardless of `run_export`'s outcome.
             self.toolbar.export_requested = false;
+            self.run_export();
         }
 
         self.maybe_retry_mic(snap.health.last_error.is_some());
@@ -313,6 +406,36 @@ impl eframe::App for ChronaApp {
                     metrics: snap.metrics.as_ref(),
                 },
             );
+
+            // M4a Task 9: the session-history + position-comparison cards
+            // that complete the mockup's layout below the amplitude strip.
+            // `rates` is per the SELECTED watch (spec §8) — distinct from
+            // the history card's own listing, which spans every watch (see
+            // `ui::history_ui`'s module doc comment) — computed fresh each
+            // frame from `self.history`, same "no caching" precedent as
+            // `ui::toolbar::export_button`'s own `has_sessions` check. A
+            // watch with no rated sessions (or no watch selected at all)
+            // naturally yields the same all-`None`/no-spread result the
+            // comparison card already renders as its own empty state.
+            ui.add_space(8.0);
+            let rates = match self.toolbar.selected_watch.as_deref() {
+                Some(watch) => position_rates(&self.history, watch),
+                None => PositionRates {
+                    by_code: [None; 6],
+                    spread: None,
+                },
+            };
+            bottom_grid(
+                ui,
+                palette,
+                BottomGridCtx {
+                    history: &self.history,
+                    session: &mut self.session,
+                    engine: &self.engine,
+                    rates: &rates,
+                    selected_position: self.selected_position,
+                },
+            );
         });
     }
 }
@@ -320,24 +443,47 @@ impl eframe::App for ChronaApp {
 /// Paints one banner (M4a Task 6 severity → color mapping, spec §4): `Info`
 /// is `palette.accent` text, `Warn` is `palette.warnfg` text on a
 /// `palette.warnbg`-filled strip, `Error` is `palette.rec` text — replacing
-/// M3's flat red/amber/gray fills for every severity.
-fn render_banner(ui: &mut egui::Ui, palette: &theme::Palette, banner: &Banner) {
-    match banner.severity {
+/// M3's flat red/amber/gray fills for every severity. Takes severity/text
+/// directly (M4a Task 9) rather than a `&Banner`, so the same paint code
+/// serves both the engine's own banner AND the app-side notice — see
+/// `app_banner`'s doc comment for how the two share this one strip without
+/// ever showing simultaneously.
+fn render_banner(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    severity: BannerSeverity,
+    text: &str,
+) {
+    match severity {
         BannerSeverity::Warn => {
             egui::Frame::new()
                 .fill(palette.warnbg)
                 .corner_radius(6)
                 .inner_margin(6.0)
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(&banner.text).color(palette.warnfg));
+                    ui.label(egui::RichText::new(text).color(palette.warnfg));
                 });
         }
         BannerSeverity::Info => {
-            ui.label(egui::RichText::new(&banner.text).color(palette.accent));
+            ui.label(egui::RichText::new(text).color(palette.accent));
         }
         BannerSeverity::Error => {
-            ui.label(egui::RichText::new(&banner.text).color(palette.rec));
+            ui.label(egui::RichText::new(text).color(palette.rec));
         }
     }
     ui.add_space(4.0);
+}
+
+/// "BPH mode" report field text (`export::ReportInput::bph_mode`): `Auto`/
+/// `Free` verbatim, or the free-text `Fixed` buffer's trimmed content.
+/// Reads `controls.bph_mode_ui` (the actual DSP-facing mode state) rather
+/// than `toolbar.bph_selection` (just which combo row is highlighted) —
+/// the more direct source, and it avoids reaching into `ui::toolbar`'s
+/// private combo-label formatter for this one call site.
+fn bph_mode_report_label(mode: &BphModeUi) -> String {
+    match mode {
+        BphModeUi::Auto => "Auto".to_string(),
+        BphModeUi::Free => "Free".to_string(),
+        BphModeUi::Fixed(text) => text.trim().to_string(),
+    }
 }
