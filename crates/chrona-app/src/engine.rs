@@ -682,20 +682,54 @@ fn engine_loop(
             s
         }
         Err(e) => {
-            // No source at all — nothing to run. Publish the fault and
-            // return; the thread exits cleanly (not a panic, so the
-            // catch_unwind wrapper in `Engine::start_with_turbo` sees Ok
-            // and does not double-publish).
-            publish(
-                buf_input,
-                last_snapshot,
-                &egui_ctx,
-                EngineSnapshot {
-                    error_banner: Some(format!("failed to start: {e}")),
-                    ..Default::default()
-                },
-            );
-            return;
+            // A saved-but-now-unplugged input device is a common,
+            // recoverable failure — retry once against the default input
+            // rather than leaving the whole app inert (dead control
+            // channel: no device picker, nothing) until restart. A Mic
+            // build failure never mutates `config` (only Replay does — see
+            // `SourceRuntime::build`'s doc comment), so retrying against
+            // the same `config` is safe. This is deliberately a single
+            // retry, not a stay-alive-on-total-failure loop — that's an M4
+            // followup.
+            if matches!(initial, SourceSpec::Mic { device_id: Some(_) }) {
+                match SourceRuntime::build(&SourceSpec::Mic { device_id: None }, &mut config) {
+                    Ok((s, _info)) => {
+                        error_banner = Some(format!(
+                            "saved input device unavailable ({e}) — using default input"
+                        ));
+                        s
+                    }
+                    Err(e2) => {
+                        publish(
+                            buf_input,
+                            last_snapshot,
+                            &egui_ctx,
+                            EngineSnapshot {
+                                error_banner: Some(format!(
+                                    "failed to start: {e}; default input also failed: {e2}"
+                                )),
+                                ..Default::default()
+                            },
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // No source at all — nothing to run. Publish the fault and
+                // return; the thread exits cleanly (not a panic, so the
+                // catch_unwind wrapper in `Engine::start_with_turbo` sees Ok
+                // and does not double-publish).
+                publish(
+                    buf_input,
+                    last_snapshot,
+                    &egui_ctx,
+                    EngineSnapshot {
+                        error_banner: Some(format!("failed to start: {e}")),
+                        ..Default::default()
+                    },
+                );
+                return;
+            }
         }
     };
     let mut analyzer = match build_analyzer(&config, source.sample_rate_hz()) {

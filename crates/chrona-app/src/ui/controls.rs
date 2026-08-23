@@ -146,6 +146,16 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Lift-angle preset menu (behavior contract), degrees.
 const LIFT_PRESETS: [f64; 7] = [52.0, 38.0, 42.0, 44.0, 50.0, 53.0, 55.0];
 
+/// Config files are hand-editable; TOML has literal `inf`/`nan`. Gate on
+/// finiteness first (f64::clamp propagates NaN), then clamp to the same
+/// ranges the sidecar-restore path enforces (engine.rs).
+fn sanitize_lift(lift: f64) -> f64 {
+    if lift.is_finite() { lift.clamp(10.0, 90.0) } else { 52.0 }
+}
+fn sanitize_ppm(ppm: f64) -> f64 {
+    if ppm.is_finite() { ppm.clamp(-500.0, 500.0) } else { 0.0 }
+}
+
 impl ControlsState {
     /// Seeds initial controls state from a loaded `ConfigStore`: `lift`
     /// from `default_lift_deg`, `selected_device` from `last_device`, and
@@ -154,6 +164,13 @@ impl ControlsState {
     /// the very first frame either). `averaging`/`bph_mode_ui` start at the
     /// analyzer's own defaults since M3's `ConfigStore` doesn't persist
     /// either.
+    ///
+    /// `config.toml` is hand-editable, so `lift`/`ppm` are run through
+    /// `sanitize_lift`/`sanitize_ppm` before use — an out-of-range or
+    /// `inf`/`nan` value here would otherwise reach `app.rs`'s initial
+    /// `EngineConfig` unclamped and fail `Analyzer::new`, leaving the
+    /// engine thread dead before the UI ever gets a control channel to
+    /// recover through (the bug this sanitization fixes).
     pub fn from_config(config: &ConfigStore) -> ControlsState {
         let devices = chrona_audio::list_input_devices();
         let selected_device = config.last_device.clone();
@@ -166,10 +183,10 @@ impl ControlsState {
         ControlsState {
             devices,
             selected_device,
-            lift: config.default_lift_deg,
+            lift: sanitize_lift(config.default_lift_deg),
             averaging: 30.0,
             bph_mode_ui: BphModeUi::Auto,
-            ppm,
+            ppm: sanitize_ppm(ppm),
             last_refresh: Some(Instant::now()),
         }
     }
@@ -603,5 +620,23 @@ mod tests {
             1,
             "a genuine new clip right after a reset re-enters the window"
         );
+    }
+
+    #[test]
+    fn sanitize_lift_clamps_finite_out_of_range_and_defaults_non_finite() {
+        assert_eq!(sanitize_lift(500.0), 90.0);
+        assert_eq!(sanitize_lift(5.0), 10.0);
+        assert_eq!(sanitize_lift(f64::NAN), 52.0);
+        assert_eq!(sanitize_lift(f64::INFINITY), 52.0);
+        assert_eq!(sanitize_lift(52.0), 52.0);
+    }
+
+    #[test]
+    fn sanitize_ppm_clamps_finite_out_of_range_and_defaults_non_finite() {
+        assert_eq!(sanitize_ppm(f64::NAN), 0.0);
+        assert_eq!(sanitize_ppm(f64::INFINITY), 0.0);
+        assert_eq!(sanitize_ppm(9999.0), 500.0);
+        assert_eq!(sanitize_ppm(-9999.0), -500.0);
+        assert_eq!(sanitize_ppm(25.0), 25.0);
     }
 }
