@@ -159,14 +159,27 @@ fn correlate_in_gate(
 /// slice length; this function recomputes that offset with the identical
 /// two lines (kept in sync by this comment on both sites).
 ///
-/// `extract_events` extracts every cycle in the window
-/// (`extract_events_from(.., 0)`). `extract_events_from` additionally takes
-/// `from_cycle`: predictions and templates are still built over ALL
-/// `cycles` in the window (templates are cheap and benefit from full data),
-/// but only cycles in `from_cycle..cycles` are correlated and emitted. This
-/// is the incremental analyzer's hot path (`Analyzer::current_metrics`),
-/// which freezes the window's cycle grid at a fold-time origin and, between
-/// refolds, asks only for the cycles newly completed since the last call.
+/// `extract_events` derives `fold_start` from `env.len()` exactly as
+/// `fold_envelope` does (see the fold-window invariant above) and extracts
+/// every cycle in the window: `extract_events_anchored(.., fold_start, 0, 0)`.
+///
+/// `extract_events_anchored` takes the cycle-grid anchor explicitly instead
+/// of deriving it from `env.len()`: `fold_start_env` is the LOCAL env offset
+/// (into THIS `env` slice) where cycle 0 begins, `beat_index_base` is added
+/// to every emitted `beat_index` (so callers using a window that starts
+/// partway through a larger absolute grid can report the correct absolute
+/// beat number), and `from_cycle_local` skips correlating/emitting cycles
+/// before it (LOCAL to this window's own 0-based numbering) — predictions
+/// and templates are still built over ALL cycles in the window (templates
+/// are cheap and benefit from full data), only correlation is skipped.
+///
+/// This is the incremental analyzer's hot path (`Analyzer::current_metrics`):
+/// between refolds it re-anchors a fresh window's `fold_start_env` to 0 (the
+/// window is copied starting exactly at the desired cycle boundary) and
+/// tracks how many GLOBAL cycles have been extracted so far itself, passing
+/// the right `beat_index_base`/`from_cycle_local` for whatever window it
+/// managed to keep inside the ring — see its own doc comment for why a
+/// window's start can't just be re-derived from `env.len()` call to call.
 pub fn extract_events(
     raw: &[f32],
     raw_start_abs: u64,
@@ -174,28 +187,52 @@ pub fn extract_events(
     sample_rate_hz: f64,
     profile: &FoldProfile,
 ) -> Vec<BeatEvent> {
-    extract_events_from(raw, raw_start_abs, env, sample_rate_hz, profile, 0)
-}
-
-pub fn extract_events_from(
-    raw: &[f32],
-    raw_start_abs: u64,
-    env: &[f32],
-    sample_rate_hz: f64,
-    profile: &FoldProfile,
-    from_cycle: usize,
-) -> Vec<BeatEvent> {
     let t_osc_env = profile.t_osc_env;
     if !(t_osc_env.is_finite() && t_osc_env > 1.0) || env.is_empty() {
         return Vec::new();
     }
     // Must match fold_envelope's window arithmetic (see invariant note).
     let cycles = (env.len() as f64 / t_osc_env).floor() as usize;
+    let usable = (cycles as f64 * t_osc_env) as usize;
+    let fold_start = env.len() - usable;
+    extract_events_anchored(
+        raw,
+        raw_start_abs,
+        env,
+        sample_rate_hz,
+        profile,
+        fold_start,
+        0,
+        0,
+    )
+}
+
+// The 8-parameter grid-anchor interface (R4-M3) is the explicit fix for the
+// incremental analyzer's steady-state extraction bug (see
+// Analyzer::current_metrics's doc comment) — each parameter is independently
+// meaningful to a caller re-anchoring its own extraction window, so bundling
+// them into a struct would just move the same information one level of
+// indirection away without reducing it.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_events_anchored(
+    raw: &[f32],
+    raw_start_abs: u64,
+    env: &[f32],
+    sample_rate_hz: f64,
+    profile: &FoldProfile,
+    fold_start_env: usize,
+    beat_index_base: i64,
+    from_cycle_local: usize,
+) -> Vec<BeatEvent> {
+    let t_osc_env = profile.t_osc_env;
+    if !(t_osc_env.is_finite() && t_osc_env > 1.0) || env.is_empty() {
+        return Vec::new();
+    }
+    let fold_start = fold_start_env;
+    let cycles = (env.len().saturating_sub(fold_start) as f64 / t_osc_env).floor() as usize;
     if cycles < 8 {
         return Vec::new();
     }
-    let usable = (cycles as f64 * t_osc_env) as usize;
-    let fold_start = env.len() - usable;
 
     let (off_a, off_b) = profile.anchor_env_offsets();
     let gate = ((t_osc_env / 16.0) * DECIMATION as f64) as usize; // T_beat/8 in raw samples
@@ -217,7 +254,7 @@ pub fn extract_events_from(
         let Some(template) = build_template(raw, &predictions, gate) else {
             continue;
         };
-        for (c, &pred) in predictions.iter().enumerate().skip(from_cycle) {
+        for (c, &pred) in predictions.iter().enumerate().skip(from_cycle_local) {
             let Some((idx, peak, rms)) =
                 correlate_in_gate(raw, &template, pred.round() as i64, gate, sample_rate_hz)
             else {
@@ -228,7 +265,7 @@ pub fn extract_events_from(
                 continue;
             }
             out.push(BeatEvent {
-                beat_index: 2 * c as i64 + slot,
+                beat_index: beat_index_base + 2 * c as i64 + slot,
                 parity,
                 t_drop_corr_s: (raw_start_abs as f64 + idx + TEMPLATE_PEAK_AT as f64)
                     / sample_rate_hz,
