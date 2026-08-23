@@ -405,7 +405,7 @@ mod tests {
                     let x = synthesize(&cfg).expect("valid synth config");
                     let mut a = Analyzer::new(AnalyzerConfig::default()).expect("config");
                     a.push_samples(&x);
-                    match a.current() {
+                    match a.current_metrics() {
                         Some(est) => {
                             if est.bph_nominal != Some(28_800) {
                                 failures.push(format!(
@@ -446,7 +446,7 @@ mod tests {
             let x = synthesize(&cfg).expect("valid synth config");
             let mut a = Analyzer::new(AnalyzerConfig::default()).expect("config");
             a.push_samples(&x);
-            match a.current() {
+            match a.current_metrics() {
                 Some(est) if est.bph_nominal == Some(28_800) => {}
                 other => failures.push(format!("seed {seed}: {:?}", other.map(|e| e.bph_nominal))),
             }

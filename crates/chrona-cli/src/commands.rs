@@ -139,6 +139,7 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
     })?;
     analyzer.push_samples(&samples);
     let duration_s = samples.len() as f64 / sr;
+    let clipped_samples = analyzer.clipped_samples();
     let base = |status| AnalyzeReport {
         status,
         file: a.file.display().to_string(),
@@ -159,9 +160,9 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
         onset_jitter_ms: None,
         unlocking_ratio: None,
         mean_beat_snr_db: None,
-        clipped_samples: 0,
+        clipped_samples,
     };
-    Ok(match analyzer.current() {
+    Ok(match analyzer.current_metrics() {
         None => base("no_beat"),
         Some(est) => AnalyzeReport {
             bph_detected: Some(est.bph_detected),
@@ -175,13 +176,10 @@ pub fn run_analyze(a: &AnalyzeArgs) -> anyhow::Result<AnalyzeReport> {
                 chrona_dsp::Tier::T2 => "T2",
                 chrona_dsp::Tier::T3 => "T3",
             }),
-            rate_source: est
-                .rate_s_per_day
-                .is_some()
-                .then_some(match est.rate_source {
-                    chrona_dsp::RateSource::PeriodSlope => "period_slope",
-                    chrona_dsp::RateSource::UnlockingRegression => "unlocking_regression",
-                }),
+            rate_source: est.rate_source.map(|s| match s {
+                chrona_dsp::RateSource::PeriodSlope => "period_slope",
+                chrona_dsp::RateSource::UnlockingRegression => "unlocking_regression",
+            }),
             beat_error_ms: est.beat_error_ms,
             amplitude_deg: est.amplitude_deg,
             amplitude_gate: est.quality.amplitude_gate.map(|g| format!("{g:?}")),

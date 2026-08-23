@@ -181,7 +181,7 @@ mod tests {
             * (1.0 - cfg.rate_s_per_day / 86_400.0)
             * envx.envelope_rate_hz();
         let profile = fold_envelope(&env, t_osc_env).expect("fold");
-        extract_events(&raw, 0, &env, 0, sr, &profile)
+        extract_events(&raw, 0, &env, sr, &profile)
     }
 
     #[test]

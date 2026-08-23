@@ -150,23 +150,41 @@ fn correlate_in_gate(
 /// scale.
 ///
 /// **Alignment invariant:** `raw` and `env` come from rings fed in lockstep
-/// from stream start, so envelope absolute index `j` corresponds to raw
-/// absolute index `j · envelope::DECIMATION`; callers pass `env_start_abs`
-/// in envelope-domain units and `raw_start_abs` in raw units.
+/// from stream start and start at the same absolute instant — envelope
+/// index `j` corresponds to raw index `j · envelope::DECIMATION`; callers
+/// pass that shared instant as `raw_start_abs`, in raw-sample units.
 ///
 /// **Fold-window invariant:** the fold in `fold_envelope` starts at
 /// `env.len() − (cycles·t_osc_env) as usize` computed from the SAME env
 /// slice length; this function recomputes that offset with the identical
 /// two lines (kept in sync by this comment on both sites).
+///
+/// `extract_events` extracts every cycle in the window
+/// (`extract_events_from(.., 0)`). `extract_events_from` additionally takes
+/// `from_cycle`: predictions and templates are still built over ALL
+/// `cycles` in the window (templates are cheap and benefit from full data),
+/// but only cycles in `from_cycle..cycles` are correlated and emitted. This
+/// is the incremental analyzer's hot path (`Analyzer::current_metrics`),
+/// which freezes the window's cycle grid at a fold-time origin and, between
+/// refolds, asks only for the cycles newly completed since the last call.
 pub fn extract_events(
     raw: &[f32],
     raw_start_abs: u64,
     env: &[f32],
-    env_start_abs: u64,
     sample_rate_hz: f64,
     profile: &FoldProfile,
 ) -> Vec<BeatEvent> {
-    let _ = env_start_abs; // env used by the Task-7 edge pass; alignment documented above
+    extract_events_from(raw, raw_start_abs, env, sample_rate_hz, profile, 0)
+}
+
+pub fn extract_events_from(
+    raw: &[f32],
+    raw_start_abs: u64,
+    env: &[f32],
+    sample_rate_hz: f64,
+    profile: &FoldProfile,
+    from_cycle: usize,
+) -> Vec<BeatEvent> {
     let t_osc_env = profile.t_osc_env;
     if !(t_osc_env.is_finite() && t_osc_env > 1.0) || env.is_empty() {
         return Vec::new();
@@ -191,13 +209,15 @@ pub fn extract_events(
     };
 
     for (parity, off, slot) in [first, second] {
+        // ALL predictions in the window, even when only a suffix is
+        // extracted below — templates are cheap and benefit from full data.
         let predictions: Vec<f64> = (0..cycles)
             .map(|c| (fold_start as f64 + c as f64 * t_osc_env + off) * DECIMATION as f64)
             .collect();
         let Some(template) = build_template(raw, &predictions, gate) else {
             continue;
         };
-        for (c, &pred) in predictions.iter().enumerate() {
+        for (c, &pred) in predictions.iter().enumerate().skip(from_cycle) {
             let Some((idx, peak, rms)) =
                 correlate_in_gate(raw, &template, pred.round() as i64, gate, sample_rate_hz)
             else {
@@ -394,7 +414,7 @@ mod tests {
             * (1.0 - cfg.rate_s_per_day / 86_400.0)
             * envx.envelope_rate_hz();
         let profile = fold_envelope(&env, t_osc_env).expect("fold");
-        let events = extract_events(&raw, 0, &env, 0, sr, &profile);
+        let events = extract_events(&raw, 0, &env, sr, &profile);
         let t_beat = crate::bph::t_beat_s(cfg.bph) * (1.0 - cfg.rate_s_per_day / 86_400.0);
         (events, t_beat)
     }

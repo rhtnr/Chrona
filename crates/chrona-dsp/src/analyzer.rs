@@ -1,9 +1,9 @@
 //! Streaming analyzer: precondition → envelope → period → fold → events → regression → amplitude → tier (spec §5, stages 1–7).
 
 use crate::envelope::{DECIMATION, EnvelopeExtractor};
-use crate::events::{BeatEvent, extract_events};
+use crate::events::{BeatEvent, extract_events_from};
 use crate::filter::{Butterworth, DcBlocker, FilterError};
-use crate::fold::fold_with_octave_guard;
+use crate::fold::{FoldProfile, fold_with_octave_guard};
 use crate::metrics::{AmplitudeGateFail, amplitude_from_events, regress_unlocking};
 use crate::period::{PeriodEstimate, PeriodEstimator};
 use crate::ring::SampleRing;
@@ -71,9 +71,9 @@ pub struct MetricsSnapshot {
     pub bph_nominal: Option<u32>,
     /// s/day, positive = fast; None when no defensible nominal (spec §3.1).
     pub rate_s_per_day: Option<f64>,
-    /// Which estimator produced rate_s_per_day. Meaningful only when
-    /// rate_s_per_day is Some; reads PeriodSlope otherwise.
-    pub rate_source: RateSource,
+    /// Which estimator produced rate_s_per_day. `Some` iff rate_s_per_day
+    /// is `Some` — `None` here means there is no rate to attribute.
+    pub rate_source: Option<RateSource>,
     /// Only at tier ≥ T2.
     pub beat_error_ms: Option<f64>,
     /// Only at T3.
@@ -81,6 +81,36 @@ pub struct MetricsSnapshot {
     pub period: PeriodEstimate,
     pub quality: Quality,
     pub calibrated: bool,
+}
+
+/// One cached tape entry — the live view onto `Analyzer::tape_events()`.
+/// A thin, `Copy` projection of `BeatEvent` (spec §5.5 / M3).
+#[derive(Debug, Clone, Copy)]
+pub struct TapeEvent {
+    pub beat_index: i64,
+    pub parity: crate::events::Parity,
+    pub t_unlock_s: Option<f64>,
+    pub t_drop_corr_s: f64,
+}
+
+/// Incremental analysis state (M3): the fold/extraction results from the
+/// last refold, plus how far event extraction has progressed since. See
+/// `Analyzer::current_metrics` for the refold/extend algorithm.
+struct AnalysisCache {
+    profile: FoldProfile,
+    halved: bool,
+    /// Nominal t_osc (seconds, pre-halving) the profile was folded at.
+    t_osc_used: f64,
+    /// env ring len when folded (fold_start recomputation anchor).
+    env_len_at_fold: usize,
+    /// Absolute env index of env_window[0] at fold time.
+    env_start_at_fold: u64,
+    /// How many cycles of the frozen grid have been extracted so far.
+    extracted_through_cycle: usize,
+    /// Absolute-seconds events, ascending, pruned to the 32 s ring span.
+    events: Vec<BeatEvent>,
+    /// raw_ring.total_pushed() at the last fold.
+    last_fold_total: u64,
 }
 
 pub struct Analyzer {
@@ -93,6 +123,7 @@ pub struct Analyzer {
     env_ring: SampleRing,
     clipped: u64,
     scratch: Vec<f32>,
+    cache: Option<AnalysisCache>,
 }
 
 impl Analyzer {
@@ -114,12 +145,12 @@ impl Analyzer {
         }
         let envelope = EnvelopeExtractor::new(config.sample_rate_hz)?;
         let period = PeriodEstimator::new(envelope.envelope_rate_hz());
-        // Ring-capacity note: the aligned copy's start boundary in current() is safe by
-        // construction (env_start·16 is always ≥ the raw ring's retained start); its end
-        // boundary is handled there by trimming the trailing partial envelope sample
-        // (the envelope leads the raw stream, so a full env window can imply a raw range
-        // past what's been pushed). The +DECIMATION margin below is retained as harmless
-        // slack, not load-bearing.
+        // Ring-capacity note: the aligned copy's start boundary in current_metrics() is
+        // safe by construction (env_start·16 is always ≥ the raw ring's retained start);
+        // its end boundary is handled there by trimming the trailing partial envelope
+        // sample (the envelope leads the raw stream, so a full env window can imply a raw
+        // range past what's been pushed). The +DECIMATION margin below is retained as
+        // harmless slack, not load-bearing.
         let raw_cap = (32.0 * config.sample_rate_hz) as usize + DECIMATION;
         let env_cap = (32.0 * config.sample_rate_hz) as usize / DECIMATION;
         Ok(Analyzer {
@@ -132,6 +163,7 @@ impl Analyzer {
             env_ring: SampleRing::new(env_cap),
             clipped: 0,
             scratch: Vec::new(),
+            cache: None,
         })
     }
 
@@ -151,35 +183,97 @@ impl Analyzer {
         self.scratch = filtered;
     }
 
-    pub fn current(&self) -> Option<MetricsSnapshot> {
+    /// Clipped-sample count, readable without a snapshot (spec §M3: the
+    /// `no_beat` CLI report needs this even when no estimate is available).
+    pub fn clipped_samples(&self) -> u64 {
+        self.clipped
+    }
+
+    /// The cached events in the current 32 s ring, ascending time. Empty
+    /// before the first successful fold.
+    pub fn tape_events(&self) -> Vec<TapeEvent> {
+        match &self.cache {
+            None => Vec::new(),
+            Some(c) => c
+                .events
+                .iter()
+                .map(|e| TapeEvent {
+                    beat_index: e.beat_index,
+                    parity: e.parity,
+                    t_unlock_s: e.t_unlock_s,
+                    t_drop_corr_s: e.t_drop_corr_s,
+                })
+                .collect(),
+        }
+    }
+
+    /// Incremental metrics (M3 breaking window). Refolds (recomputing the
+    /// fold profile and octave-guard decision, and re-extracting every
+    /// cycle) at most once per ~1 s of new data or when the period estimate
+    /// has drifted >0.1% since the last fold; between refolds it extends the
+    /// SAME frozen cycle grid forward and extracts only newly-completed
+    /// cycles, appending to the cached event tape. Results are equal to the
+    /// old one-shot recomputation on identical pushed data (see
+    /// `incremental_equals_oneshot`).
+    pub fn current_metrics(&mut self) -> Option<MetricsSnapshot> {
         let raw_est = self.period.estimate()?;
         let clock = 1.0 + self.config.ppm_correction / 1e6;
         let sr = self.config.sample_rate_hz;
         let env_rate = self.envelope.envelope_rate_hz();
 
-        let mut env_window = Vec::new();
-        self.env_ring
-            .copy_last(self.env_ring.len(), &mut env_window);
-        let env_start_abs = self.env_ring.start_index();
-
-        // The envelope LEADS the raw stream (the extractor emits at decimation phase 0),
-        // so env_total = ceil(raw_total/16) and the newest env sample's 16-sample raw
-        // group may not be fully pushed yet. Drop it so the aligned copy stays inside
-        // the raw ring. Must happen BEFORE the fold: fold_envelope and extract_events
-        // derive cycles/fold_start from the same env.len() (events.rs fold-window invariant).
-        let usable = (self
-            .raw_ring
-            .total_pushed()
-            .saturating_sub(env_start_abs * DECIMATION as u64)
-            / DECIMATION as u64) as usize;
-        env_window.truncate(usable.min(env_window.len()));
-
-        let folded = fold_with_octave_guard(&env_window, raw_est.t_osc_s * env_rate);
-        let (profile, halved) = match folded {
-            Some(p) => p,
-            None => return Some(self.tier1_snapshot(raw_est, clock, None)),
+        let need_refold = match &self.cache {
+            None => true,
+            Some(c) => {
+                self.raw_ring
+                    .total_pushed()
+                    .saturating_sub(c.last_fold_total)
+                    >= sr as u64
+                    || (raw_est.t_osc_s - c.t_osc_used).abs() / c.t_osc_used > 0.001
+            }
         };
-        let halving = if halved { 2.0 } else { 1.0 };
+
+        if need_refold {
+            // Rebuild the env window exactly as M2's one-shot current() did,
+            // including the trailing-partial-envelope-sample trim (the
+            // envelope leads the raw stream at decimation phase 0, so a full
+            // env window can imply a raw range past what's been pushed).
+            let mut env_window = Vec::new();
+            self.env_ring
+                .copy_last(self.env_ring.len(), &mut env_window);
+            let env_start_abs = self.env_ring.start_index();
+            let usable = (self
+                .raw_ring
+                .total_pushed()
+                .saturating_sub(env_start_abs * DECIMATION as u64)
+                / DECIMATION as u64) as usize;
+            env_window.truncate(usable.min(env_window.len()));
+
+            let folded = fold_with_octave_guard(&env_window, raw_est.t_osc_s * env_rate);
+            match folded {
+                None => {
+                    self.cache = None;
+                    return Some(self.tier1_snapshot(raw_est, clock, None));
+                }
+                Some((profile, halved)) => {
+                    self.cache = Some(AnalysisCache {
+                        profile,
+                        halved,
+                        t_osc_used: raw_est.t_osc_s,
+                        env_len_at_fold: env_window.len(),
+                        env_start_at_fold: env_start_abs,
+                        extracted_through_cycle: 0,
+                        events: Vec::new(),
+                        last_fold_total: self.raw_ring.total_pushed(),
+                    });
+                }
+            }
+        }
+
+        let halving = if self.cache.as_ref().unwrap().halved {
+            2.0
+        } else {
+            1.0
+        };
         let t_osc_nominal = raw_est.t_osc_s / halving;
         let corrected = PeriodEstimate {
             t_osc_s: t_osc_nominal / clock,
@@ -187,34 +281,89 @@ impl Analyzer {
             window_s: raw_est.window_s,
         };
 
-        let mut raw_window = Vec::new();
-        let ok = self.raw_ring.copy_range_abs(
-            env_start_abs * DECIMATION as u64,
-            env_window.len() * DECIMATION,
-            &mut raw_window,
-        );
-        if !ok {
-            return Some(self.tier1_snapshot(raw_est, clock, Some(halving)));
+        // Extend the frozen cycle grid forward and extract newly-completed
+        // cycles (design: see the module-level algorithm note above and the
+        // task brief — the grid is anchored to a fold-time origin, computed
+        // fresh each call from env_start_at_fold/env_len_at_fold so it never
+        // depends on the CURRENT ring content, only on the profile's own
+        // t_osc_env and where the last fold placed cycle 0).
+        let (origin_abs, t_osc_env, cycles_now, from_cycle) = {
+            let cache = self.cache.as_ref().unwrap();
+            let t_osc_env = cache.profile.t_osc_env;
+            // Identical two-line arithmetic to fold_envelope/extract_events's
+            // own fold_start derivation, applied to the fold-time window, so
+            // this exactly reproduces where that call placed cycle 0.
+            let cycles_at_fold = (cache.env_len_at_fold as f64 / t_osc_env).floor() as usize;
+            let usable_at_fold = (cycles_at_fold as f64 * t_osc_env) as usize;
+            let fold_start_at_fold = cache.env_len_at_fold - usable_at_fold;
+            let origin_abs = cache.env_start_at_fold + fold_start_at_fold as u64;
+
+            // Global "fully raw-backed" env frontier (same trim rule as the
+            // fold window above, just expressed from absolute index 0).
+            let usable_abs_end = self.raw_ring.total_pushed() / DECIMATION as u64;
+            let avail = usable_abs_end.saturating_sub(origin_abs) as f64;
+            let cycles_now = (avail / t_osc_env).floor().max(0.0) as usize;
+            (
+                origin_abs,
+                t_osc_env,
+                cycles_now,
+                cache.extracted_through_cycle,
+            )
+        };
+
+        let newest_time = self.raw_ring.total_pushed() as f64 / sr;
+        if cycles_now > from_cycle {
+            // Truncate to a whole number of cycles from origin_abs so that
+            // extract_events_from's own end-anchored fold_start computation
+            // lands on 0 — i.e. cycle 0 (local) is cycle 0 (global, from
+            // origin_abs) — keeping beat_index numbering stable across polls.
+            let l_env = (cycles_now as f64 * t_osc_env) as usize;
+            let mut env_window = Vec::new();
+            let mut raw_window = Vec::new();
+            let env_ok = self
+                .env_ring
+                .copy_range_abs(origin_abs, l_env, &mut env_window);
+            let raw_ok = env_ok
+                && self.raw_ring.copy_range_abs(
+                    origin_abs * DECIMATION as u64,
+                    l_env * DECIMATION,
+                    &mut raw_window,
+                );
+            // Both copies are expected to succeed by construction (the ≥1 s
+            // refold cadence keeps origin_abs well inside the 32 s ring); if
+            // not, skip extraction this poll and retry once more data lands.
+            if raw_ok {
+                let new_events = extract_events_from(
+                    &raw_window,
+                    origin_abs * DECIMATION as u64,
+                    &env_window,
+                    sr,
+                    &self.cache.as_ref().unwrap().profile,
+                    from_cycle,
+                );
+                let cache = self.cache.as_mut().unwrap();
+                cache.events.extend(new_events);
+                cache
+                    .events
+                    .retain(|e| e.t_drop_corr_s >= newest_time - 32.0);
+                cache.extracted_through_cycle = cycles_now;
+            }
         }
 
-        let events = extract_events(
-            &raw_window,
-            env_start_abs * DECIMATION as u64,
-            &env_window,
-            env_start_abs,
-            sr,
-            &profile,
-        );
-        let newest_time = self.raw_ring.total_pushed() as f64 / sr;
-        let recent: Vec<BeatEvent> = events
-            .into_iter()
+        let recent: Vec<BeatEvent> = self
+            .cache
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
             .filter(|e| e.t_drop_corr_s >= newest_time - self.config.averaging_s)
+            .copied()
             .collect();
 
         let span = self
             .config
             .averaging_s
-            .min(env_window.len() as f64 / env_rate);
+            .min(self.env_ring.len() as f64 / env_rate);
         let expected = (span / (t_osc_nominal / 2.0)).round().max(1.0);
         let detection_ratio = (recent.len() as f64 / expected).min(1.0);
         let unlocking_ratio = if recent.is_empty() {
@@ -244,13 +393,14 @@ impl Analyzer {
         // present, not just a nominal existing — a Fixed-mode >3% mismatch
         // resolves to (Some(nom), None) and must not be papered over with a
         // regression-derived rate (see fixed_mode_rejects_gross_mismatch).
+        // rate_source is Some iff rate_s_per_day is Some (M3 honesty gate).
         let (rate_s_per_day, rate_source) = match (bph_nominal, period_rate, regression) {
             (Some(nom), Some(_), Some(r)) if tier >= Tier::T2 => {
                 let t_beat_nom = crate::bph::t_beat_s(nom);
                 let rate = 86_400.0 * (t_beat_nom - r.t_beat_s / clock) / t_beat_nom;
-                (Some(rate), RateSource::UnlockingRegression)
+                (Some(rate), Some(RateSource::UnlockingRegression))
             }
-            _ => (period_rate, RateSource::PeriodSlope),
+            _ => (period_rate, period_rate.map(|_| RateSource::PeriodSlope)),
         };
 
         Some(MetricsSnapshot {
@@ -298,7 +448,7 @@ impl Analyzer {
             bph_detected,
             bph_nominal,
             rate_s_per_day: rate,
-            rate_source: RateSource::PeriodSlope,
+            rate_source: rate.map(|_| RateSource::PeriodSlope),
             beat_error_ms: None,
             amplitude_deg: None,
             period: corrected,
@@ -346,7 +496,7 @@ mod tests {
         })
         .unwrap();
         a.push_samples(&x);
-        a.current()
+        a.current_metrics()
     }
 
     #[test]
@@ -449,7 +599,7 @@ mod tests {
         for chunk in x.chunks(480) {
             b.push_samples(chunk);
         }
-        let (ra, rb) = (a.current().unwrap(), b.current().unwrap());
+        let (ra, rb) = (a.current_metrics().unwrap(), b.current_metrics().unwrap());
         assert!((ra.period.t_osc_s - rb.period.t_osc_s).abs() < 1e-12);
     }
 
@@ -457,7 +607,7 @@ mod tests {
     fn silence_yields_none() {
         let mut a = Analyzer::new(AnalyzerConfig::default()).unwrap();
         a.push_samples(&vec![0.0f32; 48_000 * 10]);
-        assert!(a.current().is_none());
+        assert!(a.current_metrics().is_none());
     }
 
     #[test]
@@ -471,7 +621,7 @@ mod tests {
         };
         let est = analyze(&cfg, BphMode::Auto, 0.0).expect("snapshot");
         assert_eq!(est.tier, crate::tier::Tier::T3);
-        assert_eq!(est.rate_source, RateSource::UnlockingRegression);
+        assert_eq!(est.rate_source, Some(RateSource::UnlockingRegression));
         let be = est.beat_error_ms.expect("beat error at T3");
         assert!((be - 0.8).abs() <= 0.1, "be {be}");
         let amp = est.amplitude_deg.expect("amplitude at T3");
@@ -547,7 +697,7 @@ mod tests {
         .unwrap();
         a.push_samples(&x);
         a.push_samples(&[0.0f32; 7]); // total_pushed % 16 == 7
-        let est = a.current().expect("snapshot");
+        let est = a.current_metrics().expect("snapshot");
         assert_eq!(est.tier, crate::tier::Tier::T3, "tier {:?}", est.tier);
         let be = est.beat_error_ms.expect("beat error at T3");
         assert!((be - 0.8).abs() <= 0.1, "be {be}");
@@ -564,7 +714,7 @@ mod tests {
         // signal and confirm it survives into the snapshot.
         let x = synthesize(&SynthConfig::default()).unwrap();
         a.push_samples(&x);
-        let est = a.current().expect("snapshot");
+        let est = a.current_metrics().expect("snapshot");
         assert!(est.quality.clipped_samples >= 100);
         // This push sequence's total is % 16 == 4 — it was silently
         // exercising the C1 tier1 fallback until fixed.
@@ -614,5 +764,80 @@ mod tests {
                 Err(AnalyzerError::InvalidConfig { .. })
             ));
         }
+    }
+
+    #[test]
+    fn incremental_equals_oneshot() {
+        // Push identical data as (a) one shot and (b) 100 ms chunks with a
+        // current_metrics() poll after every chunk (forcing many incremental
+        // paths), then compare the FINAL snapshots field-by-field.
+        let cfg = SynthConfig {
+            beat_error_ms: 0.8,
+            amplitude_deg: 270.0,
+            rate_s_per_day: 12.0,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let x = synthesize(&cfg).expect("valid synth config");
+        let mk = || Analyzer::new(AnalyzerConfig::default()).expect("config");
+        let mut a = mk();
+        a.push_samples(&x);
+        let one = a.current_metrics().expect("one-shot");
+        let mut b = mk();
+        let chunk = 4_800; // 100 ms
+        let mut last = None;
+        for c in x.chunks(chunk) {
+            b.push_samples(c);
+            last = b.current_metrics().or(last);
+        }
+        let inc = last.expect("incremental");
+        assert_eq!(one.tier, inc.tier);
+        assert_eq!(one.bph_nominal, inc.bph_nominal);
+        let close = |x: Option<f64>, y: Option<f64>, tol: f64, what: &str| match (x, y) {
+            (Some(x), Some(y)) => assert!((x - y).abs() < tol, "{what}: {x} vs {y}"),
+            (a, b) => assert_eq!(a.is_some(), b.is_some(), "{what} presence"),
+        };
+        close(one.rate_s_per_day, inc.rate_s_per_day, 0.05, "rate");
+        close(one.beat_error_ms, inc.beat_error_ms, 0.05, "beat error");
+        close(one.amplitude_deg, inc.amplitude_deg, 1.0, "amplitude");
+    }
+
+    #[test]
+    fn tape_events_are_ascending_and_bounded() {
+        let x = synthesize(&SynthConfig::default()).expect("valid synth config");
+        let mut a = Analyzer::new(AnalyzerConfig::default()).expect("config");
+        a.push_samples(&x);
+        let _ = a.current_metrics().expect("snapshot");
+        let tape = a.tape_events();
+        assert!(tape.len() > 200, "tape {} events", tape.len());
+        for w in tape.windows(2) {
+            assert!(w[1].t_drop_corr_s >= w[0].t_drop_corr_s);
+        }
+    }
+
+    #[test]
+    #[ignore = "perf harness; run in release with --ignored"]
+    fn current_metrics_perf_bar() {
+        let cfg = SynthConfig {
+            duration_s: 40.0,
+            ..SynthConfig::default()
+        };
+        let x = synthesize(&cfg).expect("valid synth config");
+        let mut a = Analyzer::new(AnalyzerConfig::default()).expect("config");
+        a.push_samples(&x);
+        let _ = a.current_metrics(); // prime the cache
+        let mut times = Vec::new();
+        for _ in 0..50 {
+            a.push_samples(&vec![0.0f32; 4_800]); // 100 ms of new data per poll
+            let t0 = std::time::Instant::now();
+            let _ = a.current_metrics();
+            times.push(t0.elapsed());
+        }
+        times.sort();
+        let p50 = times[times.len() / 2];
+        assert!(
+            p50 < std::time::Duration::from_millis(10),
+            "p50 {p50:?} (bar: 10 ms release)"
+        );
     }
 }
