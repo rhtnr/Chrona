@@ -4,11 +4,24 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+/// The sidecar schema version this crate writes. `write_sidecar` stamps
+/// every write with this value unconditionally, regardless of what the
+/// in-memory `SessionMeta` carried — see
+/// [`SessionMeta::schema_version`]'s doc comment for the read/write split.
+pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
+
 /// Per-session metadata, serialized alongside the WAV as
 /// `<stem>.json` (spec M3: recording; M4a sidecar v2 adds `watch` and
 /// `summary` below).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
+    /// On **write**, always overwritten with [`SIDECAR_SCHEMA_VERSION`] by
+    /// `write_sidecar`, regardless of what this field held — callers never
+    /// need to (and can't reliably) set it themselves. On **read**, this
+    /// faithfully reports whatever the file actually said; the reader adds
+    /// no version validation (matches the sidecar's "best-effort, never an
+    /// error" contract — older/newer versions still parse as far as
+    /// `#[serde(default)]` on the fields added since each version allows).
     pub schema_version: u32,
     pub device_name: String,
     pub sample_rate_hz: f64,
@@ -50,9 +63,15 @@ pub(crate) fn sidecar_path(wav_path: &Path) -> PathBuf {
     wav_path.with_extension("json")
 }
 
+/// Writes `meta` to `wav_path`'s sidecar, first stamping a copy's
+/// `schema_version` to [`SIDECAR_SCHEMA_VERSION`] unconditionally — the
+/// caller's own `meta` (and whatever `schema_version` it happened to
+/// carry) is left untouched; only the on-disk copy is corrected.
 pub(crate) fn write_sidecar(wav_path: &Path, meta: &SessionMeta) -> Result<()> {
     let path = sidecar_path(wav_path);
-    let json = serde_json::to_string_pretty(meta).context("serialize session sidecar")?;
+    let mut meta = meta.clone();
+    meta.schema_version = SIDECAR_SCHEMA_VERSION;
+    let json = serde_json::to_string_pretty(&meta).context("serialize session sidecar")?;
     std::fs::write(&path, json).with_context(|| format!("write sidecar {}", path.display()))
 }
 
@@ -154,6 +173,42 @@ mod tests {
         assert!(
             text.contains("\"schema_version\": 2"),
             "expected schema_version: 2 in raw JSON, got: {text}"
+        );
+    }
+
+    /// `write_sidecar` must stamp the current schema version
+    /// unconditionally, never trusting whatever the caller happened to set
+    /// — the whole point of enforcing `SIDECAR_SCHEMA_VERSION` at this one
+    /// write choke point rather than leaving every call site to remember
+    /// it. Also confirms the caller's own `meta` is never mutated in
+    /// place — only the on-disk copy is corrected.
+    #[test]
+    fn write_sidecar_always_stamps_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("stamped.wav");
+        let meta = SessionMeta {
+            schema_version: 1, // deliberately stale
+            device_name: "TestMic".to_string(),
+            sample_rate_hz: 48_000.0,
+            ppm_correction: 0.0,
+            lift_angle_deg: 52.0,
+            bph_mode: "auto".to_string(),
+            position: None,
+            started_unix_s: 1_700_000_000,
+            app_version: "test".into(),
+            watch: None,
+            summary: None,
+        };
+        write_sidecar(&wav_path, &meta).unwrap();
+
+        let text = std::fs::read_to_string(sidecar_path(&wav_path)).unwrap();
+        assert!(
+            text.contains("\"schema_version\": 2"),
+            "write_sidecar must stamp schema_version to SIDECAR_SCHEMA_VERSION (2), got: {text}"
+        );
+        assert_eq!(
+            meta.schema_version, 1,
+            "write_sidecar takes &SessionMeta — the caller's own copy must be untouched"
         );
     }
 }
