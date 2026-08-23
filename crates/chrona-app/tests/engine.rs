@@ -50,13 +50,18 @@ fn simulate_source_reaches_tier3_and_publishes_tape() {
         {
             break s;
         }
-        assert!(std::time::Instant::now() < deadline, "never reached T3");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached T3 with tape > 100 (last tier {:?}, tape.len() {})",
+            s.metrics.as_ref().map(|m| m.tier),
+            s.tape.len()
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     let m = snap.metrics.unwrap();
     assert!((m.rate_s_per_day.unwrap() - 12.0).abs() < 0.5);
     assert!((m.beat_error_ms.unwrap() - 0.8).abs() <= 0.15);
-    assert!(snap.tape.len() > 100);
+    // tape.len() > 100 is already guaranteed by the loop's break condition.
     assert!(matches!(snap.source_kind, SourceKind::Simulate));
 }
 
@@ -83,5 +88,40 @@ fn control_messages_rebuild_without_deadlock() {
     eng.send(ControlMsg::SetPpm(25.0));
     std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = eng.snapshot(); // must not hang
+    drop(eng); // Shutdown + join must complete (test would hang otherwise)
+}
+
+#[test]
+fn non_turbo_pacing_survives_a_control_message_burst() {
+    // I2: the two tests above only ever exercise `start_with_turbo(..,
+    // true)`, never the real (non-turbo) wall-clock-paced path this fix
+    // touches directly. This doesn't measure the cadence precisely (the
+    // public snapshot has no elapsed-ticks counter to assert against) but
+    // does confirm the pacing rewrite doesn't hang or deadlock — including
+    // under a burst of control messages, which is exactly the scenario I2
+    // guards against inflating the tick cadence for.
+    let mut eng = Engine::start(
+        SourceSpec::Simulate {
+            rate: 0.0,
+            beat_error: 0.0,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+    );
+    for _ in 0..20 {
+        eng.send(ControlMsg::SetLift(52.0));
+    }
+    // ~10 Hz publish cadence: 1 s is generous headroom for at least one
+    // real (non-default) snapshot to land even on a loaded machine.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let snap = eng.snapshot();
+    assert!(matches!(snap.source_kind, SourceKind::Simulate));
     drop(eng); // Shutdown + join must complete (test would hang otherwise)
 }

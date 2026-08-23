@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrona_audio::{CaptureStream, StreamInfo};
 use chrona_dsp::synth::{SynthConfig, synthesize};
@@ -191,22 +191,37 @@ impl Engine {
             .name("chrona-engine".to_string())
             .spawn(move || {
                 let mut buf_input = buf_input;
+                // Mirrors the last snapshot `engine_loop` published, kept
+                // outside the panicking closure (like `buf_input`) so a
+                // caught panic can still report truthful context — source
+                // kind, recording path, stream info — instead of resetting
+                // everything to `Default` in the fault banner.
+                let mut last_snapshot = EngineSnapshot::default();
                 let ctx_for_loop = egui_ctx.clone();
                 // Panic containment (spec §9): the DSP thread must never
                 // silently vanish and leave the UI showing stale data with
-                // no explanation. `&mut buf_input` is the only borrowed
-                // (non-owned) capture here — AssertUnwindSafe is the
-                // standard escape hatch for exactly this shape (see
-                // `std::panic::catch_unwind`'s own docs example).
+                // no explanation. `&mut buf_input` / `&mut last_snapshot`
+                // are the only borrowed (non-owned) captures here —
+                // AssertUnwindSafe is the standard escape hatch for exactly
+                // this shape (see `std::panic::catch_unwind`'s own docs
+                // example).
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine_loop(initial, config, ctx_for_loop, turbo, rx, &mut buf_input);
+                    engine_loop(
+                        initial,
+                        config,
+                        ctx_for_loop,
+                        turbo,
+                        rx,
+                        &mut buf_input,
+                        &mut last_snapshot,
+                    );
                 }));
                 if let Err(payload) = result {
                     let detail = panic_payload_message(&payload);
                     eprintln!("chrona engine thread panicked: {detail}");
                     buf_input.write(EngineSnapshot {
                         error_banner: Some(format!("analysis thread fault: {detail}")),
-                        ..Default::default()
+                        ..last_snapshot
                     });
                     if let Some(ctx) = &egui_ctx {
                         ctx.request_repaint();
@@ -451,6 +466,23 @@ fn apply_config(
     }
 }
 
+/// Writes `snap` to the triple_buffer, mirrors it into `last_snapshot` (see
+/// its doc comment on the spawn closure for why), and requests a repaint.
+/// The single publish path for `engine_loop`, so `last_snapshot` can never
+/// drift from what was actually last written.
+fn publish(
+    buf_input: &mut triple_buffer::Input<EngineSnapshot>,
+    last_snapshot: &mut EngineSnapshot,
+    egui_ctx: &Option<egui::Context>,
+    snap: EngineSnapshot,
+) {
+    *last_snapshot = snap.clone();
+    buf_input.write(snap);
+    if let Some(ctx) = egui_ctx {
+        ctx.request_repaint();
+    }
+}
+
 /// Pulls one tick's worth of audio from `source` into `analyzer`, teeing it
 /// to `writer` if recording and folding it into the silence tracker.
 /// Returns the number of samples pulled (0 for a starved mic, or a replay
@@ -536,6 +568,7 @@ fn engine_loop(
     turbo: bool,
     rx: mpsc::Receiver<ControlMsg>,
     buf_input: &mut triple_buffer::Input<EngineSnapshot>,
+    last_snapshot: &mut EngineSnapshot,
 ) {
     let mut config = initial_config;
     let mut source = match SourceRuntime::build(&initial) {
@@ -545,26 +578,30 @@ fn engine_loop(
             // return; the thread exits cleanly (not a panic, so the
             // catch_unwind wrapper in `Engine::start_with_turbo` sees Ok
             // and does not double-publish).
-            buf_input.write(EngineSnapshot {
-                error_banner: Some(format!("failed to start: {e}")),
-                ..Default::default()
-            });
-            if let Some(ctx) = &egui_ctx {
-                ctx.request_repaint();
-            }
+            publish(
+                buf_input,
+                last_snapshot,
+                &egui_ctx,
+                EngineSnapshot {
+                    error_banner: Some(format!("failed to start: {e}")),
+                    ..Default::default()
+                },
+            );
             return;
         }
     };
     let mut analyzer = match build_analyzer(&config, source.sample_rate_hz()) {
         Ok(a) => a,
         Err(e) => {
-            buf_input.write(EngineSnapshot {
-                error_banner: Some(format!("invalid initial config: {e}")),
-                ..Default::default()
-            });
-            if let Some(ctx) = &egui_ctx {
-                ctx.request_repaint();
-            }
+            publish(
+                buf_input,
+                last_snapshot,
+                &egui_ctx,
+                EngineSnapshot {
+                    error_banner: Some(format!("invalid initial config: {e}")),
+                    ..Default::default()
+                },
+            );
             return;
         }
     };
@@ -574,19 +611,33 @@ fn engine_loop(
     let mut silence = SilenceTracker::default();
     let mut error_banner: Option<String> = None;
     let mut tick: u32 = 0;
+    // I2: pull_tick/publish are gated on real elapsed time (non-turbo) so a
+    // burst of control messages (e.g. a T9 slider drag, which can fire many
+    // SetLift messages between two real ticks) can't inflate the
+    // audio/publish cadence — see the loop body below.
+    let tick_duration = Duration::from_secs_f64(TICK_S);
+    let mut next_tick = Instant::now() + tick_duration;
 
     'outer: loop {
-        // 1. Drain control messages. The tick's wait doubles as receipt: a
-        // blocking `recv_timeout` paces real-time runs, `try_recv` in
-        // turbo mode never waits.
+        // 1. Drain control messages. Non-turbo waits only until the next
+        // tick boundary (not a flat 50 ms) so it can't overshoot it; turbo
+        // never waits. Either way this drains ALL currently-queued
+        // messages, not just one — a burst (e.g. a slider drag) is fully
+        // absorbed here without affecting how often step 2/3 below runs.
+        // Both branches treat a disconnected sender as an implicit
+        // Shutdown (the sender is gone without sending one explicitly) so
+        // the thread doesn't spin forever on a dead channel.
         let first = if turbo {
-            rx.try_recv().ok()
+            match rx.try_recv() {
+                Ok(m) => Some(m),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(ControlMsg::Shutdown),
+            }
         } else {
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            let wait = next_tick.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(wait) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
-                // The sender is gone without an explicit Shutdown — treat
-                // it as one so the thread doesn't spin on a dead channel.
                 Err(mpsc::RecvTimeoutError::Disconnected) => Some(ControlMsg::Shutdown),
             }
         };
@@ -639,7 +690,22 @@ fn engine_loop(
                                 source = new_source;
                                 analyzer = a;
                                 silence = SilenceTracker::default();
-                                error_banner = None;
+                                // A mid-recording switch must not keep
+                                // teeing the old source's (now
+                                // semantically wrong, possibly
+                                // different-rate) audio into the WAV —
+                                // stop and finalize it. Unconditional and
+                                // best-effort: harmless when nothing was
+                                // recording, and the single banner slot is
+                                // fine carrying this info-grade notice for
+                                // M3 (`writer.take()` is a no-op if it was
+                                // already `None`).
+                                if let Some(w) = writer.take() {
+                                    let _ = w.finalize();
+                                }
+                                recording_path = None;
+                                error_banner =
+                                    Some("recording stopped: source changed".to_string());
                             }
                             Err(e) => {
                                 error_banner = Some(format!("invalid config for new source: {e}"))
@@ -691,38 +757,64 @@ fn engine_loop(
             }
         }
 
-        // 2. Pull audio (mic / simulate / replay — see `pull_tick`).
-        pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+        // 2/3. Pull audio and (every ~10 Hz) publish — gated on wall-clock
+        // time actually reaching `next_tick` in non-turbo mode (turbo
+        // always fires, matching its existing "as fast as possible"
+        // semantics). Without this gate, a burst of control messages above
+        // would make `recv_timeout` above return near-instantly on every
+        // iteration, running this block far faster than the intended ~50
+        // ms/tick pace — over-generating Simulate/Replay audio and
+        // over-triggering publishes for as long as the burst lasted.
+        if turbo || Instant::now() >= next_tick {
+            pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
 
-        // 3. Publish every ~10 Hz.
-        tick += 1;
-        if tick.is_multiple_of(SNAPSHOT_EVERY) {
-            let metrics = analyzer.current_metrics();
-            let tape = analyzer.tape_events();
-            let health = HealthView {
-                overruns: match &source {
-                    SourceRuntime::Mic(s) => s.health.overruns(),
-                    _ => 0,
-                },
-                clipped: analyzer.clipped_samples(),
-                silent_for_s: silence.silent_for_s,
-                last_error: match &source {
-                    SourceRuntime::Mic(s) => s.health.last_error(),
-                    _ => None,
-                },
-            };
-            buf_input.write(EngineSnapshot {
-                metrics,
-                tape,
-                stream: source.stream_info(),
-                source_kind: source.kind(),
-                replay_done: source.replay_done(),
-                health,
-                recording: recording_path.clone(),
-                error_banner: error_banner.clone(),
-            });
-            if let Some(ctx) = &egui_ctx {
-                ctx.request_repaint();
+            tick += 1;
+            if tick.is_multiple_of(SNAPSHOT_EVERY) {
+                let metrics = analyzer.current_metrics();
+                let tape = analyzer.tape_events();
+                let health = HealthView {
+                    overruns: match &source {
+                        SourceRuntime::Mic(s) => s.health.overruns(),
+                        _ => 0,
+                    },
+                    clipped: analyzer.clipped_samples(),
+                    silent_for_s: silence.silent_for_s,
+                    last_error: match &source {
+                        SourceRuntime::Mic(s) => s.health.last_error(),
+                        _ => None,
+                    },
+                };
+                publish(
+                    buf_input,
+                    last_snapshot,
+                    &egui_ctx,
+                    EngineSnapshot {
+                        metrics,
+                        tape,
+                        stream: source.stream_info(),
+                        source_kind: source.kind(),
+                        replay_done: source.replay_done(),
+                        health,
+                        recording: recording_path.clone(),
+                        error_banner: error_banner.clone(),
+                    },
+                );
+            }
+
+            if !turbo {
+                next_tick += tick_duration;
+                // Catch up without spiraling: a long stall (GC-style
+                // pause, OS starving this thread, a debugger breakpoint)
+                // would otherwise leave `next_tick` far in the past, and
+                // the loop would immediately re-enter this block on every
+                // subsequent iteration to "catch up" — doing so by
+                // bursting through the whole backlog only makes the
+                // thread fall further behind while it works through it.
+                // Past 5 ticks behind, give up catching up and resume
+                // pacing from now instead.
+                if Instant::now() > next_tick + tick_duration * 5 {
+                    next_tick = Instant::now() + tick_duration;
+                }
             }
         }
     }
