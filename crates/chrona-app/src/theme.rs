@@ -44,6 +44,11 @@ pub struct Palette {
     pub warnfg: Color32,
     pub rec: Color32,
     pub overlay: Color32,
+    /// Fixed white, both themes (M4a Task 6 pre-review fix): text painted
+    /// on top of a `rec`-filled surface (the Record button's label while
+    /// recording) needs to stay legible regardless of theme, unlike
+    /// `accent_ink`, which flips dark/light with `accent`'s own contrast.
+    pub rec_ink: Color32,
 }
 
 // Spec §1 table, dark column. Hex values are binding — do not "improve" them.
@@ -67,6 +72,7 @@ static DARK_PALETTE: Palette = Palette {
     warnfg: Color32::from_rgb(0xf2, 0xc8, 0x6c),
     rec: Color32::from_rgb(0xc9, 0x2f, 0x33),
     overlay: Color32::from_rgb(0x02, 0x04, 0x05),
+    rec_ink: Color32::from_rgb(0xff, 0xff, 0xff),
 };
 
 // Spec §1 table, light column.
@@ -90,6 +96,7 @@ static LIGHT_PALETTE: Palette = Palette {
     warnfg: Color32::from_rgb(0x8a, 0x56, 0x00),
     rec: Color32::from_rgb(0xc9, 0x2f, 0x33),
     overlay: Color32::from_rgb(0x02, 0x04, 0x05),
+    rec_ink: Color32::from_rgb(0xff, 0xff, 0xff),
 };
 
 impl Palette {
@@ -275,6 +282,7 @@ mod tests {
             ("warnfg", |p| p.warnfg, 0xf2c86c, 0x8a5600),
             ("rec", |p| p.rec, 0xc92f33, 0xc92f33),
             ("overlay", |p| p.overlay, 0x020405, 0x020405),
+            ("rec_ink", |p| p.rec_ink, 0xffffff, 0xffffff),
         ];
 
         let dark = Palette::of(Theme::Dark);

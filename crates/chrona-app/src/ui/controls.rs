@@ -212,6 +212,20 @@ impl ControlsState {
     }
 }
 
+/// Resolves the currently selected device id to its display name, for the
+/// `device_ppm` config key (behavior contract: keyed by device name, not
+/// the opaque id — a name survives round-tripping through the config file
+/// more legibly, matching `ConfigStore`'s own convention). `pub(crate)`:
+/// reused by the toolbar's ppm popup (M4a Task 6 pre-review fix) the same
+/// way `device_picker` is.
+pub(crate) fn current_device_name(controls: &ControlsState) -> Option<String> {
+    controls
+        .selected_device
+        .as_ref()
+        .and_then(|id| controls.devices.iter().find(|d| &d.id == id))
+        .map(|d| d.name.clone())
+}
+
 /// True iff the *set* of device ids differs — used to gate replacing
 /// `controls.devices` on a poll so an unchanged device list (the common
 /// case, polled every 2s) doesn't flicker the open combo box.

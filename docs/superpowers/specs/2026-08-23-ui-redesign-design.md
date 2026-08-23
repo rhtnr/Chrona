@@ -187,7 +187,7 @@ gridlines (lo/mid/hi). Below T3 the strip shows `amplitude requires Tier 3 · <r
   25200 / 28800 / 36000 / Other…** — "Other…" reveals M3's validated free-text Fixed
   field (M3 exposed Auto/Free/Fixed-text; the mockup's fixed-value list alone would
   regress that, §14); averaging combo **10 s / 30 s / 60 s** (§14); `cal {ppm:+.1} ppm`
-  monospace text.
+  monospace text (click-to-edit popup).
 - Elapsed timer `● MM:SS` in the strip (engine-confirmed recording, M3 semantics).
 
 ## 13. Architecture & testing
@@ -230,6 +230,11 @@ gridlines (lo/mid/hi). Below T3 the strip shows `amplitude requires Tier 3 · <r
    8 beats/s = 4 Hz oscillation; COSC −4/+6; both correct).
 9. The mockup's `support.js` React-like runtime is preview scaffolding only — nothing
    from it is ported.
+10. The mockup renders the calibration readout as static text (`cal 0.0 ppm`); the app
+    keeps it editable — the readout is a click target opening a compact ppm editor (M3's
+    per-device DragValue semantics, persisted via `device_ppm`) — because manual-protocol
+    B.7 and per-device calibration depend on in-app entry. M4's calibration wizard may
+    absorb it.
 
 ## 15. Protocol & docs updates (in this milestone)
 

@@ -17,7 +17,9 @@ use eframe::egui;
 use crate::engine::{ControlMsg, Engine, EngineSnapshot, SourceSpec};
 use crate::history::HistoryIndex;
 use crate::theme::{self, Palette, Theme};
-use crate::ui::controls::{BphModeUi, ControlsState, device_picker, to_bph_mode};
+use crate::ui::controls::{
+    BphModeUi, ControlsState, current_device_name, device_picker, to_bph_mode,
+};
 use crate::ui::modals::{AddWatchModalState, render_add_watch_modal};
 use crate::ui::session_panel::SessionPanelState;
 
@@ -131,7 +133,7 @@ pub fn toolbar_row(
         dirty |= lift_control(ui, palette, controls, engine, config);
         bph_combo(ui, palette, controls, engine, &mut state.bph_selection);
         averaging_combo(ui, palette, controls, engine);
-        cal_label(ui, palette, controls.ppm);
+        dirty |= cal_ppm_control(ui, palette, controls, engine, config);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Added in reverse of visual left-to-right order (mockup:
@@ -406,17 +408,63 @@ fn averaging_combo(
         });
 }
 
-/// `cal {ppm:+.1} ppm` read-only monospace readout (behavior contract; spec
-/// §12: no in-toolbar editor — M3's ppm `DragValue` is retired here, same
-/// as the lift preset menu. `select_device`, kept in `controls.rs`, still
-/// applies + sends a newly-selected device's saved ppm unchanged).
-fn cal_label(ui: &mut egui::Ui, palette: &Palette, ppm: f64) {
-    ui.label(
-        egui::RichText::new(format!("cal {ppm:+.1} ppm"))
-            .font(egui::FontId::monospace(12.0))
-            .color(palette.faint),
-    )
-    .on_hover_text("Timebase calibration");
+/// `cal {ppm:+.1} ppm` — a click target opening a compact ppm editor (spec
+/// §14 deviation #10, pre-review fix: the mockup renders this as static
+/// text, but the app keeps it editable — manual-protocol B.7 and per-device
+/// calibration depend on in-app entry). The popup reuses the M3
+/// `ppm_control` DragValue verbatim (range/step/`SetPpm`/`device_ppm`
+/// persistence — see `git show 1bbd3ba:crates/chrona-app/src/ui/
+/// controls.rs`), just moved behind a click instead of always visible.
+/// `egui::Popup::from_toggle_button_response` handles the open/close state
+/// (toggling on click) and, via `CloseOnClickOutside`, closing on an
+/// outside click; Esc-closing is built into `Popup::show` unconditionally.
+/// Returns `true` iff `config.device_ppm` changed this frame (same
+/// debounced-dirty contract the old `ppm_control` had).
+fn cal_ppm_control(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    controls: &mut ControlsState,
+    engine: &Engine,
+    config: &mut ConfigStore,
+) -> bool {
+    let button_resp = ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new(format!("cal {:+.1} ppm", controls.ppm))
+                    .font(egui::FontId::monospace(12.0))
+                    .color(palette.faint),
+            )
+            .frame(false),
+        )
+        .on_hover_text("Timebase calibration — click to edit");
+
+    egui::Popup::from_toggle_button_response(&button_resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(150.0);
+            ui.label(muted_label(palette, "Timebase calibration"));
+            let changed = ui
+                .add(
+                    egui::DragValue::new(&mut controls.ppm)
+                        .range(-500.0..=500.0)
+                        .speed(0.1)
+                        .suffix(" ppm"),
+                )
+                .changed();
+            if !changed {
+                return false;
+            }
+            engine.send(ControlMsg::SetPpm(controls.ppm));
+            match current_device_name(controls) {
+                Some(name) => {
+                    config.device_ppm.insert(name, controls.ppm);
+                    true
+                }
+                None => false,
+            }
+        })
+        .map(|inner| inner.inner)
+        .unwrap_or(false)
 }
 
 fn outline_button(ui: &mut egui::Ui, palette: &Palette, text: &str) -> egui::Response {
@@ -519,7 +567,7 @@ fn record_stop_button(
     let label = if recording { "Stop" } else { "Record" };
     let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::FAMILY_SEMIBOLD.into()));
     let fg = if recording {
-        egui::Color32::WHITE
+        palette.rec_ink
     } else {
         palette.accent_ink
     };
