@@ -514,6 +514,18 @@ fn beat_trace_panel(
         } else if scroll_y > 0.0 {
             view.zoom(1.0 / 1.15); // DOM-equivalent "scroll up" → zoom IN
         }
+        // Consume the vertical delta now that we've read it: the outer
+        // ScrollArea (T10) applies `smooth_scroll_delta` to its own offset
+        // AFTER this panel's content runs (vendored egui
+        // scroll_area.rs:1219-1249), so an unconsumed delta double-fires —
+        // wheel-zoom here also scrolls the page. This is the egui analog
+        // of the mockup's `bindPanZoom` `preventDefault()`. Zeroed
+        // unconditionally while hovered (not just on an actual zoom) so
+        // the page NEVER scrolls with the cursor over the chart; zeroing
+        // an already-zero delta is free. `.x` is left alone — the outer
+        // ScrollArea is vertical-only, so a horizontal delta is inert
+        // there anyway.
+        ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
     }
     if response.dragged() && plot.width() > 0.0 {
         // Positive dx (dragging right) must PAN BACKWARD (reveal older
