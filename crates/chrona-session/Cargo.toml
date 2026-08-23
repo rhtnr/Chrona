@@ -1,0 +1,19 @@
+[package]
+name = "chrona-session"
+description = "Chrona session I/O: WAV+JSON recording, replay, and the TOML config store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+chrona-dsp = { path = "../chrona-dsp" }
+hound = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+directories = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
