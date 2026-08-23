@@ -11,6 +11,7 @@ use eframe::egui;
 
 use crate::AppFlags;
 use crate::engine::{ControlMsg, Engine, EngineConfig, HealthView, SourceSpec};
+use crate::theme::{self, Theme};
 use crate::ui::{
     Banner, ClipTracker, ControlsState, SessionPanelState, TapeUiState, controls_row,
     default_recordings_dir, pick_banner, session_panel,
@@ -28,6 +29,11 @@ pub struct ChronaApp {
     tape_ui: TapeUiState,
     controls: ControlsState,
     config: ConfigStore,
+    /// The active theme, applied to `cc.egui_ctx` at startup. Not yet read
+    /// anywhere else — the toolbar toggle that flips it and re-applies via
+    /// `theme::apply_style` lands in a later M4a task (spec §1).
+    #[allow(dead_code)]
+    theme: Theme,
     /// Set the moment the config first goes dirty (not refreshed on every
     /// subsequent edit), so a continuous drag still saves within a bounded
     /// ~1s window instead of never catching up — cleared once saved.
@@ -46,6 +52,10 @@ impl ChronaApp {
     pub fn new(cc: &eframe::CreationContext<'_>, flags: AppFlags) -> Self {
         let config = ConfigStore::load_default();
         let controls = ControlsState::from_config(&config);
+
+        let theme = theme::theme_from_config(config.theme.as_deref());
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply_style(&cc.egui_ctx, theme);
 
         let initial = if flags.simulate {
             SourceSpec::Simulate {
@@ -71,6 +81,7 @@ impl ChronaApp {
             tape_ui: TapeUiState::default(),
             controls,
             config,
+            theme,
             dirty_since: None,
             clip_tracker: ClipTracker::default(),
             next_mic_retry: None,

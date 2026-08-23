@@ -17,6 +17,10 @@ pub struct ConfigStore {
     pub last_device: Option<String>,
     #[serde(default)]
     pub device_ppm: BTreeMap<String, f64>,
+    /// Persisted UI theme, `"dark"` | `"light"` (M4a spec §1); `None` or any
+    /// other value falls back to dark — see `chrona_app::theme::theme_from_config`.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl Default for ConfigStore {
@@ -25,6 +29,7 @@ impl Default for ConfigStore {
             default_lift_deg: default_lift_deg(),
             last_device: None,
             device_ppm: BTreeMap::new(),
+            theme: None,
         }
     }
 }
@@ -82,11 +87,14 @@ mod tests {
         let path = dir.path().join("config.toml");
         let mut c = ConfigStore::load_from(&path); // missing → defaults
         assert_eq!(c.default_lift_deg, 52.0);
+        assert_eq!(c.theme, None);
         c.device_ppm.insert("Built-in Microphone".into(), -37.2);
         c.last_device = Some("Built-in Microphone".into());
+        c.theme = Some("light".into());
         c.save_to(&path).unwrap();
         let c2 = ConfigStore::load_from(&path);
         assert_eq!(c2.device_ppm["Built-in Microphone"], -37.2);
+        assert_eq!(c2.theme.as_deref(), Some("light"));
         assert_eq!(c2.last_device.as_deref(), Some("Built-in Microphone"));
     }
 }

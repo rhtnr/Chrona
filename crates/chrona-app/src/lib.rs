@@ -5,6 +5,7 @@
 pub mod app;
 pub mod engine;
 pub mod presenter;
+pub mod theme;
 pub mod ui;
 
 use clap::Parser;
