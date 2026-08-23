@@ -70,3 +70,31 @@ fn verify_checks_beat_error_and_amplitude_when_present() {
         .assert()
         .code(1);
 }
+
+#[test]
+fn verify_default_beat_error_tolerance() {
+    // Expectation with expect_beat_error_ms but NO tol_beat_error should use
+    // the documented 0.15 default (see commands.rs line 389).
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("be.wav");
+    chrona()
+        .args(["synth", wav.to_str().unwrap(), "--beat-error", "0.8"])
+        .assert()
+        .success();
+
+    // Case (a): synth be 0.8, expect 0.8, NO tol_beat_error → passes at 0.15 default.
+    let good = r#"{"file":"be.wav","bph":"auto","expect_rate_s_per_day":0.0,"tol_rate":1.0,"expect_beat_error_ms":0.8}"#;
+    std::fs::write(dir.path().join("good.json"), good).unwrap();
+    chrona()
+        .args(["verify", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Case (b): expect 0.2 (0.8 - 0.2 = 0.6 > 0.15 tolerance) → fails.
+    let bad = r#"{"file":"be.wav","bph":"auto","expect_rate_s_per_day":0.0,"tol_rate":1.0,"expect_beat_error_ms":0.2}"#;
+    std::fs::write(dir.path().join("bad.json"), bad).unwrap();
+    chrona()
+        .args(["verify", dir.path().to_str().unwrap()])
+        .assert()
+        .code(1);
+}

@@ -191,10 +191,12 @@ pub fn extract_events(
     if !(t_osc_env.is_finite() && t_osc_env > 1.0) || env.is_empty() {
         return Vec::new();
     }
-    // Must match fold_envelope's window arithmetic (see invariant note).
+    // Compute cycle count once. When t_osc_env is fractional, floor(C·t) may
+    // lose precision; pass fold_start = env.len − ceil(C·t) so anchored recomputes
+    // cycles from it and gets exactly C (not C−1).
     let cycles = (env.len() as f64 / t_osc_env).floor() as usize;
-    let usable = (cycles as f64 * t_osc_env) as usize;
-    let fold_start = env.len() - usable;
+    let window_size = ((cycles as f64 * t_osc_env).ceil()) as usize;
+    let fold_start = env.len().saturating_sub(window_size);
     extract_events_anchored(
         raw,
         raw_start_abs,
@@ -602,5 +604,59 @@ mod tests {
             medians[0] > medians[1] && medians[1] > medians[2],
             "medians {medians:?}"
         );
+    }
+
+    #[test]
+    fn extract_events_wrapper_preserves_cycle_count_with_fractional_t_osc_env() {
+        // Regression test for the cycle-loss bug: when t_osc_env is fractional,
+        // the wrapper's fold_start computation could cause anchored to recompute
+        // one fewer cycle (C → C−1) due to floating-point precision loss.
+        // This test verifies the wrapper and a full-window anchored call extract
+        // the same number of events at the same beat indices.
+        let cfg = SynthConfig {
+            rate_s_per_day: 12.0,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        };
+        let (events_via_wrapper, _) = pipeline_to_events(&cfg);
+
+        // Now call anchored directly with a full window (fold_start = 0)
+        // to get the "ground truth" extraction of ALL cycles.
+        let x = synthesize(&cfg).expect("valid synth config");
+        let sr = cfg.sample_rate_hz;
+        let mut dc = DcBlocker::new();
+        let mut hp = Butterworth::high_pass(sr, 3_000.0).unwrap();
+        let raw: Vec<f32> = x.iter().map(|&s| hp.process(dc.process(s))).collect();
+        let mut envx = EnvelopeExtractor::new(sr).unwrap();
+        let mut env = Vec::new();
+        envx.process(&raw, &mut env);
+        let t_osc_env = crate::bph::t_osc_s(cfg.bph)
+            * (1.0 - cfg.rate_s_per_day / 86_400.0)
+            * envx.envelope_rate_hz();
+        let profile = fold_envelope(&env, t_osc_env).expect("fold");
+        let events_via_anchored = extract_events_anchored(&raw, 0, &env, sr, &profile, 0, 0, 0);
+
+        // Both extractions should detect the same events (same count, same beat indices).
+        assert_eq!(
+            events_via_wrapper.len(),
+            events_via_anchored.len(),
+            "wrapper and anchored event counts differ"
+        );
+        if !events_via_wrapper.is_empty() && !events_via_anchored.is_empty() {
+            let max_wrapper = events_via_wrapper
+                .iter()
+                .map(|e| e.beat_index)
+                .max()
+                .unwrap();
+            let max_anchored = events_via_anchored
+                .iter()
+                .map(|e| e.beat_index)
+                .max()
+                .unwrap();
+            assert_eq!(
+                max_wrapper, max_anchored,
+                "wrapper max beat_index {max_wrapper}, anchored {max_anchored}"
+            );
+        }
     }
 }

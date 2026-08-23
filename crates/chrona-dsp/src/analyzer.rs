@@ -986,15 +986,13 @@ mod tests {
             // No large beat_index gaps within the newly-appended suffix this
             // poll (a batch is emitted from one extract_events_anchored call
             // sharing one beat_index_base, so consecutive detections should
-            // differ by a small amount at 30 dB — bug (a)'s systematic
-            // one-cycle-per-poll loss would show as a dense, repeated gap of
-            // exactly 2 across the whole tape, not just an occasional miss).
+            // differ by 1–2 at 30 dB; a lost cycle produces gap 3+).
             if tape.len() > prev_tape.len() {
                 let new_suffix = &tape[prev_tape.len()..];
                 for w in new_suffix.windows(2) {
                     let gap = w[1].beat_index - w[0].beat_index;
                     assert!(
-                        (1..=4).contains(&gap),
+                        (1..=2).contains(&gap),
                         "beat_index gap {gap} within one poll's batch at pushed {pushed_s:.1}s"
                     );
                 }
@@ -1005,6 +1003,30 @@ mod tests {
         assert!(
             checked_after_ring_fill,
             "test never reached the post-ring-fill steady state it's meant to check"
+        );
+    }
+
+    #[test]
+    fn periodslope_pin_at_t1() {
+        // A short clip that lands T1 (fold/alignment can't run yet) with a
+        // defensible rate from period slope. Shorter clips → fewer cycles →
+        // sparse events → detection_ratio < 0.6 → forces T1 (no beat_error/amplitude).
+        // Very low SNR (10 dB) + short duration (4 s) + high rate makes events sparse.
+        let cfg = SynthConfig {
+            duration_s: 4.0,
+            rate_s_per_day: 12.0,
+            snr_db: 10.0,
+            ..SynthConfig::default()
+        };
+        let est = analyze(&cfg, BphMode::Auto, 0.0).expect("snapshot at 4s, SNR 10");
+
+        assert_eq!(est.tier, crate::tier::Tier::T1);
+        assert!(est.rate_s_per_day.is_some());
+        assert_eq!(est.rate_source, Some(RateSource::PeriodSlope));
+        let rate = est.rate_s_per_day.expect("rate in T1");
+        assert!(
+            (rate - 12.0).abs() < 1.0,
+            "rate {rate} should be within ±1.0 of 12.0"
         );
     }
 

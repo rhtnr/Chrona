@@ -91,6 +91,11 @@ fn analyze_noise_exits_2_with_no_beat() {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["status"], "no_beat");
+    // Verify clipped_samples field exists.
+    assert!(
+        v["clipped_samples"].is_number(),
+        "clipped_samples field must exist in no_beat JSON"
+    );
 }
 
 #[test]

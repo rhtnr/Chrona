@@ -194,4 +194,48 @@ mod tests {
             Err(CalError::NoTicks)
         ));
     }
+
+    #[test]
+    fn bad_input_all_zeros_and_nan() {
+        // calibrate_quartz(&[0.0; 48_000], f64::NAN) is Err(CalError::BadInput{..})
+        let result = calibrate_quartz(&[0.0f32; 48_000], f64::NAN);
+        assert!(
+            matches!(result, Err(CalError::BadInput { .. })),
+            "all zeros + NAN sample_rate should error BadInput"
+        );
+    }
+
+    #[test]
+    fn unstable_corruption_yields_high_residual_or_no_ticks() {
+        // Interleave two quartz signals with ppm −400 and +400 (concatenate
+        // 160 s of each into one 320 s buffer) → split slope's residual should
+        // exceed 2 ppm → Err(CalError::Unstable{..}). If tracker loses ticks
+        // on the seam, also accept NoTicks.
+        let sr = 48_000.0;
+        let mut corrupted = Vec::new();
+
+        // First 160 s: quartz at −400 ppm
+        let x1 = synthesize_quartz(160.0, sr, -400.0, 30.0, 1).unwrap();
+        corrupted.extend(&x1);
+
+        // Next 160 s: quartz at +400 ppm
+        let x2 = synthesize_quartz(160.0, sr, 400.0, 30.0, 1).unwrap();
+        corrupted.extend(&x2);
+
+        let result = calibrate_quartz(&corrupted, sr);
+        match result {
+            Err(CalError::Unstable { residual_ppm }) => {
+                assert!(
+                    residual_ppm > 2.0,
+                    "unstable residual {residual_ppm} should exceed 2 ppm"
+                );
+            }
+            Err(CalError::NoTicks) => {
+                // Also acceptable: tracker lost ticks on the seam.
+            }
+            other => {
+                panic!("expected Err(Unstable) or Err(NoTicks), got {:?}", other);
+            }
+        }
+    }
 }
