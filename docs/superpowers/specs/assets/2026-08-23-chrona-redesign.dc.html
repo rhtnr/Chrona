@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Fragment+Mono&display=swap" rel="stylesheet">
+<style>
+:root { --bg:oklch(0.16 0.01 240); --panel:oklch(0.2 0.01 240); --panel2:oklch(0.24 0.01 240); --border:oklch(0.28 0.01 240); --border2:oklch(0.34 0.01 240); --text:oklch(0.93 0.005 240); --muted:oklch(0.62 0.01 240); --faint:oklch(0.52 0.01 240); --grid:oklch(0.23 0.008 240); --grid0:oklch(0.35 0.01 240); --chartbg:oklch(0.14 0.008 240); --accent:oklch(0.74 0.12 230); --accent-ink:oklch(0.15 0.01 240); --tick:oklch(0.8 0.14 85); --good:oklch(0.72 0.15 150); --warnbg:oklch(0.3 0.06 75); --warnfg:oklch(0.85 0.12 85); }
+[data-theme="light"] { --bg:oklch(0.965 0.003 240); --panel:oklch(1 0 0); --panel2:oklch(0.95 0.004 240); --border:oklch(0.88 0.005 240); --border2:oklch(0.8 0.006 240); --text:oklch(0.24 0.01 240); --muted:oklch(0.5 0.01 240); --faint:oklch(0.58 0.01 240); --grid:oklch(0.92 0.004 240); --grid0:oklch(0.8 0.006 240); --chartbg:oklch(0.99 0.002 240); --accent:oklch(0.56 0.13 240); --accent-ink:oklch(0.99 0 0); --tick:oklch(0.68 0.14 70); --good:oklch(0.6 0.15 150); --warnbg:oklch(0.93 0.05 85); --warnfg:oklch(0.5 0.11 70); }
+body { margin:0; background:var(--bg); }
+a { color:var(--accent); } a:hover { opacity:0.8; }
+@keyframes recpulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+select, input { accent-color:var(--accent); }
+</style>
+</helmet>
+<div style="min-height:100vh; display:flex; flex-direction:column; background:var(--bg); color:var(--text); font-family:'Archivo',sans-serif; font-size:14px;">
+
+  <!-- Toolbar -->
+  <header style="display:flex; align-items:center; gap:14px; padding:10px 20px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap;">
+    <div style="display:flex; align-items:center; gap:10px; margin-right:6px;">
+      <div style="width:26px; height:26px; border-radius:7px; background:var(--accent); display:grid; place-items:center; color:var(--accent-ink); font-weight:700; font-size:13px;">C</div>
+      <span style="font-weight:600; font-size:15px;">Chrona</span>
+    </div>
+    <div style="width:1px; height:22px; background:var(--border);"></div>
+    <label style="display:flex; align-items:center; gap:7px; color:var(--muted); font-size:13px;">Watch
+      <select onChange="{{ watchChange }}" value="{{ watch }}" style="background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:6px 8px; font-family:inherit; font-size:13px; max-width:180px;">
+        <sc-for list="{{ watches }}" as="w" hint-placeholder-count="3">
+          <option value="{{ w }}">{{ w }}</option>
+        </sc-for>
+        <option value="__add">+ Add new watch…</option>
+      </select>
+    </label>
+    <div style="width:1px; height:22px; background:var(--border);"></div>
+    <label style="display:flex; align-items:center; gap:7px; color:var(--muted); font-size:13px;">Input
+      <select style="background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:6px 8px; font-family:inherit; font-size:13px;">
+        <option>System default</option><option>USB microphone</option><option>Line in</option>
+      </select>
+    </label>
+    <label style="display:flex; align-items:center; gap:7px; color:var(--muted); font-size:13px;">Lift angle
+      <input defaultValue="52°" style="width:44px; background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:6px 6px; font-family:'Fragment Mono',monospace; font-size:13px; text-align:center;">
+    </label>
+    <label style="display:flex; align-items:center; gap:7px; color:var(--muted); font-size:13px;">BPH
+      <select style="background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:6px 8px; font-family:inherit; font-size:13px;">
+        <option>Auto</option><option>18000</option><option>21600</option><option>28800</option><option>36000</option>
+      </select>
+    </label>
+    <label style="display:flex; align-items:center; gap:7px; color:var(--muted); font-size:13px;">Averaging
+      <select style="background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:6px 8px; font-family:inherit; font-size:13px;">
+        <option>30 s</option><option>10 s</option><option>60 s</option><option>120 s</option>
+      </select>
+    </label>
+    <span title="Timebase calibration" style="color:var(--faint); font-family:'Fragment Mono',monospace; font-size:12px;">cal 0.0 ppm</span>
+    <div style="flex:1;"></div>
+    <button onClick="{{ toggleTheme }}" title="Toggle light/dark" style="background:none; border:1px solid var(--border2); color:var(--muted); border-radius:8px; padding:7px 10px; font-family:inherit; font-size:13px; cursor:pointer;" style-hover="color:var(--text); border-color:var(--faint);">{{ themeLabel }}</button>
+    <button style="background:none; border:1px solid var(--border2); color:var(--text); border-radius:8px; padding:7px 13px; font-family:inherit; font-size:13px; cursor:pointer;" style-hover="border-color:var(--faint);">Open recording…</button>
+    <button style="background:none; border:1px solid var(--border2); color:var(--text); border-radius:8px; padding:7px 13px; font-family:inherit; font-size:13px; cursor:pointer;" style-hover="border-color:var(--faint);">Export report</button>
+    <button onClick="{{ toggleRecord }}" style="{{ recordBtnStyle }}"><span style="{{ recordDotStyle }}"></span>{{ recordLabel }}</button>
+  </header>
+
+  <!-- Position + session strip -->
+  <div style="display:flex; align-items:center; gap:16px; padding:10px 20px; border-bottom:1px solid var(--border); flex-wrap:wrap;">
+    <span style="color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0.09em;">Position</span>
+    <div style="display:flex; gap:4px; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:4px;">
+      <sc-for list="{{ positions }}" as="pos" hint-placeholder-count="6">
+        <button onClick="{{ pos.select }}" title="{{ pos.full }}" style="{{ pos.style }}">
+          <span style="font-family:'Fragment Mono',monospace; font-size:13px; line-height:1;">{{ pos.code }}</span>
+          <span style="font-size:9.5px; opacity:0.75; line-height:1;">{{ pos.label }}</span>
+        </button>
+      </sc-for>
+    </div>
+    <div style="flex:1;"></div>
+    <div style="display:flex; align-items:center; gap:9px;">
+      <span style="color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0.09em;">Signal</span>
+      <div style="display:flex; gap:3px; align-items:flex-end;">
+        <div style="width:5px; height:8px; border-radius:2px; background:var(--good);"></div>
+        <div style="width:5px; height:12px; border-radius:2px; background:var(--good);"></div>
+        <div style="width:5px; height:16px; border-radius:2px; background:var(--good);"></div>
+        <div style="width:5px; height:20px; border-radius:2px; background:var(--border2);"></div>
+      </div>
+      <span style="font-size:12px; color:var(--good);">Strong · full regression</span>
+    </div>
+    <span style="font-family:'Fragment Mono',monospace; font-size:12px; color:var(--muted); min-width:88px; text-align:right;">{{ elapsed }}</span>
+  </div>
+
+  <!-- Metrics band -->
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; padding:14px 20px;">
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px;">
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="display:flex; align-items:center; gap:6px; font-size:11px; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted);">Rate
+          <button onClick="{{ helpRate }}" style="{{ helpBtnStyle }}">?</button>
+        </span>
+        <span title="Not calibrated — measured against uncalibrated system clock" style="font-size:11px; padding:2px 8px; border-radius:99px; background:var(--warnbg); color:var(--warnfg); cursor:help;">uncal</span>
+      </div>
+      <div style="font-family:'Fragment Mono',monospace; font-size:30px; line-height:1.2; margin-top:4px;">+12.0<span style="font-size:15px; color:var(--muted);"> s/d</span></div>
+    </div>
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px;">
+      <div style="display:flex; align-items:center; gap:6px; font-size:11px; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted);">Beat error
+        <button onClick="{{ helpBeatError }}" style="{{ helpBtnStyle }}">?</button>
+      </div>
+      <div style="font-family:'Fragment Mono',monospace; font-size:30px; line-height:1.2; margin-top:4px;">0.8<span style="font-size:15px; color:var(--muted);"> ms</span></div>
+    </div>
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px;">
+      <div style="display:flex; align-items:center; gap:6px; font-size:11px; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted);">Amplitude
+        <button onClick="{{ helpAmplitude }}" style="{{ helpBtnStyle }}">?</button>
+      </div>
+      <div style="font-family:'Fragment Mono',monospace; font-size:30px; line-height:1.2; margin-top:4px;">270<span style="font-size:15px; color:var(--muted);">°</span></div>
+    </div>
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px;">
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="display:flex; align-items:center; gap:6px; font-size:11px; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted);">Beat rate
+          <button onClick="{{ helpBeatRate }}" style="{{ helpBtnStyle }}">?</button>
+        </span>
+        <span style="font-size:11px; color:var(--faint);">auto</span>
+      </div>
+      <div style="font-family:'Fragment Mono',monospace; font-size:30px; line-height:1.2; margin-top:4px;">28 800<span style="font-size:15px; color:var(--muted);"> bph</span></div>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div style="display:flex; flex-direction:column; padding:0 20px; flex:1; min-height:0;">
+    <div style="display:flex; align-items:center; gap:14px; padding:2px 4px 10px; flex-wrap:wrap;">
+      <span style="font-weight:600; font-size:13px;">Beat trace</span>
+      <div style="display:flex; align-items:center; gap:14px; font-size:12px; color:var(--muted);">
+        <span style="display:flex; align-items:center; gap:6px;"><span style="width:8px; height:8px; border-radius:50%; background:var(--tick);"></span>Tick</span>
+        <span style="display:flex; align-items:center; gap:6px;"><span style="width:8px; height:8px; border-radius:50%; background:var(--accent);"></span>Tock</span>
+        <span style="display:flex; align-items:center; gap:6px;"><span style="width:14px; height:2px; background:var(--good);"></span>Rate trend</span>
+      </div>
+      <div style="flex:1;"></div>
+      <span style="font-size:11px; color:var(--faint);">scroll to zoom · drag to pan</span>
+      <div style="display:flex; gap:4px;">
+        <button onClick="{{ zoomIn }}" style="width:28px; height:28px; background:var(--panel2); border:1px solid var(--border2); color:var(--text); border-radius:7px; cursor:pointer; font-size:15px; line-height:1;">+</button>
+        <button onClick="{{ zoomOut }}" style="width:28px; height:28px; background:var(--panel2); border:1px solid var(--border2); color:var(--text); border-radius:7px; cursor:pointer; font-size:15px; line-height:1;">−</button>
+        <button onClick="{{ zoomReset }}" style="height:28px; padding:0 10px; background:var(--panel2); border:1px solid var(--border2); color:var(--text); border-radius:7px; cursor:pointer; font-size:12px; font-family:inherit;">Fit</button>
+      </div>
+      <label style="display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12px;">Wrap
+        <select onChange="{{ wrapChange }}" defaultValue="5" style="background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:5px 7px; font-family:inherit; font-size:12px;">
+          <option value="5">±5 ms</option><option value="2">±2 ms</option><option value="10">±10 ms</option><option value="25">±25 ms</option>
+        </select>
+      </label>
+    </div>
+    <div style="flex:1; min-height:260px; position:relative; border:1px solid var(--border); border-radius:12px; background:var(--chartbg); overflow:hidden;">
+      <canvas ref="{{ beatRef }}" style="position:absolute; inset:0; width:100%; height:100%; cursor:grab;"></canvas>
+    </div>
+    <div style="display:flex; align-items:center; gap:10px; padding:12px 4px 8px;">
+      <span style="font-weight:600; font-size:13px;">Amplitude</span>
+      <span style="font-size:11px; color:var(--faint);">same time scale</span>
+    </div>
+    <div style="height:110px; position:relative; border:1px solid var(--border); border-radius:12px; background:var(--chartbg); overflow:hidden;">
+      <canvas ref="{{ ampRef }}" style="position:absolute; inset:0; width:100%; height:100%;"></canvas>
+    </div>
+  </div>
+
+  <!-- History + position comparison -->
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(380px, 1fr)); gap:12px; padding:16px 20px 20px;">
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+        <span style="font-weight:600; font-size:13px;">Session history</span>
+        <span style="font-size:11px; color:var(--faint);">today</span>
+      </div>
+      <div style="display:flex; flex-direction:column;">
+        <div style="display:grid; grid-template-columns:1fr 44px 90px 64px 64px 54px; gap:8px; font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:0.06em; padding:0 0 6px;">
+          <span>Watch</span><span>Pos</span><span>Time</span><span style="text-align:right;">Rate</span><span style="text-align:right;">Beat err</span><span style="text-align:right;">Ampl</span>
+        </div>
+        <sc-for list="{{ history }}" as="h" hint-placeholder-count="4">
+          <div style="display:grid; grid-template-columns:1fr 44px 90px 64px 64px 54px; gap:8px; padding:7px 0; border-top:1px solid var(--border); font-size:13px; align-items:center;">
+            <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ h.watch }}</span>
+            <span style="font-family:'Fragment Mono',monospace;">{{ h.pos }}</span>
+            <span style="color:var(--muted); font-size:12px;">{{ h.time }}</span>
+            <span style="font-family:'Fragment Mono',monospace; text-align:right;">{{ h.rate }}</span>
+            <span style="font-family:'Fragment Mono',monospace; text-align:right; color:var(--muted);">{{ h.err }}</span>
+            <span style="font-family:'Fragment Mono',monospace; text-align:right; color:var(--muted);">{{ h.amp }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+        <span style="font-weight:600; font-size:13px;">Position comparison</span>
+        <span style="font-size:12px; color:var(--muted);">Δ spread <span style="font-family:'Fragment Mono',monospace; color:var(--text);">9.1 s/d</span></span>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:7px;">
+        <sc-for list="{{ posRuns }}" as="p" hint-placeholder-count="6">
+          <div style="display:grid; grid-template-columns:40px 1fr 64px; gap:10px; align-items:center;">
+            <span style="font-family:'Fragment Mono',monospace; font-size:13px; color:{{ p.color }};">{{ p.code }}</span>
+            <div style="height:8px; border-radius:4px; background:var(--panel2); position:relative;">
+              <div style="{{ p.barStyle }}"></div>
+              <div style="position:absolute; left:50%; top:-2px; bottom:-2px; width:1px; background:var(--border2);"></div>
+            </div>
+            <span style="font-family:'Fragment Mono',monospace; font-size:13px; text-align:right;">{{ p.rate }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="font-size:11px; color:var(--faint); margin-top:10px;">Bars show rate deviation from 0 s/d · center line = on time</div>
+    </div>
+  </div>
+
+  <!-- Help popup -->
+  <sc-if value="{{ helpOpen }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ closeHelp }}" style="position:fixed; inset:0; background:oklch(0.1 0.01 240 / 0.55); display:grid; place-items:center; z-index:50;">
+      <div onClick="{{ stopClick }}" style="width:min(480px, calc(100vw - 48px)); background:var(--panel); border:1px solid var(--border2); border-radius:14px; padding:22px 24px; box-shadow:0 24px 60px oklch(0 0 0 / 0.4);">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+          <span style="font-weight:600; font-size:16px;">{{ helpTitle }}</span>
+          <button onClick="{{ closeHelp }}" style="width:28px; height:28px; background:var(--panel2); border:1px solid var(--border2); color:var(--muted); border-radius:7px; cursor:pointer; font-size:14px;">✕</button>
+        </div>
+        <p style="margin:0 0 12px; font-size:14px; line-height:1.55; color:var(--text);">{{ helpWhat }}</p>
+        <div style="background:var(--panel2); border-radius:10px; padding:12px 14px; margin-bottom:12px;">
+          <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:4px;">Why it matters</div>
+          <p style="margin:0; font-size:13px; line-height:1.55; color:var(--text);">{{ helpWhy }}</p>
+        </div>
+        <div style="font-size:13px; color:var(--muted); line-height:1.5;"><span style="color:var(--good); font-weight:600;">Good range: </span>{{ helpGood }}</div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- Add watch popup -->
+  <sc-if value="{{ addWatchOpen }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ closeAddWatch }}" style="position:fixed; inset:0; background:oklch(0.1 0.01 240 / 0.55); display:grid; place-items:center; z-index:50;">
+      <div onClick="{{ stopClick }}" style="width:min(400px, calc(100vw - 48px)); background:var(--panel); border:1px solid var(--border2); border-radius:14px; padding:22px 24px; box-shadow:0 24px 60px oklch(0 0 0 / 0.4);">
+        <div style="font-weight:600; font-size:16px; margin-bottom:6px;">Add a watch</div>
+        <p style="margin:0 0 14px; font-size:13px; color:var(--muted); line-height:1.5;">Sessions are saved under the watch, so you can track a movement over time.</p>
+        <input ref="{{ watchInputRef }}" placeholder="e.g. Seiko SKX007 · 7S26" onKeyDown="{{ watchKeyDown }}" style="width:100%; box-sizing:border-box; background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px; padding:9px 12px; font-family:inherit; font-size:14px; margin-bottom:14px;">
+        <div style="display:flex; justify-content:flex-end; gap:8px;">
+          <button onClick="{{ closeAddWatch }}" style="background:none; border:1px solid var(--border2); color:var(--muted); border-radius:8px; padding:8px 14px; font-family:inherit; font-size:13px; cursor:pointer;">Cancel</button>
+          <button onClick="{{ saveWatch }}" style="background:var(--accent); border:none; color:var(--accent-ink); border-radius:8px; padding:8px 16px; font-family:inherit; font-size:13px; font-weight:600; cursor:pointer;">Save watch</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;: {&quot;width&quot;: 1440, &quot;height&quot;: 1100}}">
+class Component extends DCLogic {
+  state = { recording: true, position: 'DU', seconds: 128, theme: 'dark', help: null, addWatchOpen: false, watch: 'Seiko SKX007 · 7S26', watches: ['Seiko SKX007 · 7S26', 'Omega Speedmaster · 1861', 'Vostok Amphibia · 2416B'] };
+  helpTopics = {
+    rate: { title: 'Rate (s/d)', what: 'How many seconds per day the watch gains (+) or loses (−) compared to a perfect clock. +12.0 s/d means the watch runs about 12 seconds fast every day.', why: 'This is the headline accuracy number. A regulator adjusts it by moving the regulator arm or timing screws. Large differences between positions point to poise or hairspring issues.', good: '±10 s/d for everyday mechanicals · −4/+6 s/d for COSC chronometers' },
+    beatError: { title: 'Beat error (ms)', what: 'The difference in time between the tick and the tock — the two halves of the balance swing. Ideally both take exactly the same time.', why: 'A high beat error wastes power, can make the watch harder to start, and often signals the hairspring collet is off-center. It is fixed by adjusting the stud or collet, not the regulator.', good: 'under 0.5 ms is excellent · under 1.0 ms is acceptable' },
+    amplitude: { title: 'Amplitude (°)', what: 'How far the balance wheel swings on each beat, in degrees of rotation. Calculated from the sound of the escapement using the lift angle you set.', why: 'Amplitude is a health check for the movement: low amplitude suggests thickened oil, worn parts, or a weak mainspring, and usually means worse timekeeping. Durability issues show up here first.', good: '250–300° dial up on a full wind · above ~200° after 24h' },
+    beatRate: { title: 'Beat rate (bph)', what: 'How many beats (ticks) the movement makes per hour — a fixed design property of the movement. 28,800 bph = 8 beats per second (4 Hz).', why: 'Chrona must know the beat rate to measure anything else; Auto detects it from the audio. If the detected rate looks wrong (e.g. 18,000 for a modern watch), the signal is probably noisy.', good: 'common rates: 18,000 · 21,600 · 25,200 · 28,800 · 36,000 bph' }
+  };
+  view = { span: 180, end: 300, wrap: 5 };
+  componentDidMount() {
+    this.genData();
+    this.timer = setInterval(() => { if (this.state.recording) this.setState(s => ({ seconds: s.seconds + 1 })); }, 1000);
+    this.ro = new ResizeObserver(() => this.drawAll());
+    if (this.beat) this.ro.observe(this.beat.parentElement);
+    this.bindPanZoom();
+    this.drawAll();
+  }
+  componentWillUnmount() { clearInterval(this.timer); if (this.ro) this.ro.disconnect(); }
+  genData() {
+    this.beats = [];
+    const drift = 0.139, be = 0.8; // +12 s/d ≈ 0.139 ms/s
+    for (let t = 0; t <= 300; t += 0.25) {
+      this.beats.push({ t, tick: -20 + drift * t + (Math.random() - 0.5) * 0.14, tock: -20 - be + drift * t + (Math.random() - 0.5) * 0.14, amp: 270 + Math.sin(t / 22) * 4 + (Math.random() - 0.5) * 3 });
+    }
+  }
+  saveWatch() {
+    const name = (this.watchInput && this.watchInput.value || '').trim();
+    if (!name) return;
+    this.setState(s => ({ watches: s.watches.includes(name) ? s.watches : [...s.watches, name], watch: name, addWatchOpen: false }));
+  }
+  cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888'; }
+  setupCanvas(c) {
+    const box = c.parentElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    c.width = box.width * dpr; c.height = box.height * dpr;
+    const ctx = c.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, W: box.width, H: box.height };
+  }
+  drawAll() { this.drawBeat(); this.drawAmp(); }
+  drawBeat() {
+    const c = this.beat; if (!c || !this.beats) return;
+    const { ctx, W, H } = this.setupCanvas(c);
+    const { span, end, wrap } = this.view;
+    const t0 = end - span, padL = 46, padR = 12, padT = 12, padB = 26;
+    const pw = W - padL - padR, ph = H - padT - padB;
+    const X = t => padL + pw * (t - t0) / span;
+    const Y = v => padT + ph * (1 - (v + wrap) / (2 * wrap));
+    ctx.font = '11px "Fragment Mono", monospace';
+    const grid = this.cssVar('--grid'), grid0 = this.cssVar('--grid0'), lbl = this.cssVar('--faint');
+    const yStep = wrap <= 2 ? 0.5 : wrap <= 5 ? 1 : wrap <= 10 ? 2 : 5;
+    for (let v = -wrap; v <= wrap + 1e-9; v += yStep) {
+      const y = Y(v);
+      ctx.strokeStyle = Math.abs(v) < 1e-9 ? grid0 : grid;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+      ctx.fillStyle = lbl; ctx.textAlign = 'right';
+      ctx.fillText((v > 0 ? '+' : '') + (yStep < 1 ? v.toFixed(1) : Math.round(v)), padL - 8, y + 4);
+    }
+    const xStep = span <= 40 ? 5 : span <= 90 ? 10 : span <= 200 ? 30 : 60;
+    for (let t = Math.ceil(t0 / xStep) * xStep; t <= end; t += xStep) {
+      const x = X(t);
+      ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ph); ctx.stroke();
+      ctx.fillStyle = lbl; ctx.textAlign = 'center';
+      const ago = Math.round(end - t);
+      ctx.fillText(ago === 0 ? 'now' : '-' + ago + 's', x, H - 8);
+    }
+    ctx.save(); ctx.translate(12, padT + ph / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillStyle = lbl; ctx.textAlign = 'center'; ctx.fillText('offset (ms)', 0, 0); ctx.restore();
+    const wrapV = v => ((v + wrap) % (2 * wrap) + 2 * wrap) % (2 * wrap) - wrap;
+    ctx.save(); ctx.beginPath(); ctx.rect(padL, padT, pw, ph); ctx.clip();
+    const tickC = this.cssVar('--tick'), tockC = this.cssVar('--accent');
+    const r = span > 200 ? 1.3 : 1.8;
+    for (const b of this.beats) {
+      if (b.t < t0 || b.t > end) continue;
+      ctx.fillStyle = tickC; ctx.beginPath(); ctx.arc(X(b.t), Y(wrapV(b.tick)), r, 0, 7); ctx.fill();
+      ctx.fillStyle = tockC; ctx.beginPath(); ctx.arc(X(b.t), Y(wrapV(b.tock)), r, 0, 7); ctx.fill();
+    }
+    // rate trend: wrapped segments of the mean drift line
+    ctx.strokeStyle = this.cssVar('--good'); ctx.lineWidth = 1.5;
+    let prev = null;
+    ctx.beginPath();
+    for (let t = t0; t <= end; t += span / 300) {
+      const v = wrapV(-20 - 0.4 + 0.139 * t);
+      if (prev === null || Math.abs(v - prev) > wrap / 2) ctx.moveTo(X(t), Y(v));
+      else ctx.lineTo(X(t), Y(v));
+      prev = v;
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+  drawAmp() {
+    const c = this.amp; if (!c || !this.beats) return;
+    const { ctx, W, H } = this.setupCanvas(c);
+    const { span, end } = this.view;
+    const t0 = end - span, padL = 46, padR = 12, padT = 8, padB = 20;
+    const pw = W - padL - padR, ph = H - padT - padB;
+    const lo = 240, hi = 300;
+    const X = t => padL + pw * (t - t0) / span;
+    const Y = v => padT + ph * (1 - (v - lo) / (hi - lo));
+    ctx.font = '11px "Fragment Mono", monospace';
+    const grid = this.cssVar('--grid'), lbl = this.cssVar('--faint');
+    for (const v of [240, 270, 300]) {
+      ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(padL, Y(v)); ctx.lineTo(W - padR, Y(v)); ctx.stroke();
+      ctx.fillStyle = lbl; ctx.textAlign = 'right'; ctx.fillText(v + '°', padL - 8, Y(v) + 4);
+    }
+    ctx.save(); ctx.beginPath(); ctx.rect(padL, padT, pw, ph); ctx.clip();
+    ctx.strokeStyle = this.cssVar('--accent'); ctx.lineWidth = 1.5; ctx.beginPath();
+    let started = false;
+    for (const b of this.beats) {
+      if (b.t < t0 || b.t > end) continue;
+      if (!started) { ctx.moveTo(X(b.t), Y(b.amp)); started = true; } else ctx.lineTo(X(b.t), Y(b.amp));
+    }
+    ctx.stroke(); ctx.restore();
+  }
+  bindPanZoom() {
+    const c = this.beat; if (!c) return;
+    c.addEventListener('wheel', e => {
+      e.preventDefault();
+      const f = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+      this.view.span = Math.min(300, Math.max(15, this.view.span * f));
+      this.view.end = Math.min(300, Math.max(this.view.span, this.view.end));
+      this.drawAll();
+    }, { passive: false });
+    let drag = null;
+    c.addEventListener('pointerdown', e => { drag = { x: e.clientX, end: this.view.end }; c.setPointerCapture(e.pointerId); c.style.cursor = 'grabbing'; });
+    c.addEventListener('pointermove', e => {
+      if (!drag) return;
+      const pw = c.getBoundingClientRect().width - 58;
+      const dt = (e.clientX - drag.x) / pw * this.view.span;
+      this.view.end = Math.min(300, Math.max(this.view.span, drag.end - dt));
+      this.drawAll();
+    });
+    c.addEventListener('pointerup', () => { drag = null; c.style.cursor = 'grab'; });
+  }
+  renderVals() {
+    const { recording, position, seconds, theme, help, addWatchOpen, watch, watches } = this.state;
+    const topic = help ? this.helpTopics[help] : null;
+    const mm = String(Math.floor(seconds / 60)).padStart(2, '0');
+    const ss = String(seconds % 60).padStart(2, '0');
+    const defs = [['DU','Dial up'],['DD','Dial down'],['CU','Crown up'],['CD','Crown down'],['CL','Crown left'],['CR','Crown right']];
+    const positions = defs.map(([code, full]) => ({
+      code, full, label: full.split(' ')[1],
+      select: () => this.setState({ position: code }),
+      style: { display:'flex', flexDirection:'column', alignItems:'center', gap:'2px', padding:'5px 12px', borderRadius:'7px', cursor:'pointer', border:'none', fontFamily:'inherit',
+        background: code === position ? 'var(--accent)' : 'transparent',
+        color: code === position ? 'var(--accent-ink)' : 'var(--muted)' }
+    }));
+    const runs = [['DU', 12.0], ['DD', 10.4], ['CU', 6.8], ['CD', 8.1], ['CL', 2.9], ['CR', 5.5]];
+    const posRuns = runs.map(([code, rate]) => {
+      const max = 15, w = Math.min(50, Math.abs(rate) / max * 50);
+      return { code, rate: (rate > 0 ? '+' : '') + rate.toFixed(1),
+        color: code === position ? 'var(--accent)' : 'var(--muted)',
+        barStyle: { position:'absolute', top:0, bottom:0, borderRadius:'4px',
+          left: rate >= 0 ? '50%' : (50 - w) + '%', width: w + '%',
+          background: code === position ? 'var(--accent)' : 'var(--border2)' } };
+    });
+    return {
+      positions, posRuns,
+      history: [
+        { watch: 'Seiko SKX007 · 7S26', pos: 'DU', time: '14:32 · 2 min', rate: '+12.0', err: '0.8', amp: '270°' },
+        { watch: 'Seiko SKX007 · 7S26', pos: 'DD', time: '14:28 · 3 min', rate: '+10.4', err: '0.7', amp: '268°' },
+        { watch: 'Omega Speedmaster · 1861', pos: 'CU', time: '14:21 · 3 min', rate: '+6.8', err: '0.9', amp: '255°' },
+        { watch: 'Omega Speedmaster · 1861', pos: 'CL', time: '14:15 · 2 min', rate: '+2.9', err: '1.1', amp: '251°' }
+      ],
+      helpOpen: !!topic, helpTitle: topic ? topic.title : '', helpWhat: topic ? topic.what : '', helpWhy: topic ? topic.why : '', helpGood: topic ? topic.good : '',
+      helpRate: () => this.setState({ help: 'rate' }),
+      helpBeatError: () => this.setState({ help: 'beatError' }),
+      helpAmplitude: () => this.setState({ help: 'amplitude' }),
+      helpBeatRate: () => this.setState({ help: 'beatRate' }),
+      closeHelp: () => this.setState({ help: null }),
+      stopClick: e => e.stopPropagation(),
+      helpBtnStyle: { width:'16px', height:'16px', borderRadius:'50%', border:'1px solid var(--border2)', background:'none', color:'var(--faint)', fontSize:'10px', lineHeight:1, cursor:'pointer', padding:0, display:'grid', placeItems:'center', fontFamily:'inherit' },
+      watch, watches, addWatchOpen,
+      watchChange: e => {
+        if (e.target.value === '__add') { e.target.value = this.state.watch; this.setState({ addWatchOpen: true }); }
+        else this.setState({ watch: e.target.value });
+      },
+      closeAddWatch: () => this.setState({ addWatchOpen: false }),
+      watchInputRef: el => { this.watchInput = el; if (el) el.focus(); },
+      watchKeyDown: e => { if (e.key === 'Enter') this.saveWatch(); if (e.key === 'Escape') this.setState({ addWatchOpen: false }); },
+      saveWatch: () => this.saveWatch(),
+      elapsed: (recording ? '● ' : '') + mm + ':' + ss,
+      recordLabel: recording ? 'Stop' : 'Record',
+      toggleRecord: () => this.setState(s => ({ recording: !s.recording })),
+      recordBtnStyle: { display:'flex', alignItems:'center', gap:'8px', padding:'7px 16px', borderRadius:'8px', border:'none', cursor:'pointer', fontFamily:'inherit', fontSize:'13px', fontWeight:600,
+        background: recording ? 'oklch(0.55 0.19 25)' : 'var(--accent)',
+        color: recording ? 'white' : 'var(--accent-ink)' },
+      recordDotStyle: { width:'8px', height:'8px', borderRadius: recording ? '2px' : '50%', background:'currentColor',
+        animation: recording ? 'recpulse 1.4s ease-in-out infinite' : 'none' },
+      themeLabel: theme === 'dark' ? '☾ Dark' : '☀ Light',
+      toggleTheme: () => {
+        const next = this.state.theme === 'dark' ? 'light' : 'dark';
+        document.documentElement.dataset.theme = next;
+        this.setState({ theme: next }, () => this.drawAll());
+      },
+      wrapChange: e => { this.view.wrap = Number(e.target.value); this.drawBeat(); },
+      zoomIn: () => { this.view.span = Math.max(15, this.view.span / 1.5); this.drawAll(); },
+      zoomOut: () => { this.view.span = Math.min(300, this.view.span * 1.5); this.view.end = Math.min(300, Math.max(this.view.span, this.view.end)); this.drawAll(); },
+      zoomReset: () => { this.view = { ...this.view, span: 180, end: 300 }; this.drawAll(); },
+      beatRef: el => { this.beat = el; },
+      ampRef: el => { this.amp = el; }
+    };
+  }
+}
+</script>
+</body>
+</html>
