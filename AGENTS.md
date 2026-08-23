@@ -70,7 +70,9 @@ project's defining anti-goal.
   manual protocol; if you need it testable, build an injectable device-enumeration seam
   first.
 - Presenter output strings are byte-exact pinned (e.g. `"+12.3 s/d"`, `"⚠ uncal"`,
-  `"TIER 3 · full"`). Change the format ⇒ change the pins deliberately.
+  `"TIER 3 · full"`, and the signal-meter labels `"No signal"`, `"Weak · rate only"`,
+  `"Fair · rate + beat error"`, `"Strong · full regression"`). Change the format ⇒
+  change the pins deliberately.
 - Tests live in in-file `#[cfg(test)]` modules. Sweep tests collect failures then
   assert, rather than asserting inside the loop (an inline assert once masked a real
   330° amplitude failure).

@@ -21,6 +21,11 @@ positions summary/export). Ordered by priority.
    line a protocol-A.5 tester sees. One `enum BannerSeverity { Info, Warn, Error }` field
    fixes replay-info tone, "recording stopped" notice tone, and the red-tinted overrun
    case at once. (T10 deferred minor, priority raised by the final review.)
+   **DISCHARGED by M4a (Task 3, commit b1afab3):** `BannerSeverity { Info, Warn, Error }`
+   landed on `Banner`/`EngineSnapshot` exactly as described; the replay-info and
+   recording-stopped banners now render `Info` (accent-colored, not red) and only
+   genuine faults render `Error` (red) — see `engine.rs`'s `Banner`/`BannerSeverity` and
+   `app.rs::render_banner`.
 4. **Collect-then-assert sweep refactor** (M2 carryover) — the inline-assert loop pattern
    masks later sweep points on first failure; applies to amplitude_sweep,
    beat_error_sweep, and future sweeps.
@@ -73,7 +78,10 @@ positions summary/export). Ordered by priority.
   recording path; config-burst rebuilds don't coalesce; theoretical drain-all starvation;
   publish double-clone (~20 KB @ 10 Hz).
 - **UI**: amplitude_cell wildcard arm absorbs future gate variants (drop wildcard if the
-  enum grows); blank no-nominal tape lacks a caption; per-metric confidence badges +
+  enum grows); blank no-nominal tape lacks a caption (**DISCHARGED by M4a:** the
+  redesigned beat-trace/amplitude charts always show an explicit empty-state caption —
+  "no beat grid — select or detect a beat rate", "listening…", or "amplitude requires
+  Tier 3 · <reason>" — see `ui/charts.rs`'s `empty_state` calls); per-metric confidence badges +
   signal/headroom meters are a recorded deliberate simplification → M4 Mic Doctor;
   ClipTracker same-poll clip+reset false-negative (count watermark; engine timestamps fix
   it); "System default" selection sends SetPpm(0.0) (code correct, wording was off);

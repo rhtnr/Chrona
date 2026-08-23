@@ -4,9 +4,10 @@ A cross-platform software timegrapher in Rust: listen to a mechanical watch and 
 rate (s/day), beat error (ms), and amplitude (°) — with honest, signal-aware confidence
 instead of fabricated numbers on weak microphones.
 
-**Status:** milestones M1 (headless DSP pipeline), M2 (full metrics + calibration), and
-M3 (live app: microphone capture, real-time instrument UI, record/replay) are complete.
-Next up is M4: Mic Doctor, calibration wizard UI, scope view, position summaries/export.
+**Status:** milestones M1 (headless DSP pipeline), M2 (full metrics + calibration), M3
+(live app: microphone capture, real-time instrument UI, record/replay), and M4a (redesigned
+instrument UI: watch library, session history, position comparison, report export) are
+complete. Still open from M4: Mic Doctor, calibration wizard UI, scope view.
 The binding design document is
 [docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md](docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md);
 known debt and deferred work live in [docs/superpowers/notes/](docs/superpowers/notes/).
@@ -25,11 +26,15 @@ cargo run -p chrona-app
 cargo run -p chrona-app -- --simulate --rate 12 --beat-error 0.8 --amplitude 270
 ```
 
-The instrument view shows the tier badge, rate / beat error / amplitude / BPH numerals,
-and a two-color paper tape (tic/toc) with an adjustable ±1/±2/±5 ms wrap. Controls cover
-input device, lift-angle presets, averaging window, BPH mode, and per-device timebase
-correction (persisted). Sessions can be recorded to WAV + JSON sidecar and replayed
-bit-faithfully. `--headless-seconds N` prints the metrics line and exits (used by CI).
+The redesigned instrument view shows four metric cards (rate / beat error / amplitude /
+beat rate) plus a signal-strength meter, a six-position picker (DU/DD/CU/CD/CL/CR) with
+per-position rate comparison, and a time-axis beat-trace chart (tic/toc dots, rate-trend
+line, adjustable ±2/±5/±10/±25 ms wrap) alongside a matching amplitude chart. A watch
+library groups recordings under a named movement, with a session-history log, one-click
+HTML report export, and a light/dark theme toggle. Controls cover input device, lift
+angle, averaging window, BPH mode, and per-device timebase correction (persisted).
+Sessions can be recorded to WAV + JSON sidecar and replayed bit-faithfully.
+`--headless-seconds N` prints the metrics line and exits (used by CI).
 
 Before any release, run the complete manual test protocol in
 [docs/manual-testing.md](docs/manual-testing.md) — live-mic behavior can only be
