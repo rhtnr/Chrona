@@ -878,6 +878,8 @@ fn engine_loop(
                         position: meta_position,
                         started_unix_s,
                         app_version: env!("CARGO_PKG_VERSION").to_string(),
+                        watch: None,
+                        summary: None,
                     };
                     let path = dir.join(format!(
                         "chrona-{}.wav",
@@ -1127,6 +1129,8 @@ mod tests {
             position: None,
             started_unix_s: 1_700_000_000,
             app_version: "test".to_string(),
+            watch: None,
+            summary: None,
         };
         let mut w = SessionWriter::create(dir.path(), meta).unwrap();
         w.push(&vec![0.0f32; 4_800]).unwrap();
@@ -1174,6 +1178,8 @@ mod tests {
             position: None,
             started_unix_s: 1_700_000_000,
             app_version: "test".to_string(),
+            watch: None,
+            summary: None,
         };
         let mut w = SessionWriter::create(dir.path(), meta).unwrap();
         w.push(&vec![0.0f32; 4_800]).unwrap();
@@ -1223,6 +1229,8 @@ mod tests {
             position: None,
             started_unix_s: 1_700_000_000,
             app_version: "test".to_string(),
+            watch: None,
+            summary: None,
         };
         let mut w = SessionWriter::create(dir.path(), meta).unwrap();
         w.push(&vec![0.0f32; 4_800]).unwrap();

@@ -159,6 +159,8 @@ mod tests {
             position: None,
             started_unix_s: 0,
             app_version: "test".to_string(),
+            watch: None,
+            summary: None,
         };
         write_sidecar(&wav_path, &meta).unwrap();
 
@@ -222,6 +224,8 @@ mod tests {
             position: None,
             started_unix_s: 0,
             app_version: "test".to_string(),
+            watch: None,
+            summary: None,
         };
         write_sidecar(&wav_path, &meta).unwrap();
 

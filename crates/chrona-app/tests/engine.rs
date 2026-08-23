@@ -234,6 +234,8 @@ fn switch_to_replay_with_sidecar_surfaces_settings_banner() {
         position: None,
         started_unix_s: 1_700_000_000,
         app_version: "test".to_string(),
+        watch: None,
+        summary: None,
     };
     let mut w = chrona_session::SessionWriter::create(dir.path(), meta).unwrap();
     w.push(&vec![0.0f32; 4_800]).unwrap();

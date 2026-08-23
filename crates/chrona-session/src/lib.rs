@@ -11,5 +11,5 @@ pub mod writer;
 pub use config::ConfigStore;
 pub use reader::SessionReader;
 pub use replay::{ReplayOverrides, ReplayResult, replay};
-pub use sidecar::SessionMeta;
+pub use sidecar::{SessionMeta, SessionSummary};
 pub use writer::SessionWriter;
