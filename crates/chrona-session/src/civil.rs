@@ -24,13 +24,24 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 
 /// UTC civil timestamp for `unix_secs`, formatted `"YYYYMMDD-HHMMSS"`.
 pub fn timestamp_compact(unix_secs: u64) -> String {
-    let days = (unix_secs / 86_400) as i64;
+    let (y, m, d) = ymd(unix_secs);
     let sod = (unix_secs % 86_400) as i64; // seconds of day, [0, 86399]
-    let (y, m, d) = civil_from_days(days);
     let hh = sod / 3_600;
     let mm = (sod % 3_600) / 60;
     let ss = sod % 60;
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
+}
+
+/// UTC calendar date for `unix_secs`, as `(year, month, day)` — the pieces
+/// `timestamp_compact` formats internally, exposed for callers (M4a:
+/// session-history/report date grouping) that need the parts rather than
+/// the compact string. `year` is `i64` (not `civil_from_days`'s internal
+/// `i32`) purely so callers never have to think about a second integer
+/// width for a value that's for display, not arithmetic.
+pub fn ymd(unix_secs: u64) -> (i64, u32, u32) {
+    let days = (unix_secs / 86_400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    (y as i64, m, d)
 }
 
 #[cfg(test)]
@@ -50,5 +61,15 @@ mod tests {
         // match; `date -u -r 951827696 +%Y%m%d-%H%M%S` and Python both give
         // 20000229-123456. Corrected here for the same reason.
         assert_eq!(timestamp_compact(951_827_696), "20000229-123456");
+    }
+
+    /// Same three reference instants as `known_timestamps`, decomposed
+    /// instead of formatted — `ymd` and `timestamp_compact` must agree on
+    /// the calendar date for the same input.
+    #[test]
+    fn ymd_matches_known_timestamps() {
+        assert_eq!(ymd(0), (1970, 1, 1));
+        assert_eq!(ymd(1_766_995_200), (2025, 12, 29));
+        assert_eq!(ymd(951_827_696), (2000, 2, 29)); // leap day
     }
 }

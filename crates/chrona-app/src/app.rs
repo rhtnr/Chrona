@@ -13,6 +13,7 @@ use crate::AppFlags;
 use crate::engine::{
     Banner, BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec,
 };
+use crate::history::HistoryIndex;
 use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
@@ -61,6 +62,13 @@ pub struct ChronaApp {
     /// resolve (same graceful-fallback shape as `ConfigStore::load_default`
     /// uses for the config dir).
     recordings_dir: PathBuf,
+    /// The session-history index (spec §7), scanned once from
+    /// `recordings_dir` at startup and kept current afterwards by
+    /// `session_panel`'s upsert-on-finalize hook (which is the only place
+    /// this is read so far — nothing yet renders its contents; the history
+    /// table and position-comparison card land in a later M4a task,
+    /// Task 9).
+    history: HistoryIndex,
 }
 
 impl ChronaApp {
@@ -91,6 +99,12 @@ impl ChronaApp {
             ppm_correction: controls.ppm,
         };
         let engine = Engine::start(initial, engine_config, Some(cc.egui_ctx.clone()));
+        let recordings_dir =
+            default_recordings_dir().unwrap_or_else(|| PathBuf::from("recordings"));
+        // Best-effort at startup (spec §7: "scan `*.json` sidecars at
+        // startup"): a directory that doesn't exist yet (no recording has
+        // ever been made) scans to an empty index, not an error.
+        let history = HistoryIndex::scan(&recordings_dir);
         ChronaApp {
             engine,
             tape_ui: TapeUiState::default(),
@@ -104,7 +118,8 @@ impl ChronaApp {
             clip_tracker: ClipTracker::default(),
             next_mic_retry: None,
             session: SessionPanelState::default(),
-            recordings_dir: default_recordings_dir().unwrap_or_else(|| PathBuf::from("recordings")),
+            recordings_dir,
+            history,
         }
     }
 
@@ -178,6 +193,7 @@ impl eframe::App for ChronaApp {
                 &snap,
                 &self.recordings_dir,
                 &self.controls.selected_device,
+                &mut self.history,
             );
         });
 

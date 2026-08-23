@@ -4,6 +4,8 @@
 
 pub mod app;
 pub mod engine;
+pub mod export;
+pub mod history;
 pub mod presenter;
 pub mod theme;
 pub mod ui;

@@ -18,6 +18,7 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::engine::{ControlMsg, Engine, EngineSnapshot, SourceKind, SourceSpec};
+use crate::history::HistoryIndex;
 
 /// Position quick-buttons (behavior contract): dial-up/down, crown-up/down/
 /// left/right — the standard timegrapher position vocabulary.
@@ -68,6 +69,11 @@ pub struct SessionPanelState {
     pub position: String,
     pub recording_started_at: Option<Instant>,
     pub replay_name: Option<String>,
+    /// The WAV path last seen in `snap.recording`, held across frames only
+    /// so `session_panel` can detect the `Some -> None` transition (a
+    /// recording just finalized) and upsert the right path into the
+    /// history index — see `session_panel`'s doc comment.
+    last_recording: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------
@@ -78,6 +84,17 @@ pub struct SessionPanelState {
 /// missing) the first time this session records. `last_device` is the
 /// controls row's currently selected mic device, wired into
 /// `SourceSpec::Mic` on "Back to live".
+///
+/// `history` is kept in sync here rather than by the engine itself: the
+/// moment `snap.recording` goes from `Some(path)` to `None`, the engine has
+/// already finalized that recording — including rewriting its JSON sidecar
+/// with the stop-time summary (see `Engine`'s `StopRecording` handling,
+/// which calls `finalize_with` synchronously before the snapshot publishing
+/// that clears `recording_path`) — so this is a safe, real point to
+/// `upsert` the just-finished session into the index (spec §7: "upsert
+/// after each finalized recording"). `state.last_recording` is the only
+/// state this needs across frames: the WAV path seen last time, so the
+/// transition itself (not just the current `None`) can be detected.
 pub fn session_panel(
     ui: &mut egui::Ui,
     state: &mut SessionPanelState,
@@ -85,7 +102,14 @@ pub fn session_panel(
     snap: &EngineSnapshot,
     recordings_dir: &Path,
     last_device: &Option<String>,
+    history: &mut HistoryIndex,
 ) {
+    match (state.last_recording.take(), &snap.recording) {
+        (Some(prev), None) => history.upsert(&prev),
+        (_, Some(current)) => state.last_recording = Some(current.clone()),
+        (None, None) => {}
+    }
+
     // `recording_started_at` is owned entirely by `record_controls`' own
     // click handlers (Record sets it, Stop clears it) — there is
     // deliberately no "reset it whenever snap.recording is None" check
