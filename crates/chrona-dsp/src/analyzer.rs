@@ -548,7 +548,7 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synth::{SynthConfig, synthesize};
+    use crate::synth::{Rng, SynthConfig, synthesize};
 
     fn analyze(cfg: &SynthConfig, mode: BphMode, ppm: f64) -> Option<MetricsSnapshot> {
         let x = synthesize(cfg).expect("valid synth config");
@@ -672,6 +672,26 @@ mod tests {
         let mut a = Analyzer::new(AnalyzerConfig::default()).unwrap();
         a.push_samples(&vec![0.0f32; 48_000 * 10]);
         assert!(a.current_metrics().is_none());
+    }
+
+    #[test]
+    fn clip_count_persists_when_metrics_are_none() {
+        // Brief item 4 (M2-followup debt): a loud clipped burst followed by
+        // plain noise (no periodic beat signal at all) has nothing for
+        // current_metrics() to estimate from, but the clip count — needed
+        // even in the `no_beat` CLI report (see `clipped_samples`'s doc
+        // comment) — must still be readable.
+        let mut a = Analyzer::new(AnalyzerConfig::default()).unwrap();
+        a.push_samples(&vec![1.5f32; 200]);
+        let mut rng = Rng::new(1);
+        let noise: Vec<f32> = (0..48_000 * 10).map(|_| rng.next_f32() * 0.02).collect();
+        a.push_samples(&noise);
+
+        assert!(
+            a.current_metrics().is_none(),
+            "no periodic beat signal present"
+        );
+        assert_eq!(a.clipped_samples(), 200);
     }
 
     #[test]
@@ -1008,10 +1028,23 @@ mod tests {
 
     #[test]
     fn periodslope_pin_at_t1() {
-        // A short clip that lands T1 (fold/alignment can't run yet) with a
-        // defensible rate from period slope. Shorter clips → fewer cycles →
-        // sparse events → detection_ratio < 0.6 → forces T1 (no beat_error/amplitude).
-        // Very low SNR (10 dB) + short duration (4 s) + high rate makes events sparse.
+        // A short, noisy clip that lands T1 with a defensible rate from
+        // period slope. It does NOT land T1 via the brief's originally
+        // assumed mechanism (a thin events window pulling detection_ratio
+        // below the 0.6 T2 gate) — measured detection_ratio here is 0.9375,
+        // comfortably above that gate. It lands T1 because `assign_tier`'s
+        // T2 gate also requires `onset_jitter_ms.is_some()` (see
+        // `tier::assign_tier`), and that comes from `regress_unlocking`,
+        // which itself needs ≥12 events with a RESOLVED unlock edge
+        // (`t_unlock_s.is_some()`); at 10 dB SNR the quiet unlocking pulse
+        // is lost far more often than the loud drop (unlocking_ratio here
+        // is ~0.27, i.e. only ~27 % of events resolve one), so the
+        // regression doesn't have enough usable points and returns `None`.
+        // (At 30 dB SNR on this seed, the brief's window-thinness premise
+        // is unreachable at any duration this test's config could shrink
+        // to: every duration long enough to produce a snapshot at all
+        // reaches T3 immediately — it never passes through a thin-window
+        // T1/T2 state.)
         let cfg = SynthConfig {
             duration_s: 4.0,
             rate_s_per_day: 12.0,

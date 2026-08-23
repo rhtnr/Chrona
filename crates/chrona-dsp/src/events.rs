@@ -156,12 +156,16 @@ fn correlate_in_gate(
 ///
 /// **Fold-window invariant:** the fold in `fold_envelope` starts at
 /// `env.len() − (cycles·t_osc_env) as usize` computed from the SAME env
-/// slice length; this function recomputes that offset with the identical
-/// two lines (kept in sync by this comment on both sites).
+/// slice length. `fold_envelope` only phase-buckets that slice (any window
+/// within about one cycle of `cycles` periods is fine there), but this
+/// function's downstream per-cycle prediction loop needs the window to
+/// yield EXACTLY `cycles` back out when re-divided by `t_osc_env` — so it
+/// can't just reuse fold_envelope's plain truncating cast; see
+/// `cycle_grid_fold_start`'s doc comment for why.
 ///
-/// `extract_events` derives `fold_start` from `env.len()` exactly as
-/// `fold_envelope` does (see the fold-window invariant above) and extracts
-/// every cycle in the window: `extract_events_anchored(.., fold_start, 0, 0)`.
+/// `extract_events` derives `fold_start` from `env.len()` via
+/// `cycle_grid_fold_start` (self-verifying — see its doc comment) and
+/// extracts every cycle in the window: `extract_events_anchored(.., fold_start, 0, 0)`.
 ///
 /// `extract_events_anchored` takes the cycle-grid anchor explicitly instead
 /// of deriving it from `env.len()`: `fold_start_env` is the LOCAL env offset
@@ -191,12 +195,7 @@ pub fn extract_events(
     if !(t_osc_env.is_finite() && t_osc_env > 1.0) || env.is_empty() {
         return Vec::new();
     }
-    // Compute cycle count once. When t_osc_env is fractional, floor(C·t) may
-    // lose precision; pass fold_start = env.len − ceil(C·t) so anchored recomputes
-    // cycles from it and gets exactly C (not C−1).
-    let cycles = (env.len() as f64 / t_osc_env).floor() as usize;
-    let window_size = ((cycles as f64 * t_osc_env).ceil()) as usize;
-    let fold_start = env.len().saturating_sub(window_size);
+    let fold_start = cycle_grid_fold_start(env.len(), t_osc_env);
     extract_events_anchored(
         raw,
         raw_start_abs,
@@ -207,6 +206,53 @@ pub fn extract_events(
         0,
         0,
     )
+}
+
+/// Computes the `fold_start` (into an env slice of length `env_len`) that
+/// `extract_events_anchored` should extract from so that its own
+/// cycle-count derivation — `floor((env_len − fold_start) / t_osc_env)` —
+/// recovers EXACTLY `floor(env_len / t_osc_env)` cycles (call it `C`).
+///
+/// TASK-11 FIX ROUND (finding 1): the obvious one-shot estimate, `env_len
+/// − ceil(C · t_osc_env)`, is NOT guaranteed to round-trip: `C as f64 *
+/// t_osc_env` and `(env_len − fold_start) as f64 / t_osc_env` are two
+/// different f64 expressions, and multiplying then dividing by the same
+/// f64 value isn't guaranteed to be exact. Concretely, for
+/// `t_osc_env=100.909, env_len=100910`: `C=1000`, and `C as f64 *
+/// t_osc_env` happens to round to exactly `100909.0` (so `.ceil()` is a
+/// no-op) — but `100909.0 / 100.909_f64` then rounds DOWN to just under
+/// `1000.0`, so `floor(...)` recovers `999`, silently dropping the
+/// trailing cycle's worth of events. This isn't a rare corner: a sweep
+/// over fractional `(t_osc_env, env_len)` pairs near the multiply/divide
+/// rounding boundary found the one-shot estimate off by one in roughly 2
+/// cases in 3 (see the regression tests below).
+///
+/// So instead of trusting the algebra, treat the one-shot estimate as a
+/// starting point and replay `extract_events_anchored`'s own division,
+/// nudging `fold_start` by one envelope sample at a time until it
+/// reproduces `C` exactly. This is guaranteed to terminate without
+/// oscillating: since `t_osc_env > 1` (checked by callers), each unit step
+/// of `fold_start` changes the recomputed cycle count by at most one, so
+/// the walk can never skip over the target `C` — and decrementing
+/// `fold_start` all the way to 0 is guaranteed to hit `C` exactly, because
+/// that is literally how `C` itself was defined above. In practice it
+/// converges in ≤2 steps (0 steps when the one-shot estimate is already
+/// exact — the common case — else 1).
+fn cycle_grid_fold_start(env_len: usize, t_osc_env: f64) -> usize {
+    let cycles = (env_len as f64 / t_osc_env).floor() as usize;
+    let window_size = (cycles as f64 * t_osc_env).ceil() as usize;
+    let mut fold_start = env_len.saturating_sub(window_size);
+    loop {
+        let recomputed = (env_len.saturating_sub(fold_start) as f64 / t_osc_env).floor() as usize;
+        if recomputed < cycles && fold_start > 0 {
+            fold_start -= 1;
+        } else if recomputed > cycles {
+            fold_start += 1;
+        } else {
+            break;
+        }
+    }
+    fold_start
 }
 
 // The 8-parameter grid-anchor interface (R4-M3) is the explicit fix for the
@@ -436,7 +482,7 @@ mod tests {
     use super::*;
     use crate::envelope::EnvelopeExtractor;
     use crate::filter::{Butterworth, DcBlocker};
-    use crate::fold::fold_envelope;
+    use crate::fold::{NBINS, fold_envelope};
     use crate::synth::{SynthConfig, synthesize};
 
     /// synth → precondition → envelope → fold → extract_events, one shot.
@@ -657,6 +703,158 @@ mod tests {
                 max_wrapper, max_anchored,
                 "wrapper max beat_index {max_wrapper}, anchored {max_anchored}"
             );
+        }
+    }
+
+    /// Builds a deterministic `(raw, env, profile)` triple with a
+    /// unit-amplitude impulse near every Tic/Toc grid position implied by
+    /// `t_osc_env`/`env_len` (anchored at `fold_start = 0`) — every cycle is
+    /// equally "loud," so `build_template`'s outlier trim can't mistake a
+    /// real beat for noise, and the returned event count becomes a direct,
+    /// deterministic proxy for how many cycles the extraction actually
+    /// walked. This isolates the fold_start/cycle-count ARITHMETIC (what
+    /// finding 1 is about) from real signal-detection quality.
+    ///
+    /// Each impulse is placed `TEMPLATE_PEAK_AT / 2` samples after its
+    /// nominal grid position, not exactly on it. `correlate_in_gate`
+    /// doesn't search `[center−gate, center+gate)` for the signal itself —
+    /// it correlates a `TEMPLATE_LEN`-long template (whose own peak sits at
+    /// local offset `TEMPLATE_PEAK_AT`) starting at each `start` in that
+    /// range, so the effective search window for a single-sample-delta
+    /// template is shifted to `[center−gate+TEMPLATE_PEAK_AT,
+    /// center+gate+TEMPLATE_PEAK_AT)`. A caller whose `fold_start` is off
+    /// by even one envelope sample (this bug) moves `center` by
+    /// `DECIMATION` raw samples; placing impulses exactly on the nominal
+    /// grid leaves near-zero margin against that shift on the low side
+    /// (only `TEMPLATE_PEAK_AT − gate` samples, which is negative — i.e. NO
+    /// margin — whenever `gate < TEMPLATE_PEAK_AT`). Offsetting every
+    /// impulse by a fixed `TEMPLATE_PEAK_AT / 2` instead centers it in the
+    /// intersection of `build_template`'s symmetric ±gate window and
+    /// `correlate_in_gate`'s shifted window — that intersection's midpoint
+    /// is `TEMPLATE_PEAK_AT / 2` regardless of `gate` — keeping comfortable
+    /// margin on both sides for every `t_osc_env` used by the tests below.
+    fn synthetic_cycle_grid(t_osc_env: f64, env_len: usize) -> (Vec<f32>, Vec<f32>, FoldProfile) {
+        let env = vec![0.0f32; env_len];
+        let profile = FoldProfile {
+            bins: vec![0.0f32; NBINS],
+            t_osc_env,
+            anchor_a_phase: 0.0,
+            anchor_b_phase: (NBINS / 2) as f64,
+            contrast: 1.0,
+        };
+        let (off_a, off_b) = profile.anchor_env_offsets();
+        let cycles = (env_len as f64 / t_osc_env).floor() as usize;
+        let mut raw = vec![0.0f32; env_len * crate::envelope::DECIMATION + 8_192];
+        for c in 0..cycles {
+            for off in [off_a, off_b] {
+                let idx = ((c as f64 * t_osc_env + off) * crate::envelope::DECIMATION as f64)
+                    .round() as usize
+                    + (TEMPLATE_PEAK_AT / 2);
+                raw[idx] = 1.0;
+            }
+        }
+        (raw, env, profile)
+    }
+
+    #[test]
+    fn extract_events_wrapper_matches_anchored_full_window_exact_counterexample() {
+        // Reviewer's exact counterexample for the wrapper's cycle-loss bug
+        // (task-11 fix round, finding 1): t_osc_env=100.909, env.len()=100910.
+        // In real arithmetic floor(100910/100.909) = 1000, and 1000·100.909
+        // is also exactly 100909 — but computed in f64, `cycles as f64 *
+        // t_osc_env` rounds to exactly 100909.0 (so `.ceil()` is a no-op)
+        // while dividing back, `100909.0 / 100.909_f64`, rounds DOWN below
+        // 1000 because the f64 representation of 100.909 used by the
+        // division isn't the same value the multiplication effectively
+        // used. A one-shot ceil-based fold_start can't see this; only
+        // replaying anchored's own division and self-correcting can.
+        let t_osc_env = 100.909;
+        let env_len = 100_910usize;
+        let (raw, env, profile) = synthetic_cycle_grid(t_osc_env, env_len);
+        let sr = 8_000.0;
+
+        let via_wrapper = extract_events(&raw, 0, &env, sr, &profile);
+        let via_anchored_full = extract_events_anchored(&raw, 0, &env, sr, &profile, 0, 0, 0);
+
+        assert!(
+            via_anchored_full.len() > 1_900,
+            "sanity: full-window extraction should find close to 2*1000 events, got {}",
+            via_anchored_full.len()
+        );
+        assert_eq!(
+            via_wrapper.len(),
+            via_anchored_full.len(),
+            "wrapper found {} events but the full-window (fold_start=0) extraction found {} \
+             — the wrapper dropped the trailing cycle",
+            via_wrapper.len(),
+            via_anchored_full.len()
+        );
+    }
+
+    #[test]
+    fn cycle_grid_fold_start_recovers_exact_cycle_count_for_exact_counterexample() {
+        // Same counterexample as the DSP-level test above, but pinned
+        // directly to the arithmetic that finding 1 is actually about:
+        // `cycle_grid_fold_start`'s own claimed invariant is that
+        // re-deriving cycles from its result always recovers the same
+        // `cycles` that `floor(env_len / t_osc_env)` gives directly.
+        let t_osc_env = 100.909;
+        let env_len = 100_910usize;
+        let expected_cycles = (env_len as f64 / t_osc_env).floor() as usize;
+        assert_eq!(expected_cycles, 1000, "sanity on the counterexample itself");
+
+        let fold_start = cycle_grid_fold_start(env_len, t_osc_env);
+        let recomputed = (env_len.saturating_sub(fold_start) as f64 / t_osc_env).floor() as usize;
+        assert_eq!(
+            recomputed, expected_cycles,
+            "fold_start={fold_start} recomputed {recomputed} cycles, want {expected_cycles}"
+        );
+    }
+
+    #[test]
+    fn cycle_grid_fold_start_recovers_exact_cycle_count_across_fractional_t_and_len_sweep() {
+        // Broader regression net for the same rounding class: 20 fractional
+        // t_osc_env values (found by numeric search to trip the pre-fix
+        // ceil-only formula at at least one of the 3 lengths below) times 3
+        // env lengths bracketing the exact multiply/divide rounding
+        // boundary each — 40 of these 60 cases fail against the pre-fix
+        // ceil-only formula. `cycle_grid_fold_start` must never cost a
+        // trailing cycle for any of them.
+        let cases: [(f64, usize); 20] = [
+            (70.15, 4210),
+            (73.4, 2203),
+            (76.65, 4600),
+            (79.9, 2398),
+            (83.15, 4990),
+            (83.54, 4178),
+            (86.4, 2593),
+            (87.18, 4360),
+            (89.65, 5380),
+            (92.9, 2788),
+            (93.68, 2343),
+            (139.05, 8344),
+            (142.3, 4270),
+            (145.55, 8734),
+            (148.8, 4465),
+            (152.05, 9124),
+            (155.3, 4660),
+            (158.55, 9514),
+            (161.8, 4855),
+            (165.05, 9904),
+        ];
+        for (t_osc_env, base_len) in cases {
+            for delta in [-1i64, 0, 1] {
+                let env_len = (base_len as i64 + delta) as usize;
+                let expected_cycles = (env_len as f64 / t_osc_env).floor() as usize;
+                let fold_start = cycle_grid_fold_start(env_len, t_osc_env);
+                let recomputed =
+                    (env_len.saturating_sub(fold_start) as f64 / t_osc_env).floor() as usize;
+                assert_eq!(
+                    recomputed, expected_cycles,
+                    "t_osc_env={t_osc_env} env_len={env_len}: fold_start={fold_start} \
+                     recomputed {recomputed} cycles, want {expected_cycles}"
+                );
+            }
         }
     }
 }
