@@ -4,7 +4,18 @@ A cross-platform software timegrapher in Rust: listen to a mechanical watch and 
 rate (s/day), beat error (ms), and amplitude (°) — with honest, signal-aware confidence
 instead of fabricated numbers on weak microphones.
 
-Status: M2 (full metrics — rate, beat error, amplitude, tiers, calibration). Design: docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md.
+Status: M3 (live app with microphone input, record/replay, real-time UI). Design: docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md.
+
+## App
+
+Live app (microphone), or a hardware-free demo:
+
+```sh
+cargo run -p chrona-app
+cargo run -p chrona-app -- --simulate --rate 12 --beat-error 0.8
+```
+
+Before any release, run the complete manual test protocol in docs/manual-testing.md.
 
 ## Try it
 
