@@ -1,0 +1,14 @@
+[package]
+name = "chrona-audio"
+description = "Chrona capture layer: cpal input streams behind a lock-free ring"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rtrb = { workspace = true }
+thiserror = { workspace = true }
+cpal = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { workspace = true, features = ["pipewire"] }
