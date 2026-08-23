@@ -109,6 +109,20 @@ impl Palette {
     }
 }
 
+/// Derives a low-alpha variant of a palette color (Task 6 precedent: e.g.
+/// `replay_mode_line`'s soft accent fill, the add-watch/help modal scrims,
+/// the record button's pulsing dot). The single canonical spot for this —
+/// callers reach for `theme::with_alpha` instead of writing
+/// `Color32::from_rgba_unmultiplied` themselves, so every alpha-derived
+/// color still traces back to this module, same spirit as the "no ad-hoc
+/// `Color32` construction outside the palette module" rule (that rule is
+/// about opaque literals; this is the one sanctioned exception, for
+/// deriving alpha from a color the palette already produced — `c` is
+/// always expected to be a `Palette` field, never a fresh literal).
+pub(crate) fn with_alpha(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
 /// Builds the font set embedded into the binary (spec §1): `Proportional`
 /// gets Archivo Regular ahead of egui's built-in fallbacks (so glyphs
 /// outside Archivo's coverage, e.g. emoji, still render); `Monospace` gets
@@ -291,6 +305,26 @@ mod tests {
             assert_eq!(get(dark), hex(dark_hex), "dark.{name}");
             assert_eq!(get(light), hex(light_hex), "light.{name}");
         }
+    }
+
+    #[test]
+    fn with_alpha_is_a_faithful_from_rgba_unmultiplied_passthrough() {
+        let c = Color32::from_rgb(0x4a, 0xb8, 0xe8); // dark accent
+        // `Color32` stores premultiplied alpha (`from_rgba_unmultiplied`'s
+        // own doc comment / impl), so a translucent result's r/g/b are NOT
+        // expected to equal the input's — only that `with_alpha` computes
+        // exactly what calling `from_rgba_unmultiplied` directly would.
+        assert_eq!(
+            with_alpha(c, 40),
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 40)
+        );
+        // At full alpha, `from_rgba_unmultiplied` takes its `255 =>
+        // from_rgb` fast path, so r/g/b DO round-trip exactly here.
+        let opaque = with_alpha(c, 255);
+        assert_eq!(
+            (opaque.r(), opaque.g(), opaque.b(), opaque.a()),
+            (0x4a, 0xb8, 0xe8, 255)
+        );
     }
 
     #[test]

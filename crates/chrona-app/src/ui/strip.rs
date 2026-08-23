@@ -276,16 +276,12 @@ fn elapsed_clock(ui: &mut egui::Ui, palette: &Palette, state: &SessionPanelState
     );
 }
 
-fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-}
-
 /// The "REPLAY <name>" mode line (M3 semantics/copy, controller ruling:
 /// lives here, not in the health-banner slot) plus "· done" once
 /// `replay_done`, and the "Back to live" button. Restyled onto
-/// `palette.accent` (a soft, low-alpha fill — Task 6 precedent allows
-/// `from_rgba_unmultiplied` for deriving alpha variants of palette colors)
-/// instead of M3's raw dark-blue `Color32::from_rgb(30, 60, 130)` fill.
+/// `palette.accent` (a soft, low-alpha fill via `theme::with_alpha` — Task 6
+/// precedent allows deriving alpha variants of palette colors this way)
+/// instead of M3's raw dark-blue RGB(30, 60, 130) fill.
 ///
 /// `state.replay_name` is set optimistically by the "Open recording…"
 /// handler before the engine confirms the switch. If `SwitchSource` then
@@ -312,7 +308,7 @@ fn replay_mode_line(
     // add-order-is-reversed convention.
     ui.horizontal(|ui| {
         egui::Frame::new()
-            .fill(with_alpha(palette.accent, 40))
+            .fill(crate::theme::with_alpha(palette.accent, 40))
             .corner_radius(6.0)
             .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {

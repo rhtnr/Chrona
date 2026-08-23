@@ -4,8 +4,8 @@
 //! small and the point is that it's trivially auditable. Pure logic only:
 //! no `egui`/`Color32` here. The inline CSS below hardcodes its own hex
 //! colors (spec §1's palette) — that's fine for a standalone document; the
-//! "no `Color32::from_rgb` outside the palette module" rule is about egui
-//! widget code, not CSS strings in a generated file.
+//! palette-only-`Color32`-construction rule (`theme.rs`'s doc comment) is
+//! about egui widget code, not CSS strings in a generated file.
 
 use crate::history::{POSITIONS, PositionRates, SessionEntry};
 

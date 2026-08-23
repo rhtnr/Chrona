@@ -122,7 +122,7 @@ fn non_turbo_pacing_survives_a_control_message_burst() {
     }
     // One invalid message closes out the burst: `averaging_s` must be in
     // [2, 60] (`AnalyzerConfig`'s own validation), so `Analyzer::new`
-    // rejects 999 and `apply_config` sets `error_banner`. The default
+    // rejects 999 and `apply_config` sets `banner`. The default
     // snapshot's banner is always `None`, so seeing it `Some` after the
     // wait below is proof this specific message was actually drained and
     // published by the non-turbo path — not just evidence the thread

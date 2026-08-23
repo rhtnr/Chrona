@@ -125,12 +125,30 @@ fn bph_mode_tag(selection: BphComboItem) -> &'static str {
 // see the module doc comment.
 // ---------------------------------------------------------------------
 
-/// Renders the 4-card metrics band (mockup: "Metrics band") and returns
-/// `Some(topic)` iff one card's "?" button was clicked this frame — the
-/// caller (`ChronaApp::ui`) owns `open_help` and decides what "just
-/// opened" means for `ui::modals::render_help_modal`'s click-outside
-/// guard, so this function only ever reports the request, never mutates
-/// help-modal state itself.
+/// Each card's mockup floor (`grid-template-columns:repeat(auto-fit,
+/// minmax(200px, 1fr))`) — used only to pick between the two
+/// `metrics_cards` layouts below, not as a hard per-card minimum.
+const MIN_CARD_W: f32 = 200.0;
+
+/// Metrics-band column count for `available_width` (T10 rider: the mockup
+/// reflows via CSS `auto-fit`; this is a simple two-state approximation of
+/// that, not a full responsive grid — 4-up once there's comfortably enough
+/// room for four `MIN_CARD_W`-wide cards, else a 2x2 stack). PURE.
+fn cards_columns(available_width: f32) -> usize {
+    if available_width < 4.0 * MIN_CARD_W {
+        2
+    } else {
+        4
+    }
+}
+
+/// Renders the metrics band (mockup: "Metrics band") — 4-up, or a 2x2
+/// stack on a narrow window (`cards_columns`) — and returns `Some(topic)`
+/// iff one card's "?" button was clicked this frame — the caller
+/// (`ChronaApp::ui`) owns `open_help` and decides what "just opened" means
+/// for `ui::modals::render_help_modal`'s click-outside guard, so this
+/// function only ever reports the request, never mutates help-modal state
+/// itself.
 pub fn metrics_cards(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -138,20 +156,40 @@ pub fn metrics_cards(
     bph_selection: BphComboItem,
 ) -> Option<HelpTopicId> {
     let mut clicked = None;
-    ui.columns(4, |cols| {
-        if rate_card(&mut cols[0], palette, metrics) {
-            clicked = Some(HelpTopicId::Rate);
-        }
-        if beat_error_card(&mut cols[1], palette, metrics) {
-            clicked = Some(HelpTopicId::BeatError);
-        }
-        if amplitude_card(&mut cols[2], palette, metrics) {
-            clicked = Some(HelpTopicId::Amplitude);
-        }
-        if bph_card(&mut cols[3], palette, metrics, bph_selection) {
-            clicked = Some(HelpTopicId::BeatRate);
-        }
-    });
+    if cards_columns(ui.available_width()) == 4 {
+        ui.columns(4, |cols| {
+            if rate_card(&mut cols[0], palette, metrics) {
+                clicked = Some(HelpTopicId::Rate);
+            }
+            if beat_error_card(&mut cols[1], palette, metrics) {
+                clicked = Some(HelpTopicId::BeatError);
+            }
+            if amplitude_card(&mut cols[2], palette, metrics) {
+                clicked = Some(HelpTopicId::Amplitude);
+            }
+            if bph_card(&mut cols[3], palette, metrics, bph_selection) {
+                clicked = Some(HelpTopicId::BeatRate);
+            }
+        });
+    } else {
+        ui.columns(2, |cols| {
+            if rate_card(&mut cols[0], palette, metrics) {
+                clicked = Some(HelpTopicId::Rate);
+            }
+            if beat_error_card(&mut cols[1], palette, metrics) {
+                clicked = Some(HelpTopicId::BeatError);
+            }
+        });
+        ui.add_space(12.0); // mockup: metrics-band grid `gap:12px`
+        ui.columns(2, |cols| {
+            if amplitude_card(&mut cols[0], palette, metrics) {
+                clicked = Some(HelpTopicId::Amplitude);
+            }
+            if bph_card(&mut cols[1], palette, metrics, bph_selection) {
+                clicked = Some(HelpTopicId::BeatRate);
+            }
+        });
+    }
     clicked
 }
 
@@ -317,7 +355,6 @@ mod tests {
     use super::*;
     use chrona_dsp::{PeriodEstimate, Quality, Tier};
 
-    #[allow(clippy::too_many_arguments)]
     fn mk_metrics(
         rate: Option<f64>,
         beat_error: Option<f64>,
@@ -456,6 +493,14 @@ mod tests {
         assert!(!uncal_pill_shown(true, true));
         assert!(!uncal_pill_shown(false, false));
         assert!(!uncal_pill_shown(false, true));
+    }
+
+    #[test]
+    fn cards_columns_switches_at_four_card_widths() {
+        assert_eq!(cards_columns(799.0), 2, "just under 4*200px stacks 2x2");
+        assert_eq!(cards_columns(800.0), 4, "exactly 4*200px is 4-up");
+        assert_eq!(cards_columns(1200.0), 4, "comfortably wide stays 4-up");
+        assert_eq!(cards_columns(400.0), 2, "narrow window stacks 2x2");
     }
 
     #[test]

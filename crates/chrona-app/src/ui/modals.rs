@@ -74,10 +74,6 @@ impl AddWatchModalState {
     }
 }
 
-fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-}
-
 fn persist_config_now(config: &ConfigStore) {
     if let Err(e) = config.save() {
         eprintln!("chrona: failed to save config: {e}");
@@ -112,8 +108,11 @@ pub fn render_add_watch_modal(
         egui::Order::Foreground,
         egui::Id::new("chrona_add_watch_scrim"),
     );
-    ctx.layer_painter(scrim_layer)
-        .rect_filled(screen, 0.0, with_alpha(palette.overlay, 140));
+    ctx.layer_painter(scrim_layer).rect_filled(
+        screen,
+        0.0,
+        crate::theme::with_alpha(palette.overlay, 140),
+    );
 
     let mut close = false;
     let mut save = false;
@@ -315,8 +314,11 @@ pub fn render_help_modal(
     let screen = ctx.input(|i| i.content_rect());
     let scrim_layer =
         egui::LayerId::new(egui::Order::Foreground, egui::Id::new("chrona_help_scrim"));
-    ctx.layer_painter(scrim_layer)
-        .rect_filled(screen, 0.0, with_alpha(palette.overlay, 140));
+    ctx.layer_painter(scrim_layer).rect_filled(
+        screen,
+        0.0,
+        crate::theme::with_alpha(palette.overlay, 140),
+    );
 
     let mut close = false;
 

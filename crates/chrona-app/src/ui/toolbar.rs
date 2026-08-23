@@ -152,10 +152,12 @@ pub fn toolbar_row(
                 palette,
                 engine,
                 recording,
-                ctx.session,
-                ctx.recordings_dir,
-                &state.selected_watch,
-                ctx.selected_position,
+                RecordButtonCtx {
+                    session: ctx.session,
+                    recordings_dir: ctx.recordings_dir,
+                    selected_watch: &state.selected_watch,
+                    selected_position: ctx.selected_position,
+                },
             );
             export_button(
                 ui,
@@ -448,6 +450,17 @@ fn cal_ppm_control(
         .on_hover_text("Timebase calibration — click to edit");
 
     egui::Popup::from_toggle_button_response(&button_resp)
+        // Defensive stability (T6 review rider): `Popup` has no `id_salt`
+        // builder (that's `ComboBox`'s API) — its own default id is
+        // `button_resp.id.with("popup")`, and `button_resp.id` is itself an
+        // auto-id derived from call order within the toolbar row. An
+        // explicit `.id(...)` pins the popup's open/close memory to a fixed
+        // key, decoupled from that positional id entirely (T6 review traced
+        // the default to be safe today — banner renders after the toolbar
+        // closure, combo interactions force-close popups — but a fixed id
+        // costs nothing and removes the dependency on that reasoning
+        // continuing to hold as the toolbar evolves).
+        .id(egui::Id::new("chrona_cal_ppm"))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
             ui.set_min_width(150.0);
@@ -555,6 +568,19 @@ fn export_button(
     });
 }
 
+/// Borrowed, per-frame context `record_stop_button` needs beyond its own
+/// leading arguments: bundled purely to keep the argument count sane
+/// (`clippy::too_many_arguments` — empirically 8 params without this, one
+/// over the 7-arg default threshold: T10 review rider, verified by
+/// temporarily removing the old `#[allow]` and running clippy), same shape
+/// as `ToolbarCtx`/`StripCtx`.
+struct RecordButtonCtx<'a> {
+    session: &'a mut SessionPanelState,
+    recordings_dir: &'a Path,
+    selected_watch: &'a Option<String>,
+    selected_position: &'a str,
+}
+
 /// Record/Stop: a custom-painted button (not `egui::Button`, so the
 /// leading dot can be positioned exactly) — accent fill + accent-ink text
 /// idle, `palette.rec` fill + white text while recording, with a leading
@@ -563,16 +589,12 @@ fn export_button(
 /// `ui.input(|i| i.time)`'s sine (behavior contract) and keeps repainting
 /// at 10 Hz only while recording, so the animation runs without spinning
 /// the CPU the rest of the time.
-#[allow(clippy::too_many_arguments)]
 fn record_stop_button(
     ui: &mut egui::Ui,
     palette: &Palette,
     engine: &Engine,
     recording: bool,
-    session: &mut SessionPanelState,
-    recordings_dir: &Path,
-    selected_watch: &Option<String>,
-    selected_position: &str,
+    ctx: RecordButtonCtx<'_>,
 ) {
     let label = if recording { "Stop" } else { "Record" };
     let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::FAMILY_SEMIBOLD.into()));
@@ -617,8 +639,7 @@ fn record_stop_button(
         } else {
             1.0
         };
-        let dot_color =
-            egui::Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), (alpha * 255.0) as u8);
+        let dot_color = theme::with_alpha(fg, (alpha * 255.0) as u8);
         if recording {
             let dot_rect = egui::Rect::from_center_size(dot_center, egui::vec2(dot_d, dot_d));
             ui.painter()
@@ -642,19 +663,19 @@ fn record_stop_button(
     if response.clicked() {
         if recording {
             engine.send(ControlMsg::StopRecording);
-            session.recording_started_at = None;
+            ctx.session.recording_started_at = None;
         } else {
             // "created on first record" (M3 behavior contract) —
             // idempotent, best-effort: a failure here just means the
             // subsequent StartRecording fails too and surfaces its own
             // error banner.
-            let _ = std::fs::create_dir_all(recordings_dir);
+            let _ = std::fs::create_dir_all(ctx.recordings_dir);
             engine.send(ControlMsg::StartRecording {
-                dir: recordings_dir.to_path_buf(),
-                meta_position: Some(selected_position.to_string()),
-                watch: selected_watch.clone(),
+                dir: ctx.recordings_dir.to_path_buf(),
+                meta_position: Some(ctx.selected_position.to_string()),
+                watch: ctx.selected_watch.clone(),
             });
-            session.recording_started_at = Some(Instant::now());
+            ctx.session.recording_started_at = Some(Instant::now());
         }
     }
 }

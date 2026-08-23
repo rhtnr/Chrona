@@ -1,13 +1,17 @@
 //! The eframe application shell. Owns a live `Engine`, seeded from CLI flags
-//! and the persisted `ConfigStore`, and renders the redesigned toolbar
-//! (`ui::toolbar::toolbar_row`, M4a Task 6) + health banner, the position/
-//! session strip and metric cards (`ui::strip`/`ui::cards`, M4a Task 7),
-//! above the beat-trace/amplitude charts (`ui::charts::charts_section`,
-//! M4a Task 8) that replaced M3's paper tape, and — completing the
-//! mockup's layout — the session-history/position-comparison cards
-//! (`ui::history_ui::bottom_grid`, M4a Task 9) below them, plus the
-//! Export-report flow (`run_export`) and the app-side notice banner that
-//! reports its outcome.
+//! and the persisted `ConfigStore`, and renders the mockup's top-to-bottom
+//! layout (design spec §2) across two `egui` panels (M4a Task 10 assembly):
+//! a pinned top panel — the redesigned toolbar (`ui::toolbar::toolbar_row`,
+//! M4a Task 6), the health banner, and the position/session strip
+//! (`ui::strip`, M4a Task 7) — stays on screen regardless of window height,
+//! while everything below it (the metric cards, `ui::cards`, M4a Task 7;
+//! the beat-trace/amplitude charts that replaced M3's paper tape,
+//! `ui::charts::charts_section`, M4a Task 8; and the session-history/
+//! position-comparison cards that complete the mockup's layout,
+//! `ui::history_ui::bottom_grid`, M4a Task 9) sits inside the central
+//! panel's `egui::ScrollArea::vertical`, so a short window scrolls to reach
+//! the bottom grid instead of clipping it. Also owns the Export-report flow
+//! (`run_export`) and the app-side notice banner that reports its outcome.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -306,9 +310,11 @@ impl eframe::App for ChronaApp {
         // here, outside the pure `pick_banner`; the windowed count is
         // spliced into a copy of the snapshot's health before deciding the
         // banner. Computed before the top panel (not after, as M3 did) so
-        // the banner can render inside it, directly below the toolbar (M4a
-        // Task 6 behavior contract — a temporary placement; a later task
-        // gives it a permanent home in the redesigned layout).
+        // the banner can render inside it, directly below the toolbar —
+        // matching the design spec's §2 layout order (toolbar · banner ·
+        // strip · ...); M4a Task 10's layout pass confirms this as the
+        // banner's permanent home, not the provisional one M4a Task 6
+        // started with.
         let windowed_clipped = self
             .clip_tracker
             .observe(snap.health.clipped, Instant::now());
@@ -368,19 +374,6 @@ impl eframe::App for ChronaApp {
                     history: &mut self.history,
                 },
             );
-
-            ui.separator();
-            let mut help_just_opened = false;
-            if let Some(id) = metrics_cards(
-                ui,
-                palette,
-                snap.metrics.as_ref(),
-                self.toolbar.bph_selection,
-            ) {
-                self.open_help = Some(id);
-                help_just_opened = true;
-            }
-            render_help_modal(ui.ctx(), palette, &mut self.open_help, help_just_opened);
         });
 
         if self.toolbar.export_requested {
@@ -393,49 +386,92 @@ impl eframe::App for ChronaApp {
         self.maybe_retry_mic(snap.health.last_error.is_some());
         self.maybe_save_config();
 
+        // M4a Task 10: everything below the pinned top panel (metric cards,
+        // charts, the history/comparison grid) lives inside one vertical
+        // `ScrollArea` filling the `CentralPanel` — `auto_shrink([false,
+        // false])` so it always claims the full remaining window rather
+        // than shrinking to its content on a tall window (egui's default
+        // `auto_shrink` would otherwise hug short content, which is both a
+        // one-frame-lagged size and pointless here: nothing else shares
+        // this panel). `charts_section`'s beat trace still reads
+        // `ui.available_height()` internally to grow/floor at 260px (T8) —
+        // that keeps working unchanged inside the scroll area because
+        // egui's `ScrollArea` bounds its content `Ui`'s `max_rect` to the
+        // OUTER available size at creation time (see the vendored
+        // `scroll_area.rs::begin`'s `content_max_size` — deliberately NOT
+        // `f32::INFINITY`, "tell the inner Ui to *try* to fit the content
+        // without needing to scroll"), so `available_height()` reports the
+        // same bounded numbers a plain (non-scrolling) `CentralPanel` would
+        // have. Only once total content actually exceeds that bound does
+        // the cursor run past `max_rect` and the area becomes scrollable —
+        // which is exactly the "page scrolls when the window is short"
+        // behavior this task adds: the bottom grid (previously an
+        // unreachable gap below a short window, per T9) becomes reachable
+        // by scrolling instead of being clipped.
         egui::CentralPanel::default().show(ui, |ui| {
-            let palette = theme::Palette::of(self.theme);
-            charts_section(
-                ui,
-                palette,
-                &mut self.trace_view,
-                &mut self.charts_ui,
-                ChartsCtx {
-                    beat_accum: &self.beat_accum,
-                    amp_accum: &self.amp_accum,
-                    metrics: snap.metrics.as_ref(),
-                },
-            );
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let palette = theme::Palette::of(self.theme);
 
-            // M4a Task 9: the session-history + position-comparison cards
-            // that complete the mockup's layout below the amplitude strip.
-            // `rates` is per the SELECTED watch (spec §8) — distinct from
-            // the history card's own listing, which spans every watch (see
-            // `ui::history_ui`'s module doc comment) — computed fresh each
-            // frame from `self.history`, same "no caching" precedent as
-            // `ui::toolbar::export_button`'s own `has_sessions` check. A
-            // watch with no rated sessions (or no watch selected at all)
-            // naturally yields the same all-`None`/no-spread result the
-            // comparison card already renders as its own empty state.
-            ui.add_space(8.0);
-            let rates = match self.toolbar.selected_watch.as_deref() {
-                Some(watch) => position_rates(&self.history, watch),
-                None => PositionRates {
-                    by_code: [None; 6],
-                    spread: None,
-                },
-            };
-            bottom_grid(
-                ui,
-                palette,
-                BottomGridCtx {
-                    history: &self.history,
-                    session: &mut self.session,
-                    engine: &self.engine,
-                    rates: &rates,
-                    selected_position: self.selected_position,
-                },
-            );
+                    let mut help_just_opened = false;
+                    if let Some(id) = metrics_cards(
+                        ui,
+                        palette,
+                        snap.metrics.as_ref(),
+                        self.toolbar.bph_selection,
+                    ) {
+                        self.open_help = Some(id);
+                        help_just_opened = true;
+                    }
+                    render_help_modal(ui.ctx(), palette, &mut self.open_help, help_just_opened);
+
+                    ui.add_space(8.0);
+                    charts_section(
+                        ui,
+                        palette,
+                        &mut self.trace_view,
+                        &mut self.charts_ui,
+                        ChartsCtx {
+                            beat_accum: &self.beat_accum,
+                            amp_accum: &self.amp_accum,
+                            metrics: snap.metrics.as_ref(),
+                        },
+                    );
+
+                    // M4a Task 9: the session-history + position-comparison
+                    // cards that complete the mockup's layout below the
+                    // amplitude strip. `rates` is per the SELECTED watch
+                    // (spec §8) — distinct from the history card's own
+                    // listing, which spans every watch (see
+                    // `ui::history_ui`'s module doc comment) — computed
+                    // fresh each frame from `self.history`, same "no
+                    // caching" precedent as `ui::toolbar::export_button`'s
+                    // own `has_sessions` check. A watch with no rated
+                    // sessions (or no watch selected at all) naturally
+                    // yields the same all-`None`/no-spread result the
+                    // comparison card already renders as its own empty
+                    // state.
+                    ui.add_space(8.0);
+                    let rates = match self.toolbar.selected_watch.as_deref() {
+                        Some(watch) => position_rates(&self.history, watch),
+                        None => PositionRates {
+                            by_code: [None; 6],
+                            spread: None,
+                        },
+                    };
+                    bottom_grid(
+                        ui,
+                        palette,
+                        BottomGridCtx {
+                            history: &self.history,
+                            session: &mut self.session,
+                            engine: &self.engine,
+                            rates: &rates,
+                            selected_position: self.selected_position,
+                        },
+                    );
+                });
         });
     }
 }
