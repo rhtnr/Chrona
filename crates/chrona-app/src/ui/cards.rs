@@ -9,15 +9,15 @@
 //! below-tier case (`value == "—"`), since an at-tier caption would just
 //! repeat the card's own persistent header label. The pure helpers
 //! (`rate_cell`/`beat_error_cell`/`amplitude_cell`/`bph_cell`/
-//! `uncal_pill_shown`/`bph_mode_tag`) are TDD'd first, below; the
-//! egui-facing rendering that follows is exercised only by `cargo build` +
-//! the workspace test suite (no window in CI) — same split as
-//! `controls.rs`/`toolbar.rs`.
+//! `uncal_pill_shown`/`rate_source_tag`/`bph_mode_tag`) are TDD'd first,
+//! below; the egui-facing rendering that follows is exercised only by
+//! `cargo build` + the workspace test suite (no window in CI) — same split
+//! as `controls.rs`/`toolbar.rs`.
 
 use chrona_dsp::{AmplitudeGateFail, MetricsSnapshot};
 use eframe::egui;
 
-use crate::presenter::format_bph_grouped;
+use crate::presenter::{format_bph_grouped, source_label};
 use crate::theme::Palette;
 use crate::ui::modals::HelpTopicId;
 use crate::ui::toolbar::BphComboItem;
@@ -105,6 +105,18 @@ pub fn bph_cell(metrics: Option<&MetricsSnapshot>) -> (String, String) {
 /// metrics are not calibrated. PURE.
 pub fn uncal_pill_shown(rate_shown: bool, calibrated: bool) -> bool {
     rate_shown && !calibrated
+}
+
+/// The RATE card's faint source tag (M3 parity: spec §3's "rate-source
+/// caption (period-slope vs regression) is kept from M3", mirrored in the
+/// redesigned card as a faint corner tag styled like the Beat-rate card's
+/// auto/fixed/free tag) — `presenter::source_label` on the shown metrics'
+/// `rate_source`. Needs no separate "is a rate shown" gate of its own:
+/// `source_label` already returns `None` for a `None` source, and the
+/// analyzer invariant is `rate_source.is_some() == rate_s_per_day.is_some()`.
+/// PURE.
+fn rate_source_tag(metrics: Option<&MetricsSnapshot>) -> Option<&'static str> {
+    metrics.and_then(|m| source_label(m.rate_source))
 }
 
 /// The BEAT RATE card's right-side mode tag (mockup: "auto"/"fixed"/
@@ -279,15 +291,26 @@ fn rate_card(ui: &mut egui::Ui, palette: &Palette, metrics: Option<&MetricsSnaps
     let rate_shown = metrics.and_then(|m| m.rate_s_per_day).is_some();
     let calibrated = metrics.is_some_and(|m| m.calibrated);
     let show_pill = uncal_pill_shown(rate_shown, calibrated);
+    let source_tag = rate_source_tag(metrics);
     let mut help_clicked = false;
     card_frame(ui, palette, |ui| {
         ui.horizontal(|ui| {
             if card_label_with_help(ui, palette, "RATE") {
                 help_clicked = true;
             }
-            if show_pill {
+            if show_pill || source_tag.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    uncal_pill(ui, palette);
+                    // Added in reverse of visual left-to-right order
+                    // (controller ruling: source tag then uncal pill)
+                    // since `right_to_left` stacks from the row's right
+                    // edge inward — see toolbar.rs's `right_to_left` block
+                    // for the same convention.
+                    if show_pill {
+                        uncal_pill(ui, palette);
+                    }
+                    if let Some(tag) = source_tag {
+                        ui.label(egui::RichText::new(tag).size(11.0).color(palette.faint));
+                    }
                 });
             }
         });
@@ -353,7 +376,7 @@ fn bph_card(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrona_dsp::{PeriodEstimate, Quality, Tier};
+    use chrona_dsp::{PeriodEstimate, Quality, RateSource, Tier};
 
     fn mk_metrics(
         rate: Option<f64>,
@@ -501,6 +524,41 @@ mod tests {
         assert_eq!(cards_columns(800.0), 4, "exactly 4*200px is 4-up");
         assert_eq!(cards_columns(1200.0), 4, "comfortably wide stays 4-up");
         assert_eq!(cards_columns(400.0), 2, "narrow window stacks 2x2");
+    }
+
+    #[test]
+    fn rate_source_tag_shown_iff_rate_shown() {
+        let m = MetricsSnapshot {
+            rate_source: Some(RateSource::PeriodSlope),
+            ..mk_metrics(Some(12.34), None, None, None, None, 0.0, true)
+        };
+        assert_eq!(
+            rate_source_tag(Some(&m)),
+            Some("period"),
+            "rate + PeriodSlope source surfaces source_label's string"
+        );
+
+        let no_rate = mk_metrics(None, None, None, None, None, 0.0, true);
+        assert_eq!(
+            rate_source_tag(Some(&no_rate)),
+            None,
+            "no rate shown -> no source tag"
+        );
+        assert_eq!(rate_source_tag(None), None, "no metrics -> no source tag");
+    }
+
+    #[test]
+    fn rate_source_tag_and_uncal_pill_coexist_when_uncalibrated() {
+        let m = MetricsSnapshot {
+            rate_source: Some(RateSource::PeriodSlope),
+            ..mk_metrics(Some(12.34), None, None, None, None, 0.0, false)
+        };
+        let rate_shown = m.rate_s_per_day.is_some();
+        assert_eq!(rate_source_tag(Some(&m)), Some("period"));
+        assert!(
+            uncal_pill_shown(rate_shown, m.calibrated),
+            "both the source tag and the uncal pill are present: rate shown && !calibrated"
+        );
     }
 
     #[test]
