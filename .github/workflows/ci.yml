@@ -11,6 +11,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Linux GUI system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libx11-dev libgtk-3-dev libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
