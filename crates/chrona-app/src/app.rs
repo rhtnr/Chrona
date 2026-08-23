@@ -13,6 +13,7 @@ use crate::AppFlags;
 use crate::engine::{
     Banner, BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec,
 };
+use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
     ClipTracker, ControlsState, SessionPanelState, TapeUiState, controls_row,
@@ -36,6 +37,18 @@ pub struct ChronaApp {
     /// `theme::apply_style` lands in a later M4a task (spec §1).
     #[allow(dead_code)]
     theme: Theme,
+    /// M4a beat-trace accumulators (design spec §10/§11): fed from every
+    /// snapshot alongside the M3 tape below, spanning up to
+    /// `presenter::HORIZON_S` rather than the analyzer's own ~32 s ring.
+    /// Rendering still reads the old `tape_ui`/M3 tape until Task 8's
+    /// chart painters land.
+    beat_accum: BeatAccum,
+    amp_accum: AmpAccum,
+    /// The beat-trace chart's pan/zoom/follow state (design spec §10).
+    /// Not yet read anywhere else — the chart's pan/zoom controls land in
+    /// a later M4a task (Task 7/8), same as `theme` above.
+    #[allow(dead_code)]
+    trace_view: TraceView,
     /// Set the moment the config first goes dirty (not refreshed on every
     /// subsequent edit), so a continuous drag still saves within a bounded
     /// ~1s window instead of never catching up — cleared once saved.
@@ -84,6 +97,9 @@ impl ChronaApp {
             controls,
             config,
             theme,
+            beat_accum: BeatAccum::default(),
+            amp_accum: AmpAccum::default(),
+            trace_view: TraceView::default(),
             dirty_since: None,
             clip_tracker: ClipTracker::default(),
             next_mic_retry: None,
@@ -133,6 +149,21 @@ impl eframe::App for ChronaApp {
         // see `Engine::snapshot`'s doc comment for why `current_metrics`
         // itself must never be called here.
         let snap = self.engine.snapshot();
+
+        // M4a beat-trace feed (design spec §10/§11): runs alongside the M3
+        // tape below every frame, independent of whether anything paints
+        // from it yet (Task 8). `bph_nominal`/`amplitude_deg` come straight
+        // from the snapshot's metrics; a metrics-less snapshot feeds `None`
+        // into both, which `BeatAccum`/`AmpAccum` already treat as "append
+        // nothing" rather than fabricating a beat or amplitude point.
+        self.beat_accum.extend(
+            &snap.tape,
+            snap.metrics.as_ref().and_then(|m| m.bph_nominal),
+        );
+        self.amp_accum.extend(
+            self.beat_accum.newest_t(),
+            snap.metrics.as_ref().and_then(|m| m.amplitude_deg),
+        );
 
         egui::Panel::top("chrona_top").show(ui, |ui| {
             ui.heading("Chrona");
