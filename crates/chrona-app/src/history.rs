@@ -91,8 +91,9 @@ impl HistoryIndex {
     /// yet, then re-sorts. The hook for "a recording just finalized": the
     /// engine has already rewritten the JSON sidecar with its stop-time
     /// summary by the time a caller can observe that (see
-    /// `ui::session_panel`'s recording→`None` transition), so re-reading
-    /// here picks up the fresh summary without a full directory re-scan.
+    /// `ui::strip::position_strip`'s recording→`None` transition), so
+    /// re-reading here picks up the fresh summary without a full directory
+    /// re-scan.
     /// If the sidecar no longer parses (e.g. deleted since), the stale
     /// entry is simply dropped rather than kept — never left inconsistent
     /// with what's actually on disk.

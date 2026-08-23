@@ -1,17 +1,15 @@
-//! Instrument view (spec §6): the big-numerals strip and the paper-tape
-//! `Painter`, replicating a mechanical timegrapher's readout. The only
-//! place `chrona_dsp`/`EngineSnapshot` data meets `egui` — everything
-//! numeric or geometric it needs comes pre-computed from the `presenter`
-//! layer (T6), which stays `egui`-free by design.
+//! Instrument view: the paper-tape `Painter`, replicating a mechanical
+//! timegrapher's readout. The only place `chrona_dsp`/`EngineSnapshot` data
+//! meets `egui` — everything numeric or geometric it needs comes
+//! pre-computed from the `presenter` layer, which stays `egui`-free by
+//! design. The old big-numerals strip (spec §6) moved to `ui::cards`/
+//! `ui::strip` in M4a Task 7; only the paper tape remains here (Task 8
+//! redesigns it further).
 
-use chrona_dsp::{AmplitudeGateFail, MetricsSnapshot, Tier};
 use eframe::egui;
 
 use crate::engine::EngineSnapshot;
-use crate::presenter::{
-    TapeDot, TapeParams, format_amplitude, format_beat_error, format_rate, source_label, tape_dots,
-    tier_label,
-};
+use crate::presenter::{TapeDot, TapeParams, tape_dots};
 
 /// Tape display knobs. `instrument_view` owns `wrap_ms` outright — its own
 /// wrap selector (in `tape_panel`, below) is the only thing that mutates
@@ -66,19 +64,18 @@ pub fn dot_to_screen(d: &TapeDot, rect: egui::Rect) -> egui::Pos2 {
     )
 }
 
-/// Renders the instrument view: the numerals strip on top, the paper tape
-/// filling whatever vertical space remains in `ui`.
+/// Renders the instrument view: the wrap selector plus the paper tape
+/// filling whatever vertical space remains in `ui`. The numerals strip that
+/// used to render above these (spec §6) moved to `ui::cards`/`ui::strip`
+/// (M4a Task 7) — `ChronaApp::ui` renders those separately, above this.
 pub fn instrument_view(ui: &mut egui::Ui, snap: &EngineSnapshot, tape_ui: &mut TapeUiState) {
-    numerals_strip(ui, snap.metrics.as_ref());
-    ui.separator();
     wrap_selector(ui, tape_ui);
     tape_panel(ui, snap, tape_ui);
 }
 
 /// Slim right-aligned row picking `tape_ui.wrap_ms` among `WRAP_PRESETS`
-/// (spec §6's adjustable y-scale; protocol A.2 exercises it). Sits between
-/// the numerals strip and the tape itself, so it's visible without resizing
-/// the window.
+/// (spec §6's adjustable y-scale; protocol A.2 exercises it). Sits directly
+/// above the tape itself, so it's visible without resizing the window.
 fn wrap_selector(ui: &mut egui::Ui, tape_ui: &mut TapeUiState) {
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -91,142 +88,6 @@ fn wrap_selector(ui: &mut egui::Ui, tape_ui: &mut TapeUiState) {
                 });
         });
     });
-}
-
-// ---------------------------------------------------------------------
-// Numerals strip
-// ---------------------------------------------------------------------
-
-fn numerals_strip(ui: &mut egui::Ui, metrics: Option<&MetricsSnapshot>) {
-    ui.horizontal(|ui| match metrics {
-        Some(m) => {
-            ui.label(tier_badge(m.tier));
-            if let Some(label) = source_label(m.rate_source) {
-                ui.label(
-                    egui::RichText::new(label)
-                        .size(11.0)
-                        .color(egui::Color32::from_gray(160)),
-                );
-            }
-        }
-        None => {
-            ui.label(
-                egui::RichText::new("NO SIGNAL")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(120)),
-            );
-        }
-    });
-
-    ui.columns(4, |cols| {
-        let (rate_val, rate_cap) = rate_cell(metrics);
-        let (be_val, be_cap) = beat_error_cell(metrics);
-        let (amp_val, amp_cap) = amplitude_cell(metrics);
-        let (bph_val, bph_cap) = bph_cell(metrics);
-        numeral_cell(&mut cols[0], &rate_val, &rate_cap);
-        numeral_cell(&mut cols[1], &be_val, &be_cap);
-        numeral_cell(&mut cols[2], &amp_val, &amp_cap);
-        numeral_cell(&mut cols[3], &bph_val, &bph_cap);
-    });
-}
-
-/// One big numeral (spec: `RichText::size(34.0).monospace()`) plus its
-/// small caption line.
-fn numeral_cell(ui: &mut egui::Ui, value: &str, caption: &str) {
-    ui.vertical(|ui| {
-        ui.label(egui::RichText::new(value).size(34.0).monospace());
-        ui.label(egui::RichText::new(caption).size(11.0));
-    });
-}
-
-fn tier_badge(tier: Tier) -> egui::RichText {
-    let color = match tier {
-        Tier::T1 => egui::Color32::from_gray(180),
-        Tier::T2 => egui::Color32::from_rgb(235, 175, 40),
-        Tier::T3 => egui::Color32::from_rgb(95, 200, 120),
-    };
-    egui::RichText::new(tier_label(tier))
-        .size(13.0)
-        .strong()
-        .color(color)
-}
-
-/// `(value, caption)` for the rate cell. `format_rate` already embeds the
-/// `⚠ uncal` marker when uncalibrated; when there's no rate at all the
-/// caption explains why (no defensible nominal BPH to detrend against —
-/// spec §3.1). The presenter layer doesn't expose a more specific reason
-/// than that (unlike amplitude's gate enum) so this is as precise as T8
-/// can honestly be here.
-fn rate_cell(metrics: Option<&MetricsSnapshot>) -> (String, String) {
-    match metrics {
-        Some(m) => {
-            let caption = if m.rate_s_per_day.is_some() {
-                "RATE"
-            } else {
-                "no BPH match"
-            };
-            (
-                format_rate(m.rate_s_per_day, m.calibrated),
-                caption.to_string(),
-            )
-        }
-        None => ("—".to_string(), "RATE".to_string()),
-    }
-}
-
-/// `(value, caption)` for the beat-error cell; only defined at tier ≥ T2.
-fn beat_error_cell(metrics: Option<&MetricsSnapshot>) -> (String, String) {
-    match metrics {
-        Some(m) => {
-            let caption = if m.beat_error_ms.is_some() {
-                "BEAT ERROR"
-            } else {
-                "need Tier 2"
-            };
-            (format_beat_error(m.beat_error_ms), caption.to_string())
-        }
-        None => ("—".to_string(), "BEAT ERROR".to_string()),
-    }
-}
-
-/// `(value, caption)` for the amplitude cell. When gated, `format_amplitude`
-/// already embeds the gate reason in its string (e.g. `"— (out of
-/// range)"`); that reason is pulled into the caption instead so the 34 pt
-/// numeral itself stays a bare `"—"` rather than a long parenthetical.
-fn amplitude_cell(metrics: Option<&MetricsSnapshot>) -> (String, String) {
-    match metrics {
-        Some(m) => match m.amplitude_deg {
-            Some(_) => (
-                format_amplitude(m.amplitude_deg, m.quality.amplitude_gate),
-                "AMPLITUDE".to_string(),
-            ),
-            None => {
-                let caption = match m.quality.amplitude_gate {
-                    Some(AmplitudeGateFail::TicTocDisagree) => "tic/toc disagree",
-                    Some(AmplitudeGateFail::OutOfRange) => "out of range",
-                    _ => "need Tier 3",
-                };
-                ("—".to_string(), caption.to_string())
-            }
-        },
-        None => ("—".to_string(), "AMPLITUDE".to_string()),
-    }
-}
-
-/// `(value, caption)` for the BPH cell. Always renderable once `metrics`
-/// exists (`bph_detected` has no `None` state); shows the snapped nominal
-/// when the analyzer has one, else the raw detected value, tilded.
-fn bph_cell(metrics: Option<&MetricsSnapshot>) -> (String, String) {
-    match metrics {
-        Some(m) => {
-            let value = match m.bph_nominal {
-                Some(n) => n.to_string(),
-                None => format!("~{:.0}", m.bph_detected),
-            };
-            (value, "BPH".to_string())
-        }
-        None => ("—".to_string(), "BPH".to_string()),
-    }
 }
 
 // ---------------------------------------------------------------------

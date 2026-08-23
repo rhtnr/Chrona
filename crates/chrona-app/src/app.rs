@@ -1,8 +1,9 @@
 //! The eframe application shell. Owns a live `Engine`, seeded from CLI flags
 //! and the persisted `ConfigStore`, and renders the redesigned toolbar
-//! (`ui::toolbar::toolbar_row`, M4a Task 6) + health banner strip above the
-//! M3 instrument view (T8) and record & replay panel (T10) — both still
-//! carry their own M4a redesigns in later tasks.
+//! (`ui::toolbar::toolbar_row`, M4a Task 6) + health banner, the position/
+//! session strip and metric cards (`ui::strip`/`ui::cards`, M4a Task 7),
+//! above the M3 paper tape (`ui::instrument_view`) — the tape still carries
+//! its own M4a redesign in a later task.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,12 +15,13 @@ use crate::AppFlags;
 use crate::engine::{
     Banner, BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec,
 };
-use crate::history::HistoryIndex;
+use crate::history::{HistoryIndex, POSITIONS};
 use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
-    AddWatchModalState, BphComboItem, ClipTracker, ControlsState, SessionPanelState, TapeUiState,
-    ToolbarCtx, ToolbarState, default_recordings_dir, pick_banner, session_panel, toolbar_row,
+    AddWatchModalState, BphComboItem, ClipTracker, ControlsState, HelpTopicId, SessionPanelState,
+    StripCtx, TapeUiState, ToolbarCtx, ToolbarState, default_recordings_dir, metrics_cards,
+    pick_banner, position_strip, render_help_modal, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -67,10 +69,10 @@ pub struct ChronaApp {
     recordings_dir: PathBuf,
     /// The session-history index (spec §7), scanned once from
     /// `recordings_dir` at startup and kept current afterwards by
-    /// `session_panel`'s upsert-on-finalize hook. Read by the toolbar's
-    /// Export button (M4a Task 6: `export_enabled`) to gate on whether the
-    /// selected watch has any recorded sessions; the history table and
-    /// position-comparison card land in a later M4a task.
+    /// `ui::strip::position_strip`'s upsert-on-finalize hook. Read by the
+    /// toolbar's Export button (M4a Task 6: `export_enabled`) to gate on
+    /// whether the selected watch has any recorded sessions; the history
+    /// table and position-comparison card land in a later M4a task.
     history: HistoryIndex,
     /// Toolbar-owned state (M4a Task 6) that doesn't belong on
     /// `ControlsState`/`ConfigStore`: the selected watch (seeded from, and
@@ -80,6 +82,21 @@ pub struct ChronaApp {
     /// `export_requested` stub in `ChronaApp::ui`; Task 9 wires the real
     /// export).
     toolbar: ToolbarState,
+    /// Index into `history::POSITIONS` — the position selected in the
+    /// redesigned segmented control (M4a Task 7; replaces the old M3
+    /// session-panel free-text position field). Threaded into the
+    /// toolbar's Record button as `meta_position` (`ui::toolbar::
+    /// record_stop_button`) and, later, into Task 9's position-comparison
+    /// highlight. Chosen as a `usize` index (rather than storing the code
+    /// `&'static str` itself) so it stays trivially `Copy`/`Default`-able
+    /// and index-aligned with `history::PositionRates::by_code`, the same
+    /// convention that struct already uses. Defaults to `0` (`"DU"`).
+    selected_position: usize,
+    /// Which metric's help modal is open, if any (M4a Task 7); `None` most
+    /// of the time. Set from a metrics card's "?" button
+    /// (`ui::cards::metrics_cards`'s return value) and cleared by
+    /// `ui::modals::render_help_modal` (✕, click-outside, or Esc).
+    open_help: Option<HelpTopicId>,
 }
 
 impl ChronaApp {
@@ -138,6 +155,8 @@ impl ChronaApp {
             recordings_dir,
             history,
             toolbar,
+            selected_position: 0,
+            open_help: None,
         }
     }
 
@@ -216,6 +235,7 @@ impl eframe::App for ChronaApp {
         let banner = pick_banner(snap.banner.as_ref(), &health_for_banner, snap.source_kind);
 
         egui::Panel::top("chrona_top").show(ui, |ui| {
+            let selected_position_code = POSITIONS[self.selected_position].0;
             let dirty = toolbar_row(
                 ui,
                 &mut self.controls,
@@ -228,6 +248,7 @@ impl eframe::App for ChronaApp {
                     snap: &snap,
                     recordings_dir: &self.recordings_dir,
                     history: &self.history,
+                    selected_position: selected_position_code,
                 },
             );
             if dirty {
@@ -240,14 +261,31 @@ impl eframe::App for ChronaApp {
             }
 
             ui.separator();
-            session_panel(
+            position_strip(
                 ui,
+                palette,
+                &mut self.selected_position,
                 &mut self.session,
-                &self.engine,
-                &snap,
-                &self.controls.selected_device,
-                &mut self.history,
+                StripCtx {
+                    engine: &self.engine,
+                    snap: &snap,
+                    last_device: &self.controls.selected_device,
+                    history: &mut self.history,
+                },
             );
+
+            ui.separator();
+            let mut help_just_opened = false;
+            if let Some(id) = metrics_cards(
+                ui,
+                palette,
+                snap.metrics.as_ref(),
+                self.toolbar.bph_selection,
+            ) {
+                self.open_help = Some(id);
+                help_just_opened = true;
+            }
+            render_help_modal(ui.ctx(), palette, &mut self.open_help, help_just_opened);
         });
 
         if self.toolbar.export_requested {

@@ -6,7 +6,7 @@
 //! below (`averaging_options`, `bph_combo_items`, `export_enabled`) are
 //! TDD'd first; the egui-facing rendering that follows is exercised only by
 //! `cargo build` + the workspace test suite (no window in CI) — same split
-//! as `controls.rs`/`session_panel.rs`.
+//! as `controls.rs`/`strip.rs`.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use crate::ui::controls::{
     BphModeUi, ControlsState, current_device_name, device_picker, to_bph_mode,
 };
 use crate::ui::modals::{AddWatchModalState, render_add_watch_modal};
-use crate::ui::session_panel::SessionPanelState;
+use crate::ui::strip::SessionPanelState;
 
 /// Averaging combo's fixed option set (behavior contract; spec §14 deviation
 /// #1: the mockup's 120 s is dropped — the analyzer's valid range is
@@ -93,6 +93,14 @@ pub struct ToolbarCtx<'a> {
     pub snap: &'a EngineSnapshot,
     pub recordings_dir: &'a Path,
     pub history: &'a HistoryIndex,
+    /// The canonical position code (`history::POSITIONS`) currently
+    /// selected in the redesigned position strip (M4a Task 7; the strip
+    /// itself renders below the toolbar, but `ChronaApp::ui` resolves the
+    /// code from `selected_position` before either renders — see
+    /// `record_stop_button`, the only consumer). Replaces the M3 session-
+    /// panel's free-text position field this ctx used to carry via
+    /// `session.position`.
+    pub selected_position: &'a str,
 }
 
 /// Renders the full toolbar row (logo/title, watch combo, device/lift/bph/
@@ -147,6 +155,7 @@ pub fn toolbar_row(
                 ctx.session,
                 ctx.recordings_dir,
                 &state.selected_watch,
+                ctx.selected_position,
             );
             export_button(
                 ui,
@@ -563,6 +572,7 @@ fn record_stop_button(
     session: &mut SessionPanelState,
     recordings_dir: &Path,
     selected_watch: &Option<String>,
+    selected_position: &str,
 ) {
     let label = if recording { "Stop" } else { "Record" };
     let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::FAMILY_SEMIBOLD.into()));
@@ -639,15 +649,9 @@ fn record_stop_button(
             // subsequent StartRecording fails too and surfaces its own
             // error banner.
             let _ = std::fs::create_dir_all(recordings_dir);
-            let trimmed = session.position.trim();
-            let meta_position = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
             engine.send(ControlMsg::StartRecording {
                 dir: recordings_dir.to_path_buf(),
-                meta_position,
+                meta_position: Some(selected_position.to_string()),
                 watch: selected_watch.clone(),
             });
             session.recording_started_at = Some(Instant::now());
