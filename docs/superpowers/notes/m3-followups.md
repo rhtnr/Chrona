@@ -102,8 +102,13 @@ positions summary/export). Ordered by priority.
 
 ## Process notes
 
-- **Watch the first ubuntu CI run on GitHub** — the Linux apt package list
-  (GUI/audio deps) has never executed on a real runner; it is the recorded proof
-  obligation for T5. Same for the `--ignored` stress job's first scheduled run.
+- **First real CI run: DISCHARGED 2026-08-23** (runs 32638681413 → 32639565470, all 4
+  jobs green). Two adjustments were needed, both landed: the apt list gained
+  `libpipewire-0.3-dev` (cpal 0.18 pulls the PipeWire host on Linux via libspa-sys),
+  and the perf bar is 30 ms under `CI` (shared 2-core runners measured p50 12.9 ms vs
+  4.4 ms local; the guarded regression class costs ~90 ms anywhere). The octave stress
+  matrix passed on Linux — the platform-FP-drift failure M2 warned about did not occur.
+- M4 chore: bump `actions/checkout@v4` → v5 (GitHub deprecation warnings for its
+  Node 20 runtime on every job).
 - Manual protocol (docs/manual-testing.md) is the acceptance gate for everything
   hardware-dependent: live mic, TCC permission, hot-unplug, per-device ppm persistence.
