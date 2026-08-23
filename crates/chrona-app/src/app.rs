@@ -2,8 +2,8 @@
 //! and the persisted `ConfigStore`, and renders the redesigned toolbar
 //! (`ui::toolbar::toolbar_row`, M4a Task 6) + health banner, the position/
 //! session strip and metric cards (`ui::strip`/`ui::cards`, M4a Task 7),
-//! above the M3 paper tape (`ui::instrument_view`) — the tape still carries
-//! its own M4a redesign in a later task.
+//! above the beat-trace/amplitude charts (`ui::charts::charts_section`,
+//! M4a Task 8) that replaced M3's paper tape.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,9 +19,10 @@ use crate::history::{HistoryIndex, POSITIONS};
 use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
-    AddWatchModalState, BphComboItem, ClipTracker, ControlsState, HelpTopicId, SessionPanelState,
-    StripCtx, TapeUiState, ToolbarCtx, ToolbarState, default_recordings_dir, metrics_cards,
-    pick_banner, position_strip, render_help_modal, toolbar_row,
+    AddWatchModalState, BphComboItem, ChartsCtx, ChartsUiState, ClipTracker, ControlsState,
+    HelpTopicId, SessionPanelState, StripCtx, ToolbarCtx, ToolbarState, charts_section,
+    default_recordings_dir, metrics_cards, pick_banner, position_strip, render_help_modal,
+    toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -33,7 +34,10 @@ const MIC_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 pub struct ChronaApp {
     engine: Engine,
-    tape_ui: TapeUiState,
+    /// The charts section's own UI state (M4a Task 8): currently just the
+    /// wrap-band selection — see `ui::charts::ChartsUiState`. Replaces M3's
+    /// `TapeUiState`.
+    charts_ui: ChartsUiState,
     controls: ControlsState,
     config: ConfigStore,
     /// The active theme, applied to `cc.egui_ctx` at startup and flipped by
@@ -44,16 +48,14 @@ pub struct ChronaApp {
     /// use).
     theme: Theme,
     /// M4a beat-trace accumulators (design spec §10/§11): fed from every
-    /// snapshot alongside the M3 tape below, spanning up to
-    /// `presenter::HORIZON_S` rather than the analyzer's own ~32 s ring.
-    /// Rendering still reads the old `tape_ui`/M3 tape until Task 8's
-    /// chart painters land.
+    /// snapshot, spanning up to `presenter::HORIZON_S` rather than the
+    /// analyzer's own ~32 s ring. Read each frame by
+    /// `ui::charts::charts_section`.
     beat_accum: BeatAccum,
     amp_accum: AmpAccum,
-    /// The beat-trace chart's pan/zoom/follow state (design spec §10).
-    /// Not yet read anywhere else — the chart's pan/zoom controls land in
-    /// a later M4a task (Task 8).
-    #[allow(dead_code)]
+    /// The beat-trace chart's pan/zoom/follow state (design spec §10),
+    /// mutated by `ui::charts::charts_section`'s wheel/drag interactions
+    /// and its `+`/`−`/`Fit`/`Live` controls.
     trace_view: TraceView,
     /// Set the moment the config first goes dirty (not refreshed on every
     /// subsequent edit), so a continuous drag still saves within a bounded
@@ -141,7 +143,7 @@ impl ChronaApp {
         let history = HistoryIndex::scan(&recordings_dir);
         ChronaApp {
             engine,
-            tape_ui: TapeUiState::default(),
+            charts_ui: ChartsUiState::default(),
             controls,
             config,
             theme,
@@ -202,12 +204,12 @@ impl eframe::App for ChronaApp {
         // itself must never be called here.
         let snap = self.engine.snapshot();
 
-        // M4a beat-trace feed (design spec §10/§11): runs alongside the M3
-        // tape below every frame, independent of whether anything paints
-        // from it yet (Task 8). `bph_nominal`/`amplitude_deg` come straight
-        // from the snapshot's metrics; a metrics-less snapshot feeds `None`
-        // into both, which `BeatAccum`/`AmpAccum` already treat as "append
-        // nothing" rather than fabricating a beat or amplitude point.
+        // M4a beat-trace feed (design spec §10/§11): runs every frame,
+        // feeding the charts section painted below.
+        // `bph_nominal`/`amplitude_deg` come straight from the snapshot's
+        // metrics; a metrics-less snapshot feeds `None` into both, which
+        // `BeatAccum`/`AmpAccum` already treat as "append nothing" rather
+        // than fabricating a beat or amplitude point.
         self.beat_accum.extend(
             &snap.tape,
             snap.metrics.as_ref().and_then(|m| m.bph_nominal),
@@ -299,7 +301,18 @@ impl eframe::App for ChronaApp {
         self.maybe_save_config();
 
         egui::CentralPanel::default().show(ui, |ui| {
-            crate::ui::instrument_view(ui, &snap, &mut self.tape_ui);
+            let palette = theme::Palette::of(self.theme);
+            charts_section(
+                ui,
+                palette,
+                &mut self.trace_view,
+                &mut self.charts_ui,
+                ChartsCtx {
+                    beat_accum: &self.beat_accum,
+                    amp_accum: &self.amp_accum,
+                    metrics: snap.metrics.as_ref(),
+                },
+            );
         });
     }
 }

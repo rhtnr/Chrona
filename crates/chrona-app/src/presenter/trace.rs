@@ -83,8 +83,8 @@ struct Grid {
 /// (`t_unlock − t0`) — `offset = k·T_beat − actual` is therefore POSITIVE
 /// and grows over time for a fast watch, matching the mockup's and
 /// Watch-O-Scope's up-is-fast reading. This is the opposite sign from M3's
-/// `presenter::tape::tape_dots` (`dev = actual − nominal`, i.e. down-is-
-/// fast there) — a deliberate, binding convention change for M4a's
+/// now-removed paper-tape presenter (`dev = actual − nominal`, i.e. down-
+/// is-fast there) — a deliberate, binding convention change for M4a's
 /// redesigned chart, not an inconsistency to reconcile.
 #[derive(Default)]
 pub struct BeatAccum {
