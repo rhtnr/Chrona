@@ -139,3 +139,141 @@ fn non_turbo_pacing_survives_a_control_message_burst() {
     );
     drop(eng); // Shutdown + join must complete (test would hang otherwise)
 }
+
+#[test]
+fn start_recording_failure_clears_stale_recording_path() {
+    // T7 re-review incidental, ported into T10 as an authorized engine.rs
+    // edit: `StartRecording`'s Err arm must clear `recording_path`, not
+    // leave the previous (now-finalized) recording's path stale beside a
+    // `None` writer. Forces the Err arm by starting a *second* recording
+    // (while the first is still active) into a directory that's actually a
+    // regular file — `SessionWriter::create`'s `dir.join(..)` then can't be
+    // created (not a directory).
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 0.0,
+            beat_error: 0.0,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    eng.send(ControlMsg::StartRecording {
+        dir: dir.path().to_path_buf(),
+        meta_position: None,
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if eng.snapshot().recording.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first StartRecording never took"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let not_a_dir = dir.path().join("not_a_dir");
+    std::fs::write(&not_a_dir, b"x").unwrap();
+    eng.send(ControlMsg::StartRecording {
+        dir: not_a_dir,
+        meta_position: None,
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let snap = loop {
+        let s = eng.snapshot();
+        if s.error_banner
+            .as_deref()
+            .is_some_and(|m| m.contains("failed to start recording"))
+        {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second (failing) StartRecording never surfaced its error banner"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        snap.recording.is_none(),
+        "a failed StartRecording while already recording must clear recording_path, \
+         not leave the prior writer's path stale (got {:?})",
+        snap.recording
+    );
+    drop(eng); // Shutdown + join must complete (test would hang otherwise)
+}
+
+#[test]
+fn switch_to_replay_with_sidecar_surfaces_settings_banner() {
+    // T10 edit A (T7-I3), end to end through the public Engine: switching
+    // into a recorded session with a sidecar restores its lift/ppm into the
+    // live config and surfaces the "using recorded settings" info banner.
+    // `SourceRuntime::build`'s own unit tests (in engine.rs, same-crate —
+    // it's private) cover the exact mutation in isolation; this confirms
+    // the `SwitchSource` control-message call site actually wires it
+    // through to a real published snapshot.
+    let dir = tempfile::tempdir().unwrap();
+    let meta = chrona_session::SessionMeta {
+        schema_version: 1,
+        device_name: "TestMic".to_string(),
+        sample_rate_hz: 48_000.0,
+        ppm_correction: 3.0,
+        lift_angle_deg: 40.0,
+        bph_mode: "auto".to_string(),
+        position: None,
+        started_unix_s: 1_700_000_000,
+        app_version: "test".to_string(),
+    };
+    let mut w = chrona_session::SessionWriter::create(dir.path(), meta).unwrap();
+    w.push(&vec![0.0f32; 4_800]).unwrap();
+    let wav_path = w.finalize().unwrap();
+
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 0.0,
+            beat_error: 0.0,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+    eng.send(ControlMsg::SwitchSource(SourceSpec::ReplayFile {
+        path: wav_path,
+    }));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let snap = loop {
+        let s = eng.snapshot();
+        if matches!(s.source_kind, SourceKind::Replay) {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never switched to Replay"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(
+        snap.error_banner.as_deref(),
+        Some("replay: using recorded settings (lift 40.0°, ppm 3.0)")
+    );
+    drop(eng); // Shutdown + join must complete (test would hang otherwise)
+}

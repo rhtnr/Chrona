@@ -291,10 +291,31 @@ enum SourceRuntime {
 }
 
 impl SourceRuntime {
-    fn build(spec: &SourceSpec) -> Result<SourceRuntime, String> {
+    /// Builds the runtime for `spec`. For every arm but `ReplayFile` this
+    /// leaves `config` untouched and returns `None` alongside the runtime.
+    ///
+    /// `ReplayFile` is the exception: if the recording carries a JSON
+    /// sidecar (`chrona_session::SessionMeta`, written by `StartRecording`
+    /// below), this applies its `lift_angle_deg`/`ppm_correction`/
+    /// `bph_mode` into `*config` *before returning* — the caller's
+    /// subsequent `build_analyzer(&config, ..)` then builds the replay's
+    /// analyzer from the recorded settings, not whatever the UI happened to
+    /// have live. This mirrors `chrona_session::replay::replay`'s restore
+    /// semantics (fall back to `AnalyzerConfig::default()` is the caller's
+    /// existing behavior for a bare WAV, since a missing/unparseable
+    /// sidecar is `None` here same as there) so replaying a file through
+    /// this app reproduces what the `chrona` CLI's `replay` subcommand
+    /// would report on the same file. The `Some(String)` return is an info
+    /// message describing the restored values, for the caller to publish as
+    /// a banner; UI config changes made during replay still work as normal
+    /// afterwards (they rebuild the analyzer same as any other change).
+    fn build(
+        spec: &SourceSpec,
+        config: &mut EngineConfig,
+    ) -> Result<(SourceRuntime, Option<String>), String> {
         match spec {
             SourceSpec::Mic { device_id } => CaptureStream::start(device_id.as_deref(), MIC_RING_S)
-                .map(SourceRuntime::Mic)
+                .map(|s| (SourceRuntime::Mic(s), None))
                 .map_err(|e| format!("microphone: {e}")),
             SourceSpec::Simulate {
                 rate,
@@ -313,19 +334,40 @@ impl SourceRuntime {
                 };
                 let sample_rate_hz = cfg.sample_rate_hz;
                 synthesize(&cfg)
-                    .map(|buffer| SourceRuntime::Simulate {
-                        buffer,
-                        pos: 0,
-                        sample_rate_hz,
+                    .map(|buffer| {
+                        (
+                            SourceRuntime::Simulate {
+                                buffer,
+                                pos: 0,
+                                sample_rate_hz,
+                            },
+                            None,
+                        )
                     })
                     .map_err(|e| format!("simulate: {e}"))
             }
             SourceSpec::ReplayFile { path } => SessionReader::open(path)
-                .map(|r| SourceRuntime::Replay {
-                    samples: r.samples,
-                    pos: 0,
-                    sample_rate_hz: r.sample_rate_hz,
-                    done: false,
+                .map(|r| {
+                    let info = r.meta.as_ref().map(|m| {
+                        if let Some(mode) = parse_sidecar_bph_mode(&m.bph_mode) {
+                            config.bph_mode = mode;
+                        }
+                        config.lift_angle_deg = m.lift_angle_deg;
+                        config.ppm_correction = m.ppm_correction;
+                        format!(
+                            "replay: using recorded settings (lift {:.1}°, ppm {:.1})",
+                            m.lift_angle_deg, m.ppm_correction
+                        )
+                    });
+                    (
+                        SourceRuntime::Replay {
+                            samples: r.samples,
+                            pos: 0,
+                            sample_rate_hz: r.sample_rate_hz,
+                            done: false,
+                        },
+                        info,
+                    )
                 })
                 .map_err(|e| format!("replay {}: {e}", path.display())),
         }
@@ -439,6 +481,26 @@ fn bph_mode_to_string(mode: BphMode) -> String {
         BphMode::Auto => "auto".to_string(),
         BphMode::Free => "free".to_string(),
         BphMode::Fixed(n) => n.to_string(),
+    }
+}
+
+/// Parses a sidecar's `bph_mode` string (`"auto"`, `"free"`, or a numeric
+/// BPH — `bph_mode_to_string`'s inverse) into a `BphMode`. Mirrors
+/// `chrona_session::replay`'s own `parse_bph_mode` (itself mirroring the
+/// CLI's `parse_bph_mode` in `chrona-cli/src/commands.rs`) — duplicated
+/// rather than imported because that parser is a private implementation
+/// detail of the `replay` module, not part of `chrona_session`'s public
+/// surface. Unlike `chrona_session::replay::replay` (which hard-fails the
+/// whole replay on an unparseable sidecar value), this returns `None` and
+/// lets the caller leave the current `bph_mode` untouched — consistent with
+/// `chrona_session::sidecar`'s own "absent/unparseable is not a failure"
+/// rule for a JSON sidecar that parsed as valid `SessionMeta` but happens to
+/// carry a corrupted `bph_mode` string.
+fn parse_sidecar_bph_mode(s: &str) -> Option<BphMode> {
+    match s {
+        "auto" => Some(BphMode::Auto),
+        "free" => Some(BphMode::Free),
+        n => n.parse::<u32>().ok().map(BphMode::Fixed),
     }
 }
 
@@ -571,8 +633,19 @@ fn engine_loop(
     last_snapshot: &mut EngineSnapshot,
 ) {
     let mut config = initial_config;
-    let mut source = match SourceRuntime::build(&initial) {
-        Ok(s) => s,
+    // Declared before the initial source build (rather than alongside
+    // `writer`/`recording_path` below, as originally) so a successful
+    // Replay build with a sidecar can hand its "using recorded settings"
+    // info message straight to it — see `SourceRuntime::build`'s doc
+    // comment. No initializer: the match below either assigns it (`Ok`) or
+    // diverges (`Err` returns), so every path past it is initialized —
+    // an eager `= None` here would just be dead-and-overwritten.
+    let mut error_banner: Option<String>;
+    let mut source = match SourceRuntime::build(&initial, &mut config) {
+        Ok((s, info)) => {
+            error_banner = info;
+            s
+        }
         Err(e) => {
             // No source at all — nothing to run. Publish the fault and
             // return; the thread exits cleanly (not a panic, so the
@@ -609,7 +682,6 @@ fn engine_loop(
     let mut writer: Option<SessionWriter> = None;
     let mut recording_path: Option<PathBuf> = None;
     let mut silence = SilenceTracker::default();
-    let mut error_banner: Option<String> = None;
     let mut tick: u32 = 0;
     // I2: pull_tick/publish are gated on real elapsed time (non-turbo) so a
     // burst of control messages (e.g. a T9 slider drag, which can fire many
@@ -682,8 +754,8 @@ fn engine_loop(
                     &mut error_banner,
                     |c| c.ppm_correction = v,
                 ),
-                ControlMsg::SwitchSource(spec) => match SourceRuntime::build(&spec) {
-                    Ok(new_source) => {
+                ControlMsg::SwitchSource(spec) => match SourceRuntime::build(&spec, &mut config) {
+                    Ok((new_source, info)) => {
                         let sr = new_source.sample_rate_hz();
                         match build_analyzer(&config, sr) {
                             Ok(a) => {
@@ -698,15 +770,18 @@ fn engine_loop(
                                 // nothing was recording, a successful
                                 // switch clears any stale error as usual
                                 // (this banner would otherwise be a false
-                                // "recording stopped" notice every time
-                                // the source changes).
+                                // "recording stopped" notice every time the
+                                // source changes) — except a Replay source
+                                // with a sidecar, which reports its
+                                // restored settings here instead of a bare
+                                // `None`.
                                 if let Some(w) = writer.take() {
                                     let _ = w.finalize();
                                     recording_path = None;
                                     error_banner =
                                         Some("recording stopped: source changed".to_string());
                                 } else {
-                                    error_banner = None;
+                                    error_banner = info;
                                 }
                             }
                             Err(e) => {
@@ -745,7 +820,16 @@ fn engine_loop(
                             recording_path = Some(path);
                             error_banner = None;
                         }
-                        Err(e) => error_banner = Some(format!("failed to start recording: {e}")),
+                        Err(e) => {
+                            // A failed start while already recording would
+                            // otherwise leave a stale `Some(path)` here
+                            // beside `writer = None` — the `writer.take()`
+                            // above already finalized and dropped the old
+                            // writer, but this branch never overwrote the
+                            // old `recording_path`.
+                            recording_path = None;
+                            error_banner = Some(format!("failed to start recording: {e}"));
+                        }
                     }
                 }
                 ControlMsg::StopRecording => {
@@ -845,14 +929,18 @@ pub fn run_headless(flags: &AppFlags, seconds: f64) -> i32 {
         amplitude: flags.amplitude,
         snr: flags.snr,
     };
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         lift_angle_deg: 52.0,
         averaging_s: 30.0,
         bph_mode: BphMode::Auto,
         ppm_correction: 0.0,
     };
-    let mut source = match SourceRuntime::build(&spec) {
-        Ok(s) => s,
+    // Headless is Simulate-only (validated in `main`), so `SourceRuntime::
+    // build`'s Replay-sidecar restore never fires here — `config` is passed
+    // `&mut` only because the signature is shared with the live engine
+    // loop's Replay path.
+    let mut source = match SourceRuntime::build(&spec, &mut config) {
+        Ok((s, _info)) => s,
         Err(e) => {
             eprintln!("error: {e}");
             return 2;
@@ -948,5 +1036,90 @@ mod tests {
             s.push(&chunk, sr);
             assert_eq!(s.silent_for_s, 0.0, "flickered silent at chunk {i}");
         }
+    }
+
+    #[test]
+    fn replay_source_restores_sidecar_settings_into_config() {
+        // Synthesizes a tiny session via chrona_session (a handful of
+        // silent samples — this test is about the sidecar-restore wiring,
+        // not analyzer output) with lift/ppm/bph values that all differ
+        // from the config it's replayed against, then confirms
+        // `SourceRuntime::build` overwrites `config` with the recorded
+        // values and returns the matching info message — T10's port of
+        // `chrona_session::replay::replay`'s restore semantics (T7-I3).
+        let dir = tempfile::tempdir().unwrap();
+        let meta = SessionMeta {
+            schema_version: 1,
+            device_name: "TestMic".to_string(),
+            sample_rate_hz: 48_000.0,
+            ppm_correction: 7.5,
+            lift_angle_deg: 44.0,
+            bph_mode: "21600".to_string(),
+            position: None,
+            started_unix_s: 1_700_000_000,
+            app_version: "test".to_string(),
+        };
+        let mut w = SessionWriter::create(dir.path(), meta).unwrap();
+        w.push(&vec![0.0f32; 4_800]).unwrap();
+        let wav_path = w.finalize().unwrap();
+
+        let mut config = EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: BphMode::Auto,
+            ppm_correction: 0.0,
+        };
+        let (source, info) =
+            SourceRuntime::build(&SourceSpec::ReplayFile { path: wav_path }, &mut config)
+                .expect("replay build succeeds");
+        assert_eq!(source.kind(), SourceKind::Replay);
+        assert_eq!(config.lift_angle_deg, 44.0);
+        assert_eq!(config.ppm_correction, 7.5);
+        assert_eq!(config.bph_mode, BphMode::Fixed(21_600));
+        assert_eq!(
+            info.as_deref(),
+            Some("replay: using recorded settings (lift 44.0°, ppm 7.5)")
+        );
+    }
+
+    #[test]
+    fn replay_source_without_sidecar_leaves_config_untouched() {
+        // A recording whose sidecar is missing (removed here after writing,
+        // to reuse SessionWriter rather than pull in hound directly — same
+        // "<stem>.json next to the WAV" convention `chrona_session::sidecar`
+        // documents) must not perturb `config` at all, and reports no info
+        // message — mirrors `chrona_session::sidecar`'s own "absent sidecar
+        // is not a failure" rule.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = SessionMeta {
+            schema_version: 1,
+            device_name: "TestMic".to_string(),
+            sample_rate_hz: 48_000.0,
+            ppm_correction: 7.5,
+            lift_angle_deg: 44.0,
+            bph_mode: "21600".to_string(),
+            position: None,
+            started_unix_s: 1_700_000_000,
+            app_version: "test".to_string(),
+        };
+        let mut w = SessionWriter::create(dir.path(), meta).unwrap();
+        w.push(&vec![0.0f32; 4_800]).unwrap();
+        let wav_path = w.finalize().unwrap();
+        std::fs::remove_file(wav_path.with_extension("json")).unwrap();
+
+        let mut config = EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: BphMode::Auto,
+            ppm_correction: 0.0,
+        };
+        let (source, info) =
+            SourceRuntime::build(&SourceSpec::ReplayFile { path: wav_path }, &mut config)
+                .expect("replay build succeeds");
+        assert_eq!(source.kind(), SourceKind::Replay);
+        assert_eq!(config.lift_angle_deg, 52.0);
+        assert_eq!(config.ppm_correction, 0.0);
+        assert_eq!(config.bph_mode, BphMode::Auto);
+        assert_eq!(info, None);
     }
 }

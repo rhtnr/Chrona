@@ -821,6 +821,7 @@ dependencies = [
  "chrona-dsp",
  "chrona-session",
  "clap",
+ "directories",
  "eframe",
  "predicates",
  "rfd",

@@ -1,7 +1,9 @@
 //! The eframe application shell. Owns a live `Engine`, seeded from CLI flags
 //! and the persisted `ConfigStore`, and renders the instrument view (T8)
-//! behind a top controls row + health banner strip (T9).
+//! behind a top controls row + health banner strip (T9) and a record &
+//! replay panel (T10).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrona_session::ConfigStore;
@@ -9,7 +11,10 @@ use eframe::egui;
 
 use crate::AppFlags;
 use crate::engine::{ControlMsg, Engine, EngineConfig, HealthView, SourceSpec};
-use crate::ui::{Banner, ClipTracker, ControlsState, TapeUiState, controls_row, pick_banner};
+use crate::ui::{
+    Banner, ClipTracker, ControlsState, SessionPanelState, TapeUiState, controls_row,
+    default_recordings_dir, pick_banner, session_panel,
+};
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
 /// second).
@@ -29,6 +34,12 @@ pub struct ChronaApp {
     dirty_since: Option<Instant>,
     clip_tracker: ClipTracker,
     next_mic_retry: Option<Instant>,
+    session: SessionPanelState,
+    /// `<platform data dir>/chrona/recordings` (T10); falls back to a
+    /// relative `recordings/` dir on the rare platform `directories` can't
+    /// resolve (same graceful-fallback shape as `ConfigStore::load_default`
+    /// uses for the config dir).
+    recordings_dir: PathBuf,
 }
 
 impl ChronaApp {
@@ -63,6 +74,8 @@ impl ChronaApp {
             dirty_since: None,
             clip_tracker: ClipTracker::default(),
             next_mic_retry: None,
+            session: SessionPanelState::default(),
+            recordings_dir: default_recordings_dir().unwrap_or_else(|| PathBuf::from("recordings")),
         }
     }
 
@@ -113,6 +126,15 @@ impl eframe::App for ChronaApp {
             if controls_row(ui, &mut self.controls, &self.engine, &mut self.config) {
                 self.dirty_since.get_or_insert_with(Instant::now);
             }
+            ui.separator();
+            session_panel(
+                ui,
+                &mut self.session,
+                &self.engine,
+                &snap,
+                &self.recordings_dir,
+                &self.controls.selected_device,
+            );
         });
 
         self.maybe_retry_mic(snap.health.last_error.is_some());
