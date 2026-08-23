@@ -1,23 +1,48 @@
-//! The eframe application shell. M3 scaffold: owns the CLI flags (T7 seeds
-//! the engine's initial source/config from them) and renders placeholder
-//! panels; T7 adds a live `Engine`, T8-T10 add the real instrument/control
-//! views and layout.
+//! The eframe application shell. M3 scaffold: owns the CLI flags and a live
+//! `Engine`, seeded from them, and renders placeholder panels; T8-T10 add
+//! the real instrument/control views and layout on top of the snapshots
+//! already flowing here.
 
 use crate::AppFlags;
+use crate::engine::{Engine, EngineConfig, SourceSpec};
 use eframe::egui;
 
 pub struct ChronaApp {
     flags: AppFlags,
+    engine: Engine,
 }
 
 impl ChronaApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, flags: AppFlags) -> Self {
-        ChronaApp { flags }
+    pub fn new(cc: &eframe::CreationContext<'_>, flags: AppFlags) -> Self {
+        let initial = if flags.simulate {
+            SourceSpec::Simulate {
+                rate: flags.rate,
+                beat_error: flags.beat_error,
+                amplitude: flags.amplitude,
+                snr: flags.snr,
+            }
+        } else {
+            SourceSpec::Mic { device_id: None }
+        };
+        // Defaults matching `chrona_dsp::AnalyzerConfig::default()`; T9
+        // wires these up to real controls.
+        let config = EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        };
+        let engine = Engine::start(initial, config, Some(cc.egui_ctx.clone()));
+        ChronaApp { flags, engine }
     }
 }
 
 impl eframe::App for ChronaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The only sanctioned way to read live metrics from the UI thread —
+        // see `Engine::snapshot`'s doc comment for why `current_metrics`
+        // itself must never be called here.
+        let snap = self.engine.snapshot();
         egui::Panel::top("chrona_top").show(ui, |ui| {
             ui.heading("Chrona — M3 scaffold");
         });
@@ -31,7 +56,16 @@ impl eframe::App for ChronaApp {
             } else {
                 "microphone"
             };
-            ui.label(format!("Source: {source} (engine wired in T7)"));
+            ui.label(format!("Source: {source}"));
+            let tier = snap
+                .metrics
+                .as_ref()
+                .map(|m| crate::presenter::tier_label(m.tier))
+                .unwrap_or("no signal yet");
+            ui.label(format!("Status: {tier}"));
+            if let Some(err) = &snap.error_banner {
+                ui.colored_label(egui::Color32::RED, err);
+            }
         });
     }
 }

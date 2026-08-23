@@ -1,8 +1,9 @@
 use assert_cmd::Command;
+use predicates::str::contains;
 #[test]
 fn headless_flag_parses_and_exits_cleanly() {
-    // Engine unwired in this task: exit code 2 with the stub message proves the
-    // flag surface without opening a window. T7 flips this test to expect 0 + metrics.
+    // T7: the engine is wired. Headless drives a real (synchronous) Simulate
+    // run and prints the tier badge plus the rate line, then exits 0.
     Command::cargo_bin("chrona-app")
         .unwrap()
         .args([
@@ -14,7 +15,9 @@ fn headless_flag_parses_and_exits_cleanly() {
             "5",
         ])
         .assert()
-        .code(2);
+        .code(0)
+        .stdout(contains("TIER"))
+        .stdout(contains("s/d"));
 }
 #[test]
 fn headless_without_simulate_is_a_usage_error() {
