@@ -5,11 +5,13 @@
 
 use crate::AppFlags;
 use crate::engine::{Engine, EngineConfig, SourceSpec};
+use crate::ui::TapeUiState;
 use eframe::egui;
 
 pub struct ChronaApp {
     flags: AppFlags,
     engine: Engine,
+    tape_ui: TapeUiState,
 }
 
 impl ChronaApp {
@@ -33,7 +35,11 @@ impl ChronaApp {
             ppm_correction: 0.0,
         };
         let engine = Engine::start(initial, config, Some(cc.egui_ctx.clone()));
-        ChronaApp { flags, engine }
+        ChronaApp {
+            flags,
+            engine,
+            tape_ui: TapeUiState::default(),
+        }
     }
 }
 
@@ -45,27 +51,18 @@ impl eframe::App for ChronaApp {
         let snap = self.engine.snapshot();
         egui::Panel::top("chrona_top").show(ui, |ui| {
             ui.heading("Chrona — M3 scaffold");
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.label("Instrument view placeholder (wired in T8)");
-            ui.separator();
-            ui.label("Controls placeholder (wired in T9)");
-            ui.separator();
             let source = if self.flags.simulate {
                 "simulate"
             } else {
                 "microphone"
             };
             ui.label(format!("Source: {source}"));
-            let tier = snap
-                .metrics
-                .as_ref()
-                .map(|m| crate::presenter::tier_label(m.tier))
-                .unwrap_or("no signal yet");
-            ui.label(format!("Status: {tier}"));
-            if let Some(err) = &snap.error_banner {
-                ui.colored_label(egui::Color32::RED, err);
-            }
+            // T9 owns the real controls row and fault-banner rendering
+            // here; a fault snapshot's `error_banner` is otherwise left
+            // untouched by this scaffold.
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            crate::ui::instrument_view(ui, &snap, &mut self.tape_ui);
         });
     }
 }
