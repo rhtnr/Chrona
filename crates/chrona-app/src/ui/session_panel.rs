@@ -166,6 +166,10 @@ fn record_controls(
             engine.send(ControlMsg::StartRecording {
                 dir: recordings_dir.to_path_buf(),
                 meta_position,
+                // Compile-bridge (M4a T3, mirrors T1/T2's SessionMeta
+                // bridges): watch-list selection UI is a later task, so
+                // this panel has no selected watch to pass yet.
+                watch: None,
             });
             state.recording_started_at = Some(Instant::now());
         }

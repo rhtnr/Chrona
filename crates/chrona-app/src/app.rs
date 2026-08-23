@@ -10,10 +10,12 @@ use chrona_session::ConfigStore;
 use eframe::egui;
 
 use crate::AppFlags;
-use crate::engine::{ControlMsg, Engine, EngineConfig, HealthView, SourceSpec};
+use crate::engine::{
+    Banner, BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec,
+};
 use crate::theme::{self, Theme};
 use crate::ui::{
-    Banner, ClipTracker, ControlsState, SessionPanelState, TapeUiState, controls_row,
+    ClipTracker, ControlsState, SessionPanelState, TapeUiState, controls_row,
     default_recordings_dir, pick_banner, session_panel,
 };
 
@@ -163,11 +165,7 @@ impl eframe::App for ChronaApp {
             clipped: windowed_clipped,
             ..snap.health.clone()
         };
-        let banner = pick_banner(
-            snap.error_banner.as_deref(),
-            &health_for_banner,
-            snap.source_kind,
-        );
+        let banner = pick_banner(snap.banner.as_ref(), &health_for_banner, snap.source_kind);
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(banner) = &banner {
@@ -180,16 +178,16 @@ impl eframe::App for ChronaApp {
 
 /// Paints one banner as a filled, full-width strip above the instrument.
 fn render_banner(ui: &mut egui::Ui, banner: &Banner) {
-    let (color, text) = match banner {
-        Banner::Error(s) => (egui::Color32::from_rgb(140, 30, 30), s.as_str()),
-        Banner::Warning(s) => (egui::Color32::from_rgb(140, 100, 20), s.as_str()),
-        Banner::Info(s) => (egui::Color32::from_gray(55), s.as_str()),
+    let color = match banner.severity {
+        BannerSeverity::Error => egui::Color32::from_rgb(140, 30, 30),
+        BannerSeverity::Warn => egui::Color32::from_rgb(140, 100, 20),
+        BannerSeverity::Info => egui::Color32::from_gray(55),
     };
     egui::Frame::new()
         .fill(color)
         .inner_margin(6.0)
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).color(egui::Color32::WHITE));
+            ui.label(egui::RichText::new(&banner.text).color(egui::Color32::WHITE));
         });
     ui.add_space(4.0);
 }

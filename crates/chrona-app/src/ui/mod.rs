@@ -5,9 +5,7 @@ mod controls;
 mod instrument;
 mod session_panel;
 
-pub use controls::{
-    Banner, BphModeUi, ClipTracker, ControlsState, controls_row, pick_banner, to_bph_mode,
-};
+pub use controls::{BphModeUi, ClipTracker, ControlsState, controls_row, pick_banner, to_bph_mode};
 pub use instrument::{TapeUiState, dot_to_screen, instrument_view};
 pub use session_panel::{
     SessionPanelState, default_recordings_dir, rec_elapsed_label, session_panel,

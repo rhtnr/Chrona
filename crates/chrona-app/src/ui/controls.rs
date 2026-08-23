@@ -10,7 +10,9 @@ use chrona_audio::DeviceInfo;
 use chrona_session::ConfigStore;
 use eframe::egui;
 
-use crate::engine::{ControlMsg, Engine, HealthView, SourceKind, SourceSpec};
+use crate::engine::{
+    Banner, BannerSeverity, ControlMsg, Engine, HealthView, SourceKind, SourceSpec,
+};
 
 /// BPH selector state. `Fixed` carries a free-text buffer rather than a
 /// parsed `u32` so a partially-typed (or momentarily invalid) value isn't
@@ -39,14 +41,6 @@ pub fn to_bph_mode(ui: &BphModeUi) -> Option<chrona_dsp::BphMode> {
     }
 }
 
-/// A ready-to-render banner: severity plus its already-formatted text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Banner {
-    Error(String),
-    Warning(String),
-    Info(String),
-}
-
 /// `HealthView::silent_for_s` at or above this, on a Mic source, shows the
 /// "no signal" banner (behavior contract).
 const SILENT_BANNER_S: f64 = 3.0;
@@ -56,34 +50,47 @@ const SILENT_BANNER_S: f64 = 3.0;
 /// error > silence (Mic only) > clipping > overruns. Never more than one at
 /// a time (controller ruling).
 ///
+/// `engine_banner`, when present, is returned as-is (severity included) —
+/// the engine already classified it per the spec §4 mapping. Every banner
+/// `pick_banner` itself derives from `h` (mic error, silence, clipping,
+/// overruns) is `BannerSeverity::Warn` (spec §4: health-derived banners are
+/// always Warn).
+///
 /// PURE: all temporal/stateful judgment — "clipped within the last 5s"
 /// tolerating counter resets (see `ClipTracker`), debounced retries — is the
 /// caller's job before calling this; `h.clipped` here is taken as-is.
 pub fn pick_banner(
-    engine_banner: Option<&str>,
+    engine_banner: Option<&Banner>,
     h: &HealthView,
     kind: SourceKind,
 ) -> Option<Banner> {
-    if let Some(msg) = engine_banner {
-        return Some(Banner::Error(msg.to_string()));
+    if let Some(b) = engine_banner {
+        return Some(b.clone());
     }
     if let Some(msg) = &h.last_error {
-        return Some(Banner::Error(format!("audio error: {msg} (reconnecting)")));
+        return Some(Banner {
+            severity: BannerSeverity::Warn,
+            text: format!("audio error: {msg} (reconnecting)"),
+        });
     }
     if kind == SourceKind::Mic && h.silent_for_s >= SILENT_BANNER_S {
-        return Some(Banner::Warning(
-            "no signal — check mic permission / Windows Settings → Privacy → Microphone"
+        return Some(Banner {
+            severity: BannerSeverity::Warn,
+            text: "no signal — check mic permission / Windows Settings → Privacy → Microphone"
                 .to_string(),
-        ));
+        });
     }
     if h.clipped > 0 {
-        return Some(Banner::Error("input clipping — reduce gain".to_string()));
+        return Some(Banner {
+            severity: BannerSeverity::Warn,
+            text: "input clipping — reduce gain".to_string(),
+        });
     }
     if h.overruns > 0 {
-        return Some(Banner::Info(format!(
-            "{} buffer overrun(s) — audio briefly dropped",
-            h.overruns
-        )));
+        return Some(Banner {
+            severity: BannerSeverity::Warn,
+            text: format!("{} buffer overrun(s) — audio briefly dropped", h.overruns),
+        });
     }
     None
 }
@@ -512,25 +519,26 @@ mod tests {
     #[test]
     fn pick_banner_precedence() {
         // A. engine_banner (T7 thread faults / recording notices) outranks
-        // everything, even a simultaneous mic capture error.
+        // everything, even a simultaneous mic capture error — and is
+        // returned as-is, severity included (the engine already classified
+        // it per spec §4).
         let with_mic_error = HealthView {
             last_error: Some("permission denied".to_string()),
             ..HealthView::default()
         };
+        let recording_stopped = Banner {
+            severity: BannerSeverity::Info,
+            text: "recording stopped: source changed".to_string(),
+        };
         assert_eq!(
-            pick_banner(
-                Some("recording stopped: source changed"),
-                &with_mic_error,
-                SourceKind::Mic
-            ),
-            Some(Banner::Error(
-                "recording stopped: source changed".to_string()
-            )),
+            pick_banner(Some(&recording_stopped), &with_mic_error, SourceKind::Mic),
+            Some(recording_stopped.clone()),
             "engine_banner must win over a live mic error"
         );
 
         // B. Without an engine_banner, a mic capture error outranks
         // silence/clipping/overruns even when all are present at once.
+        // Every banner pick_banner derives from HealthView itself is Warn.
         let everything_else_too = HealthView {
             last_error: Some("device disconnected".to_string()),
             silent_for_s: 10.0,
@@ -539,9 +547,10 @@ mod tests {
         };
         assert_eq!(
             pick_banner(None, &everything_else_too, SourceKind::Mic),
-            Some(Banner::Error(
-                "audio error: device disconnected (reconnecting)".to_string()
-            )),
+            Some(Banner {
+                severity: BannerSeverity::Warn,
+                text: "audio error: device disconnected (reconnecting)".to_string(),
+            }),
         );
 
         // C. Silence fires on Mic at the >= 3s threshold and still outranks
@@ -554,10 +563,11 @@ mod tests {
         };
         assert_eq!(
             pick_banner(None, &silent_on_mic, SourceKind::Mic),
-            Some(Banner::Warning(
-                "no signal — check mic permission / Windows Settings → Privacy → Microphone"
-                    .to_string()
-            )),
+            Some(Banner {
+                severity: BannerSeverity::Warn,
+                text: "no signal — check mic permission / Windows Settings → Privacy → Microphone"
+                    .to_string(),
+            }),
         );
 
         // D. Clipping outranks overruns.
@@ -568,7 +578,10 @@ mod tests {
         };
         assert_eq!(
             pick_banner(None, &clipping_and_overrunning, SourceKind::Mic),
-            Some(Banner::Error("input clipping — reduce gain".to_string())),
+            Some(Banner {
+                severity: BannerSeverity::Warn,
+                text: "input clipping — reduce gain".to_string(),
+            }),
         );
 
         // E. Overruns alone are the lowest-precedence note.
@@ -578,9 +591,10 @@ mod tests {
         };
         assert_eq!(
             pick_banner(None, &overrunning_only, SourceKind::Mic),
-            Some(Banner::Info(
-                "4 buffer overrun(s) — audio briefly dropped".to_string()
-            )),
+            Some(Banner {
+                severity: BannerSeverity::Warn,
+                text: "4 buffer overrun(s) — audio briefly dropped".to_string(),
+            }),
         );
 
         // F. Replay/Simulate suppress the silence banner even when far past

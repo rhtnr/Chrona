@@ -17,8 +17,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrona_audio::{CaptureStream, StreamInfo};
 use chrona_dsp::synth::{SynthConfig, synthesize};
-use chrona_dsp::{Analyzer, AnalyzerConfig, AnalyzerError, BphMode, MetricsSnapshot, TapeEvent};
-use chrona_session::{SessionMeta, SessionReader, SessionWriter};
+use chrona_dsp::{
+    Analyzer, AnalyzerConfig, AnalyzerError, BphMode, MetricsSnapshot, TapeEvent, Tier,
+};
+use chrona_session::{
+    SIDECAR_SCHEMA_VERSION, SessionMeta, SessionReader, SessionSummary, SessionWriter,
+};
 use eframe::egui;
 
 use crate::AppFlags;
@@ -89,6 +93,9 @@ pub enum ControlMsg {
     StartRecording {
         dir: PathBuf,
         meta_position: Option<String>,
+        /// The watch under test (M4a: watch list), stored verbatim into the
+        /// sidecar's `SessionMeta::watch`.
+        watch: Option<String>,
     },
     StopRecording,
     Shutdown,
@@ -126,6 +133,28 @@ pub struct HealthView {
     pub last_error: Option<String>,
 }
 
+/// How urgently a [`Banner`] should read (spec §4). `Info` for notices that
+/// don't need alarm styling (e.g. "recording stopped: source changed",
+/// replay's "using recorded settings…"), `Warn` for recoverable/degraded-
+/// but-continuing conditions (every banner `pick_banner` derives from
+/// `HealthView` — mic error, silence, clipping, overruns — plus "saved
+/// input device unavailable … using default input"), `Error` for genuine
+/// failures/faults (every `failed to *` / `invalid *` string, and the
+/// thread-panic banner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+/// A ready-to-render banner: severity plus its already-formatted text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Banner {
+    pub severity: BannerSeverity,
+    pub text: String,
+}
+
 /// Everything the UI thread needs to render one frame, published by the
 /// engine thread over a `triple_buffer` at ~10 Hz. Cheap to clone (small
 /// `Copy` metrics plus a tape `Vec` that's bounded to ~32 s of events by
@@ -139,7 +168,7 @@ pub struct EngineSnapshot {
     pub replay_done: bool,
     pub health: HealthView,
     pub recording: Option<PathBuf>,
-    pub error_banner: Option<String>,
+    pub banner: Option<Banner>,
 }
 
 // ---------------------------------------------------------------------
@@ -220,7 +249,10 @@ impl Engine {
                     let detail = panic_payload_message(&payload);
                     eprintln!("chrona engine thread panicked: {detail}");
                     buf_input.write(EngineSnapshot {
-                        error_banner: Some(format!("analysis thread fault: {detail}")),
+                        banner: Some(Banner {
+                            severity: BannerSeverity::Error,
+                            text: format!("analysis thread fault: {detail}"),
+                        }),
                         ..last_snapshot
                     });
                     if let Some(ctx) = &egui_ctx {
@@ -519,6 +551,50 @@ fn bph_mode_to_string(mode: BphMode) -> String {
     }
 }
 
+/// Maps a live `MetricsSnapshot` into the sidecar's stop-time
+/// `SessionSummary` (M4a). `duration_s` is always left at `0.0` here — see
+/// `stop_summary`'s doc comment for why.
+fn summary_from(m: &MetricsSnapshot) -> SessionSummary {
+    let tier = match m.tier {
+        Tier::T1 => "T1",
+        Tier::T2 => "T2",
+        Tier::T3 => "T3",
+    };
+    SessionSummary {
+        tier: tier.to_string(),
+        rate_s_per_day: m.rate_s_per_day,
+        beat_error_ms: m.beat_error_ms,
+        amplitude_deg: m.amplitude_deg,
+        bph_detected: Some(m.bph_detected),
+        duration_s: 0.0,
+    }
+}
+
+/// Builds the `SessionSummary` every finalized recording gets (M4a: engine-
+/// owned invariant — every writer that stops, however it stopped
+/// (StopRecording, an auto-finalize on SwitchSource/StartRecording, or
+/// Shutdown), gets a summary; the UI never has to remember to ask for one).
+/// `last_metrics` is the engine's most recently published `MetricsSnapshot`
+/// — independent of any one recording, so a session that ends before the
+/// analyzer ever locks reports tier `"none"` with every metric absent,
+/// rather than omitting the summary altogether. `duration_s` is always left
+/// at `0.0` here — `SessionWriter::finalize_with` (chrona-session T2)
+/// overwrites it from the actual recorded sample count, never trusted from
+/// the caller.
+fn stop_summary(last_metrics: &Option<MetricsSnapshot>) -> SessionSummary {
+    match last_metrics {
+        Some(m) => summary_from(m),
+        None => SessionSummary {
+            tier: "none".to_string(),
+            rate_s_per_day: None,
+            beat_error_ms: None,
+            amplitude_deg: None,
+            bph_detected: None,
+            duration_s: 0.0,
+        },
+    }
+}
+
 /// Parses a sidecar's `bph_mode` string (`"auto"`, `"free"`, or a numeric
 /// BPH — `bph_mode_to_string`'s inverse) into a `BphMode`. Mirrors
 /// `chrona_session::replay`'s own `parse_bph_mode` (itself mirroring the
@@ -548,7 +624,7 @@ fn apply_config(
     config: &mut EngineConfig,
     analyzer: &mut Analyzer,
     sample_rate_hz: f64,
-    error_banner: &mut Option<String>,
+    banner: &mut Option<Banner>,
     mutate: impl FnOnce(&mut EngineConfig),
 ) {
     let mut candidate = *config;
@@ -557,9 +633,14 @@ fn apply_config(
         Ok(a) => {
             *config = candidate;
             *analyzer = a;
-            *error_banner = None;
+            *banner = None;
         }
-        Err(e) => *error_banner = Some(format!("invalid config: {e}")),
+        Err(e) => {
+            *banner = Some(Banner {
+                severity: BannerSeverity::Error,
+                text: format!("invalid config: {e}"),
+            })
+        }
     }
 }
 
@@ -675,10 +756,13 @@ fn engine_loop(
     // comment. No initializer: the match below either assigns it (`Ok`) or
     // diverges (`Err` returns), so every path past it is initialized —
     // an eager `= None` here would just be dead-and-overwritten.
-    let mut error_banner: Option<String>;
+    let mut banner: Option<Banner>;
     let mut source = match SourceRuntime::build(&initial, &mut config) {
         Ok((s, info)) => {
-            error_banner = info;
+            banner = info.map(|text| Banner {
+                severity: BannerSeverity::Info,
+                text,
+            });
             s
         }
         Err(e) => {
@@ -694,9 +778,12 @@ fn engine_loop(
             if matches!(initial, SourceSpec::Mic { device_id: Some(_) }) {
                 match SourceRuntime::build(&SourceSpec::Mic { device_id: None }, &mut config) {
                     Ok((s, _info)) => {
-                        error_banner = Some(format!(
-                            "saved input device unavailable ({e}) — using default input"
-                        ));
+                        banner = Some(Banner {
+                            severity: BannerSeverity::Warn,
+                            text: format!(
+                                "saved input device unavailable ({e}) — using default input"
+                            ),
+                        });
                         s
                     }
                     Err(e2) => {
@@ -705,9 +792,12 @@ fn engine_loop(
                             last_snapshot,
                             &egui_ctx,
                             EngineSnapshot {
-                                error_banner: Some(format!(
-                                    "failed to start: {e}; default input also failed: {e2}"
-                                )),
+                                banner: Some(Banner {
+                                    severity: BannerSeverity::Error,
+                                    text: format!(
+                                        "failed to start: {e}; default input also failed: {e2}"
+                                    ),
+                                }),
                                 ..Default::default()
                             },
                         );
@@ -724,7 +814,10 @@ fn engine_loop(
                     last_snapshot,
                     &egui_ctx,
                     EngineSnapshot {
-                        error_banner: Some(format!("failed to start: {e}")),
+                        banner: Some(Banner {
+                            severity: BannerSeverity::Error,
+                            text: format!("failed to start: {e}"),
+                        }),
                         ..Default::default()
                     },
                 );
@@ -740,7 +833,10 @@ fn engine_loop(
                 last_snapshot,
                 &egui_ctx,
                 EngineSnapshot {
-                    error_banner: Some(format!("invalid initial config: {e}")),
+                    banner: Some(Banner {
+                        severity: BannerSeverity::Error,
+                        text: format!("invalid initial config: {e}"),
+                    }),
                     ..Default::default()
                 },
             );
@@ -751,6 +847,12 @@ fn engine_loop(
     let mut writer: Option<SessionWriter> = None;
     let mut recording_path: Option<PathBuf> = None;
     let mut silence = SilenceTracker::default();
+    // Mirrors the most recently published `MetricsSnapshot` (updated
+    // alongside every publish below), independent of any one recording —
+    // this is what every finalize path (`stop_summary`) summarizes at the
+    // moment it fires. `None` until the analyzer has ever detected a
+    // signal.
+    let mut last_metrics: Option<MetricsSnapshot> = None;
     let mut tick: u32 = 0;
     // I2: pull_tick/publish are gated on real elapsed time (non-turbo) so a
     // burst of control messages (e.g. a T9 slider drag, which can fire many
@@ -791,7 +893,7 @@ fn engine_loop(
             match msg {
                 ControlMsg::Shutdown => {
                     if let Some(w) = writer.take() {
-                        let _ = w.finalize();
+                        let _ = w.finalize_with(Some(stop_summary(&last_metrics)));
                     }
                     break 'outer;
                 }
@@ -799,28 +901,28 @@ fn engine_loop(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
-                    &mut error_banner,
+                    &mut banner,
                     |c| c.lift_angle_deg = v,
                 ),
                 ControlMsg::SetAveraging(v) => apply_config(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
-                    &mut error_banner,
+                    &mut banner,
                     |c| c.averaging_s = v,
                 ),
                 ControlMsg::SetBphMode(m) => apply_config(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
-                    &mut error_banner,
+                    &mut banner,
                     |c| c.bph_mode = m,
                 ),
                 ControlMsg::SetPpm(v) => apply_config(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
-                    &mut error_banner,
+                    &mut banner,
                     |c| c.ppm_correction = v,
                 ),
                 ControlMsg::SwitchSource(spec) => match SourceRuntime::build(&spec, &mut config) {
@@ -845,31 +947,53 @@ fn engine_loop(
                                 // restored settings here instead of a bare
                                 // `None`.
                                 if let Some(w) = writer.take() {
-                                    let _ = w.finalize();
+                                    let _ = w.finalize_with(Some(stop_summary(&last_metrics)));
                                     recording_path = None;
-                                    error_banner =
-                                        Some("recording stopped: source changed".to_string());
+                                    banner = Some(Banner {
+                                        severity: BannerSeverity::Info,
+                                        text: "recording stopped: source changed".to_string(),
+                                    });
                                 } else {
-                                    error_banner = info;
+                                    banner = info.map(|text| Banner {
+                                        severity: BannerSeverity::Info,
+                                        text,
+                                    });
                                 }
                             }
                             Err(e) => {
-                                error_banner = Some(format!("invalid config for new source: {e}"))
+                                banner = Some(Banner {
+                                    severity: BannerSeverity::Error,
+                                    text: format!("invalid config for new source: {e}"),
+                                })
                             }
                         }
                     }
-                    Err(e) => error_banner = Some(format!("failed to switch source: {e}")),
+                    Err(e) => {
+                        banner = Some(Banner {
+                            severity: BannerSeverity::Error,
+                            text: format!("failed to switch source: {e}"),
+                        })
+                    }
                 },
-                ControlMsg::StartRecording { dir, meta_position } => {
+                ControlMsg::StartRecording {
+                    dir,
+                    meta_position,
+                    watch,
+                } => {
                     if let Some(w) = writer.take() {
-                        let _ = w.finalize();
+                        let _ = w.finalize_with(Some(stop_summary(&last_metrics)));
                     }
                     let started_unix_s = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     let meta = SessionMeta {
-                        schema_version: 1,
+                        // Inert: `write_sidecar` (chrona-session) stamps
+                        // every on-disk sidecar with `SIDECAR_SCHEMA_VERSION`
+                        // unconditionally, regardless of what this literal
+                        // carries — set to the real constant anyway so this
+                        // in-memory value is never a lie in its own right.
+                        schema_version: SIDECAR_SCHEMA_VERSION,
                         device_name: source.device_name(),
                         sample_rate_hz: source.sample_rate_hz(),
                         ppm_correction: config.ppm_correction,
@@ -878,7 +1002,7 @@ fn engine_loop(
                         position: meta_position,
                         started_unix_s,
                         app_version: env!("CARGO_PKG_VERSION").to_string(),
-                        watch: None,
+                        watch,
                         summary: None,
                     };
                     let path = dir.join(format!(
@@ -889,7 +1013,7 @@ fn engine_loop(
                         Ok(w) => {
                             writer = Some(w);
                             recording_path = Some(path);
-                            error_banner = None;
+                            banner = None;
                         }
                         Err(e) => {
                             // A failed start while already recording would
@@ -899,15 +1023,21 @@ fn engine_loop(
                             // writer, but this branch never overwrote the
                             // old `recording_path`.
                             recording_path = None;
-                            error_banner = Some(format!("failed to start recording: {e}"));
+                            banner = Some(Banner {
+                                severity: BannerSeverity::Error,
+                                text: format!("failed to start recording: {e}"),
+                            });
                         }
                     }
                 }
                 ControlMsg::StopRecording => {
                     if let Some(w) = writer.take()
-                        && let Err(e) = w.finalize()
+                        && let Err(e) = w.finalize_with(Some(stop_summary(&last_metrics)))
                     {
-                        error_banner = Some(format!("failed to finalize recording: {e}"));
+                        banner = Some(Banner {
+                            severity: BannerSeverity::Error,
+                            text: format!("failed to finalize recording: {e}"),
+                        });
                     }
                     recording_path = None;
                 }
@@ -928,6 +1058,7 @@ fn engine_loop(
             tick += 1;
             if tick.is_multiple_of(SNAPSHOT_EVERY) {
                 let metrics = analyzer.current_metrics();
+                last_metrics = metrics;
                 let tape = analyzer.tape_events();
                 let health = HealthView {
                     overruns: match &source {
@@ -953,7 +1084,7 @@ fn engine_loop(
                         replay_done: source.replay_done(),
                         health,
                         recording: recording_path.clone(),
-                        error_banner: error_banner.clone(),
+                        banner: banner.clone(),
                     },
                 );
             }

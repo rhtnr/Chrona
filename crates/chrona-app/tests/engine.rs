@@ -134,7 +134,7 @@ fn non_turbo_pacing_survives_a_control_message_burst() {
     let snap = eng.snapshot();
     assert!(matches!(snap.source_kind, SourceKind::Simulate));
     assert!(
-        snap.error_banner.is_some(),
+        snap.banner.is_some(),
         "invalid SetAveraging never surfaced — burst wasn't drained/published"
     );
     drop(eng); // Shutdown + join must complete (test would hang otherwise)
@@ -170,6 +170,7 @@ fn start_recording_failure_clears_stale_recording_path() {
     eng.send(ControlMsg::StartRecording {
         dir: dir.path().to_path_buf(),
         meta_position: None,
+        watch: None,
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -188,14 +189,15 @@ fn start_recording_failure_clears_stale_recording_path() {
     eng.send(ControlMsg::StartRecording {
         dir: not_a_dir,
         meta_position: None,
+        watch: None,
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let snap = loop {
         let s = eng.snapshot();
-        if s.error_banner
-            .as_deref()
-            .is_some_and(|m| m.contains("failed to start recording"))
+        if s.banner
+            .as_ref()
+            .is_some_and(|b| b.text.contains("failed to start recording"))
         {
             break s;
         }
@@ -205,6 +207,9 @@ fn start_recording_failure_clears_stale_recording_path() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    let b = snap.banner.as_ref().expect("banner present");
+    assert_eq!(b.severity, BannerSeverity::Error);
+    assert!(b.text.contains("failed to start recording"));
     assert!(
         snap.recording.is_none(),
         "a failed StartRecording while already recording must clear recording_path, \
@@ -273,9 +278,99 @@ fn switch_to_replay_with_sidecar_surfaces_settings_banner() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    let b = snap.banner.as_ref().expect("banner present");
+    assert_eq!(b.severity, BannerSeverity::Info);
     assert_eq!(
-        snap.error_banner.as_deref(),
-        Some("replay: using recorded settings (lift 40.0°, ppm 3.0)")
+        b.text,
+        "replay: using recorded settings (lift 40.0°, ppm 3.0)"
     );
+    drop(eng); // Shutdown + join must complete (test would hang otherwise)
+}
+
+#[test]
+fn stop_recording_writes_summary_sidecar() {
+    // T3: `StartRecording` carries `watch` through to the sidecar, and
+    // `StopRecording` writes a stop-time `SessionSummary` (tier + headline
+    // metrics, from the engine's last-published `MetricsSnapshot`) into it.
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    // Wait for Tier 3 so `last_metrics` has something real to summarize.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if eng
+            .snapshot()
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.tier == chrona_dsp::Tier::T3)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never reached Tier 3");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    eng.send(ControlMsg::StartRecording {
+        dir: dir.path().to_path_buf(),
+        meta_position: None,
+        watch: Some("Test Watch".to_string()),
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let wav_path = loop {
+        if let Some(path) = eng.snapshot().recording {
+            break path;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "StartRecording never took"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    // >= 1 s of (turbo-paced, so far more than 1 simulated second's worth
+    // of) audio actually recorded before stopping.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    eng.send(ControlMsg::StopRecording);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if eng.snapshot().recording.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "StopRecording never took"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let meta = chrona_session::sidecar::read_meta(&wav_path).expect("sidecar present");
+    assert_eq!(meta.watch.as_deref(), Some("Test Watch"));
+    let summary = meta.summary.expect("summary present");
+    assert_eq!(summary.tier, "T3");
+    let rate = summary
+        .rate_s_per_day
+        .expect("rate_s_per_day present at T3");
+    assert!(
+        (rate - 12.0).abs() < 1.0,
+        "rate_s_per_day should be within 1.0 of 12.0, got {rate}"
+    );
+    assert!(summary.duration_s > 0.0);
     drop(eng); // Shutdown + join must complete (test would hang otherwise)
 }
