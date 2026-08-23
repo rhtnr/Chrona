@@ -13,9 +13,11 @@ use crate::presenter::{
     tier_label,
 };
 
-/// Tape display knobs T9's controls row owns; `instrument_view` only reads
-/// them each frame (the `&mut` in its signature is so T9 can mutate this
-/// same value from its own widgets earlier in the frame).
+/// Tape display knobs. `instrument_view` owns `wrap_ms` outright — its own
+/// wrap selector (in `tape_panel`, below) is the only thing that mutates
+/// it; the `&mut` in `instrument_view`'s signature is for that selector,
+/// not for some other panel elsewhere in the frame. `max_beats` has no UI
+/// control at all in M3 and stays fixed at the floor documented below.
 #[derive(Debug, Clone, Copy)]
 pub struct TapeUiState {
     /// Full display height, in milliseconds of deviation (e.g. `10.0` ⇒ the
@@ -45,6 +47,14 @@ const TIC_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 200, 60);
 /// Toc dot color.
 const TOC_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 255);
 
+/// Wrap (y-scale) presets, full display height in ms. ±1 / ±2 / ±5 ms.
+pub const WRAP_PRESETS: [f64; 3] = [2.0, 4.0, 10.0];
+
+/// "±1 ms" / "±2 ms" / "±5 ms" — label for a wrap preset.
+pub fn wrap_label(wrap_ms: f64) -> String {
+    format!("±{} ms", (wrap_ms / 2.0).round() as i64)
+}
+
 /// Maps a normalized [`TapeDot`] into screen space inside `rect`.
 /// `beat_x` runs left→right; `dev_y` runs **up** for a positive (fast)
 /// deviation — the Watch-O-Scope convention (spec §6) — which is why the
@@ -61,7 +71,26 @@ pub fn dot_to_screen(d: &TapeDot, rect: egui::Rect) -> egui::Pos2 {
 pub fn instrument_view(ui: &mut egui::Ui, snap: &EngineSnapshot, tape_ui: &mut TapeUiState) {
     numerals_strip(ui, snap.metrics.as_ref());
     ui.separator();
+    wrap_selector(ui, tape_ui);
     tape_panel(ui, snap, tape_ui);
+}
+
+/// Slim right-aligned row picking `tape_ui.wrap_ms` among `WRAP_PRESETS`
+/// (spec §6's adjustable y-scale; protocol A.2 exercises it). Sits between
+/// the numerals strip and the tape itself, so it's visible without resizing
+/// the window.
+fn wrap_selector(ui: &mut egui::Ui, tape_ui: &mut TapeUiState) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            egui::ComboBox::from_label("wrap")
+                .selected_text(wrap_label(tape_ui.wrap_ms))
+                .show_ui(ui, |ui| {
+                    for preset in WRAP_PRESETS {
+                        ui.selectable_value(&mut tape_ui.wrap_ms, preset, wrap_label(preset));
+                    }
+                });
+        });
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -323,5 +352,27 @@ mod tests {
             pos.y,
             r.center().y
         );
+    }
+
+    #[test]
+    fn wrap_presets_are_exactly_one_two_five_ms() {
+        assert_eq!(WRAP_PRESETS, [2.0, 4.0, 10.0]);
+        assert!(
+            WRAP_PRESETS.contains(&4.0),
+            "protocol A.2's 'change wrap to ±2 ms' step must be selectable"
+        );
+    }
+
+    #[test]
+    fn wrap_label_formats_each_preset() {
+        assert_eq!(wrap_label(2.0), "±1 ms");
+        assert_eq!(wrap_label(4.0), "±2 ms");
+        assert_eq!(wrap_label(10.0), "±5 ms");
+    }
+
+    #[test]
+    fn tape_ui_state_default_wrap_is_five_ms() {
+        // Pin: protocol A.2 starts at ±5 ms before switching to ±2 ms.
+        assert_eq!(TapeUiState::default().wrap_ms, 10.0);
     }
 }
