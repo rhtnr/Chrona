@@ -96,12 +96,16 @@ position/session strip's right side beside the elapsed timer.
 
 ```rust
 watch: Option<String>,
-recorded_at: Option<String>,      // RFC3339 with local offset, set at finalize
 summary: Option<SessionSummary>,  // last MetricsSnapshot at StopRecording
-// SessionSummary { tier: String ("T0".."T3"), rate_s_per_day: Option<f64>,
-//   beat_error_ms: Option<f64>, amplitude_deg: Option<f64>,
-//   bph_detected: Option<f64>, duration_s: f64 }
+// SessionSummary { tier: String ("none"|"T1"|"T2"|"T3"),
+//   rate_s_per_day: Option<f64>, beat_error_ms: Option<f64>,
+//   amplitude_deg: Option<f64>, bph_detected: Option<f64>, duration_s: f64 }
 ```
+
+(Ordering needs no new field: v1 already stores `started_unix_s`.) The sidecar is
+written at `StartRecording`; the summary only exists at stop, so finalize REWRITES the
+sidecar with `summary` filled in (`SessionWriter::finalize_with(summary)`; the bare
+`finalize()` stays as the `None` case for existing callers).
 
 The summary is *what the instrument showed when the recording stopped* — display-only
 provenance for the history table; replay always recomputes real metrics from audio.
