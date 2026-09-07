@@ -73,6 +73,57 @@ to what's still open from earlier milestones. **M5 planning starts here.**
    differently (more beats/second only raises the off-gate count further above
    quartz's 0.0 floor). Widening the matrix to all 11 would close this without
    changing the threshold itself.
+7. **Doctor capture generation tag.** `ui::doctor`'s `pending_capturing_step` matches an
+   `EngineSnapshot::doctor_capture` arrival against whichever step `DoctorPanel::pending`
+   currently names, not against a per-request identifier — there is none. A fast
+   cancel-one-step-then-run-another sequence, both falling inside one ~100 ms
+   `EngineSnapshot` publish tick, can theoretically have the CANCELLED step's buffer
+   arrive after the NEW step's request is already `pending`, and get misattributed to
+   the new step's analysis instead of silently ignored. `EngineSnapshot::
+   source_generation` (`engine.rs`) already solves an analogous staleness problem for
+   source switches — mirroring that same monotonic-counter shape onto
+   `ControlMsg::DoctorCapture`/`EngineSnapshot::doctor_capture` (a per-request id the
+   panel checks exactly, not just "is some step pending") would close this precisely
+   instead of relying on the ~100 ms window being narrow in practice. See `ui/doctor.rs`'s
+   module doc comment ("Cancel (fix round 1, post-review)") and `pending_capturing_step`.
+8. **Overrun banner always says "1 buffer overrun(s)".** `ui::controls::CountWatermark`
+   (used for both the clip and overrun trackers, `app.rs`'s `clip_tracker`/
+   `overrun_tracker`) returns a 0/1 "is this still current" placeholder, not a real
+   count — but `pick_banner` (`ui/controls.rs`) formats that placeholder straight into
+   `format!("{} buffer overrun(s) — audio briefly dropped", h.overruns)`, so the banner
+   always reads "1 buffer overrun(s)" whenever it shows at all, never the actual
+   windowed delta. Fix: either drop the number from the copy ("buffer overrun(s) —
+   audio briefly dropped") or give `CountWatermark` a real windowed-delta count to
+   return instead of the placeholder.
+9. **Quartz-capture Signal reading stays "listening…" for the whole wizard capture.**
+   `ui::cal_wizard`'s Capturing screen reuses `presenter::signal_meter` for its live
+   signal label, same as the main window — but a quartz watch's 1 Hz tick is below
+   every `AUTO_BPH` floor the signal-tier gates are tuned around, so the reading never
+   leaves "listening…" even during a perfectly healthy 5+ minute capture. Honest (it
+   really can't classify a 1 Hz source as a beat rate), but reads as anxious/stuck to a
+   first-time user watching a static label for 5+ minutes. Fix (M5-shaped): either a
+   wizard-specific sentence acknowledging this is expected for quartz, or a raw RMS
+   level meter instead of the beat-rate-tiered signal label. See `ui/cal_wizard.rs`'s
+   `render_capturing` and `presenter::signal_meter`.
+10. **Doctor staleness hint on CONFIG changes.** `ui::doctor`'s `render_doctor_panel`
+    clears all three step results (plus abandons any pending capture) when
+    `EngineSnapshot::source_generation` changes — a SOURCE switch — but a CONFIG change
+    (e.g. lift angle, BPH mode) while old Doctor results are still displayed neither
+    clears them nor hints that they might now be stale. Recorded plan drift: worth a
+    staleness indicator (or an explicit clear) the same way the source-generation guard
+    already does for source changes. See `ui/doctor.rs`'s `render_doctor_panel` and its
+    `last_source_generation` comparison.
+11. **Replay-sourced calibration attribution.** The calibration wizard's
+    `ControlMsg::StartRecording` (via `WizardAction::StartCapture`) captures from
+    whatever source the engine currently has active — including `Replay`. Replaying a
+    previously recorded quartz WAV through the wizard yields a real, correctly measured
+    ppm, but the Result screen's "Save for <device>" attributes it to whichever
+    physical device is currently selected in the toolbar's device combo, which may not
+    be the device the replayed WAV was actually recorded on. Deliberate off-road use
+    (nothing in the binding spec restricts the wizard to a live mic source), but the
+    attribution is loose enough to be worth a documented caveat or an explicit
+    replay-source warning in the wizard UI. See `ui::cal_wizard`'s `WizardAction::
+    StartCapture` and `render_result`'s `device_label`.
 
 ## Still open from earlier milestones (untouched by M4)
 

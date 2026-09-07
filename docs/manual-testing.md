@@ -87,7 +87,10 @@ Run before tagging any release. Needs: a mechanical watch, a quartz watch, ~15 m
    should reach at least Tier 1. Once ≥ 1 step has run, EXPECT a "Setup score: N/100"
    line plus ranked advice bullets (or "No issues found…" if nothing tripped).
    Switching input device/source clears all three results back to "not run" the next
-   time you open the panel. Close via Close, Esc, or a click outside the card.
+   time you open the panel. Close via Close, Esc, or a click outside the card. While a
+   step is capturing, a standing hint below its row always reads "a source with less
+   audio remaining than the step needs will never finish — Cancel, then try a different
+   source" — that's a permanent reminder, not a fault; don't be surprised by it.
 9. Open the calibration wizard: toolbar's "cal N.N ppm" popup → "Calibrate…". EXPECT an
    intro screen ("clamp any quartz watch…"), then "Start capture" begins a live elapsed
    clock plus a signal reading. The Analyze button stays disabled, with an "Available in
@@ -97,10 +100,11 @@ Run before tagging any release. Needs: a mechanical watch, a quartz watch, ~15 m
    (signed measured ppm, then the fit residual) plus event count and capture duration,
    in the same ballpark as what `chrona calibrate` reports for the same setup. Click
    "Save for <device>": EXPECT the toolbar's ppm to update and the RATE card's
-   "⚠ uncal" pill to disappear. Now re-run the wizard against a MECHANICAL watch
-   instead: EXPECT it to refuse — "Calibration failed" plus advice that this looks like
-   a mechanical watch, not quartz — rather than silently accepting a plausible-looking
-   but bogus ppm.
+   "⚠ uncal" pill to disappear. Quit and relaunch the app: EXPECT the saved ppm to
+   survive and "⚠ uncal" to stay gone (it's persisted to disk on Save, not just applied
+   live). Now re-run the wizard against a MECHANICAL watch instead: EXPECT it to
+   refuse — "Calibration failed" plus advice that this looks like a mechanical watch,
+   not quartz — rather than silently accepting a plausible-looking but bogus ppm.
 
 ## C. Cross-checks
 - `cargo run -p chrona-app -- --simulate --headless-seconds 45` prints TIER 3 metrics and exits 0.
