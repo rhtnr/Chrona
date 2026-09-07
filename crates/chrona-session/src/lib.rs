@@ -5,11 +5,13 @@ pub mod civil;
 pub mod config;
 pub mod reader;
 pub mod replay;
+pub mod sanitize;
 pub mod sidecar;
 pub mod writer;
 
 pub use config::ConfigStore;
 pub use reader::SessionReader;
 pub use replay::{ReplayOverrides, ReplayResult, replay};
+pub use sanitize::{sanitize_lift, sanitize_ppm};
 pub use sidecar::{SIDECAR_SCHEMA_VERSION, SessionMeta, SessionSummary, read_meta};
 pub use writer::SessionWriter;

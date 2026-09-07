@@ -202,20 +202,14 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Config files are hand-editable; TOML has literal `inf`/`nan`. Gate on
 /// finiteness first (f64::clamp propagates NaN), then clamp to the same
 /// ranges the sidecar-restore path enforces (engine.rs).
-fn sanitize_lift(lift: f64) -> f64 {
-    if lift.is_finite() {
-        lift.clamp(10.0, 90.0)
-    } else {
-        52.0
-    }
-}
-fn sanitize_ppm(ppm: f64) -> f64 {
-    if ppm.is_finite() {
-        ppm.clamp(-500.0, 500.0)
-    } else {
-        0.0
-    }
-}
+///
+/// M4 Task 5: the two pure fns this used to define in-crate moved to
+/// `chrona_session::sanitize` (also consumed by `chrona_session::replay`'s
+/// own sidecar handling, and by `engine.rs`'s replay-sidecar clamp) — one
+/// implementation instead of three near-copies. Re-exported here so every
+/// existing call site (and the pinned tests below, via `use super::*`)
+/// keeps compiling unchanged against the moved fns.
+pub use chrona_session::{sanitize_lift, sanitize_ppm};
 
 impl ControlsState {
     /// Seeds initial controls state from a loaded `ConfigStore`: `lift`

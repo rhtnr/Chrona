@@ -24,6 +24,7 @@ use chrona_dsp::{
 };
 use chrona_session::{
     SIDECAR_SCHEMA_VERSION, SessionMeta, SessionReader, SessionSummary, SessionWriter,
+    sanitize_lift, sanitize_ppm,
 };
 use eframe::egui;
 
@@ -399,6 +400,15 @@ impl SourceRuntime {
     /// *config`), so it would keep failing validation — for the *same*
     /// reason — until the user happened to fix the one bad field. Clamping
     /// here means `*config` is always left analyzer-valid.
+    ///
+    /// M4 Task 5: this clamp now calls `chrona_session::{sanitize_lift,
+    /// sanitize_ppm}` — the same fns `chrona_session::replay::replay`'s own
+    /// sidecar handling and `ui::controls::ControlsState::from_config` use
+    /// — instead of hand-rolling the bounds again a third time. This stays
+    /// defense-in-depth alongside those (not a replacement for them): the
+    /// engine's live replay path below doesn't go through
+    /// `chrona_session::replay::replay` at all, so it needs its own clamp
+    /// regardless of what that module does.
     fn build(
         spec: &SourceSpec,
         config: &mut EngineConfig,
@@ -443,28 +453,37 @@ impl SourceRuntime {
                             config.bph_mode = mode;
                         }
                         // Clamped, not applied raw — see this fn's doc
-                        // comment. `f64::clamp` already saturates a
-                        // (finite-but-huge or ±infinite) out-of-domain
-                        // value to the nearest bound; a `NaN` lift can't
-                        // survive the JSON round trip in the first place
-                        // (no JSON literal for it, and serde_json won't
-                        // serialize one), so the bare clamp is sufficient
-                        // here.
-                        let lift = m.lift_angle_deg.clamp(10.0, 90.0);
+                        // comment. `sanitize_lift` clamps a finite
+                        // out-of-domain value to the nearest bound; a `NaN`
+                        // (or, per further checking during Task 5, even a
+                        // huge-exponent overflow-to-±infinity numeral) lift
+                        // can't survive the JSON round trip in the first
+                        // place — `serde_json` rejects an out-of-f64-range
+                        // numeral as a parse error rather than saturating
+                        // it, so `Some(m)` here always already carries a
+                        // finite value — but going through the shared fn
+                        // (rather than a bare `.clamp(10.0, 90.0)`) means
+                        // this stays correct even if that ever changes.
+                        let lift = sanitize_lift(m.lift_angle_deg);
                         config.lift_angle_deg = lift;
                         // ppm has no analyzer-side range (`Analyzer::new`
                         // only requires it finite), so an out-of-[-500,500]
                         // value wouldn't wedge the config the way an
                         // out-of-range lift would — this clamp is UI/sanity
-                        // consistency with `ui::controls::sanitize_ppm`'s
-                        // own range, not a build-safety fix. Non-finite instead
-                        // leaves `config.ppm_correction` untouched (no
-                        // sensible clamp target for it) rather than
-                        // poisoning the live config with a value
-                        // `Analyzer::new`'s dedicated finiteness check would
-                        // reject outright.
+                        // consistency with `sanitize_ppm`'s own range, not a
+                        // build-safety fix. `sanitize_ppm` handles the
+                        // finite (the only reachable, per the lift comment
+                        // above) branch; a non-finite input — unreachable
+                        // via a real sidecar today, but kept for the same
+                        // future-proofing reason as `lift` above — still
+                        // deliberately leaves `config.ppm_correction`
+                        // untouched (no sensible clamp target for it, and
+                        // `sanitize_ppm`'s own non-finite default of 0.0
+                        // would poison the live config with a value the
+                        // user never asked for) rather than delegating that
+                        // branch too.
                         let ppm = if m.ppm_correction.is_finite() {
-                            m.ppm_correction.clamp(-500.0, 500.0)
+                            sanitize_ppm(m.ppm_correction)
                         } else {
                             config.ppm_correction
                         };
