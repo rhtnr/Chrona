@@ -7,6 +7,7 @@
 //! `cards.rs`/`toolbar.rs`/`strip.rs`/`charts.rs`.
 
 use eframe::egui;
+use jiff::{Timestamp, tz::TimeZone};
 
 use crate::engine::{ControlMsg, Engine, SourceSpec};
 use crate::history::{HistoryIndex, POSITIONS, PositionRates, SessionEntry, bar_frac};
@@ -19,20 +20,23 @@ use crate::ui::strip::SessionPanelState;
 // ---------------------------------------------------------------------
 
 /// "HH:MM"[, " · N min"] for one session-history row (mockup: `h.time`).
-/// `HH:MM` is derived from `started_unix_s` via UTC calendar math — no
-/// time-zone database, the same accepted GUI-only approximation of local
-/// time as `presenter::format::day_label` (see its doc comment); not used
-/// for anything honesty-sensitive. `duration_s`, when `Some` (the
+/// `HH:MM` is `started_unix_s` converted to `tz`'s local wall-clock time
+/// (`jiff::Zoned::hour`/`minute`) — real local time, via the injectable
+/// `TimeZone` production resolves once at startup (see `ChronaApp::tz`'s
+/// doc comment), not a UTC approximation. `duration_s`, when `Some` (the
 /// session's finalized summary), is rounded to the nearest minute with a
 /// "1 min" floor — a session that ran under 30s should still read as
 /// "1 min", never a misleadingly-precise "0 min". `None` (no summary yet,
 /// e.g. before the recording finalized) omits the duration suffix
 /// entirely rather than fabricating one.
-pub fn session_time_label(started_unix_s: u64, duration_s: Option<f64>) -> String {
-    let sod = started_unix_s % 86_400; // seconds of day
-    let hh = sod / 3_600;
-    let mm = (sod % 3_600) / 60;
-    let time = format!("{hh:02}:{mm:02}");
+pub fn session_time_label(started_unix_s: u64, duration_s: Option<f64>, tz: &TimeZone) -> String {
+    let zoned = Timestamp::from_second(started_unix_s as i64)
+        .expect(
+            "session timestamps are real wall-clock values, always within \
+             jiff's representable ±9999-year range",
+        )
+        .to_zoned(tz.clone());
+    let time = format!("{:02}:{:02}", zoned.hour(), zoned.minute());
     match duration_s {
         Some(d) => {
             let mins = ((d / 60.0).round() as i64).max(1);
@@ -120,6 +124,12 @@ pub struct BottomGridCtx<'a> {
     /// no-watch-selected case), this module only renders the result.
     pub rates: &'a PositionRates,
     pub selected_position: usize,
+    /// The local timezone (M4 Task 6), resolved once at startup by
+    /// `ChronaApp::new` (`jiff::tz::TimeZone::system()`) and threaded down
+    /// here for the session-history table's HH:MM column
+    /// (`session_time_label`) and the card's day-label header
+    /// (`presenter::day_label`) — see `ChronaApp::tz`'s doc comment.
+    pub tz: &'a TimeZone,
 }
 
 /// Renders the mockup's bottom grid: the Session-history card and the
@@ -129,7 +139,14 @@ pub struct BottomGridCtx<'a> {
 /// metrics_cards`'s 4-card row).
 pub fn bottom_grid(ui: &mut egui::Ui, palette: &Palette, ctx: BottomGridCtx<'_>) {
     ui.columns(2, |cols| {
-        history_card(&mut cols[0], palette, ctx.history, ctx.session, ctx.engine);
+        history_card(
+            &mut cols[0],
+            palette,
+            ctx.history,
+            ctx.session,
+            ctx.engine,
+            ctx.tz,
+        );
         comparison_card(&mut cols[1], palette, ctx.rates, ctx.selected_position);
     });
 }
@@ -177,6 +194,7 @@ fn history_card(
     history: &HistoryIndex,
     session: &mut SessionPanelState,
     engine: &Engine,
+    tz: &TimeZone,
 ) {
     card_frame(ui, palette, |ui| {
         let now = now_unix_s();
@@ -185,7 +203,7 @@ fn history_card(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(newest) = history.entries().first() {
                     ui.label(
-                        egui::RichText::new(day_label(newest.started_unix_s, now))
+                        egui::RichText::new(day_label(newest.started_unix_s, now, tz))
                             .size(11.0)
                             .color(palette.faint),
                     );
@@ -201,7 +219,7 @@ fn history_card(
 
         history_header_row(ui, palette);
         for entry in history.entries().iter().take(HISTORY_ROW_LIMIT) {
-            if history_row(ui, palette, entry).clicked() {
+            if history_row(ui, palette, entry, tz).clicked() {
                 let name = entry
                     .wav_path
                     .file_name()
@@ -332,7 +350,12 @@ fn history_header_row(ui: &mut egui::Ui, palette: &Palette) {
 /// simple/uniform enough not to need bubbling further up to `ChronaApp`,
 /// unlike e.g. `cards::metrics_cards`'s help-topic return (which DOES
 /// need to reach `ChronaApp` to coordinate with the help-modal state).
-fn history_row(ui: &mut egui::Ui, palette: &Palette, entry: &SessionEntry) -> egui::Response {
+fn history_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    entry: &SessionEntry,
+    tz: &TimeZone,
+) -> egui::Response {
     let width = ui.available_width();
     let (response, painter) =
         ui.allocate_painter(egui::vec2(width, HIST_ROW_H), egui::Sense::click());
@@ -385,7 +408,7 @@ fn history_row(ui: &mut egui::Ui, palette: &Palette, entry: &SessionEntry) -> eg
     painter.text(
         egui::pos2(left + cols.time_x, y),
         egui::Align2::LEFT_CENTER,
-        session_time_label(entry.started_unix_s, duration_s),
+        session_time_label(entry.started_unix_s, duration_s, tz),
         muted_prop,
         palette.muted,
     );
@@ -623,13 +646,16 @@ mod tests {
     #[test]
     fn session_time_label_with_and_without_duration() {
         // Same pinned instant chrona_session::civil/export.rs's own tests
-        // use: 1_766_995_200 == 2025-12-29 08:00:00 UTC.
+        // use: 1_766_995_200 == 2025-12-29 08:00:00 UTC. Re-pointed through
+        // an explicit UTC `TimeZone` (M4 Task 6): pins the exact same
+        // literal continuity the old UTC-only implementation had, just via
+        // the injectable-timezone API.
         assert_eq!(
-            session_time_label(1_766_995_200, Some(126.0)),
+            session_time_label(1_766_995_200, Some(126.0), &TimeZone::UTC),
             "08:00 · 2 min"
         );
         assert_eq!(
-            session_time_label(1_766_995_200, None),
+            session_time_label(1_766_995_200, None, &TimeZone::UTC),
             "08:00",
             "no summary yet: duration suffix omitted entirely"
         );
@@ -638,24 +664,38 @@ mod tests {
     #[test]
     fn session_time_label_duration_rounds_with_a_one_minute_floor() {
         assert_eq!(
-            session_time_label(0, Some(10.0)),
+            session_time_label(0, Some(10.0), &TimeZone::UTC),
             "00:00 · 1 min",
             "under 30s floors to 1 min, never 0"
         );
         assert_eq!(
-            session_time_label(0, Some(29.0)),
+            session_time_label(0, Some(29.0), &TimeZone::UTC),
             "00:00 · 1 min",
             "rounds down under 30s"
         );
         assert_eq!(
-            session_time_label(0, Some(31.0)),
+            session_time_label(0, Some(31.0), &TimeZone::UTC),
             "00:00 · 1 min",
             "rounds to nearest, 31s -> 1 min"
         );
         assert_eq!(
-            session_time_label(0, Some(150.0)),
+            session_time_label(0, Some(150.0), &TimeZone::UTC),
             "00:00 · 3 min",
             "150s / 60 = 2.5 rounds up to 3"
+        );
+    }
+
+    #[test]
+    fn session_time_label_uses_the_injected_timezones_local_wall_clock() {
+        // 86_400*20_000 + 9*3600 == 1_728_032_400 == 2024-10-04T09:00:00Z
+        // (verified: `date -j -u -r 1728032400`). Asia/Kolkata has held a
+        // fixed UTC+05:30 offset with no DST since 1945, so 09:00 UTC ->
+        // 14:30 IST on the same local calendar day, regardless of exactly
+        // which date this is.
+        let tz = TimeZone::get("Asia/Kolkata").expect("Asia/Kolkata is a valid IANA zone");
+        assert_eq!(
+            session_time_label(86_400 * 20_000 + 9 * 3600, Some(126.0), &tz),
+            "14:30 · 2 min"
         );
     }
 

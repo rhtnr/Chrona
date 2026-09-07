@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrona_session::ConfigStore;
 use eframe::egui;
+use jiff::tz::TimeZone;
 
 use crate::AppFlags;
 use crate::engine::{BannerSeverity, ControlMsg, Engine, EngineConfig, HealthView, SourceSpec};
@@ -54,6 +55,20 @@ pub struct ChronaApp {
     /// immediately (not the debounced save the continuous-drag controls
     /// use).
     theme: Theme,
+    /// The OS local timezone (M4 Task 6), resolved ONCE here at startup via
+    /// `jiff::tz::TimeZone::system()` — re-resolving per frame would be
+    /// wasted work for a value that practically never changes mid-session.
+    /// `TimeZone::system()` itself never fails: on a lookup error it falls
+    /// back to `Etc/Unknown`, which behaves like UTC (jiff's own doc
+    /// comment), so this field is always well-formed. An OS timezone
+    /// change while the app keeps running (laptop travel, a manual
+    /// clock-panel edit) is explicitly OUT OF SCOPE and won't be picked up
+    /// until restart. Threaded into `ui::history_ui::bottom_grid`
+    /// (`BottomGridCtx::tz`) for the session-history table's HH:MM column
+    /// (`ui::history_ui::session_time_label`) and the card's day-label
+    /// header (`presenter::day_label`) — the only two places `chrona-app`
+    /// renders a wall-clock time.
+    tz: TimeZone,
     /// M4a beat-trace accumulators (design spec §10/§11): fed from every
     /// snapshot, spanning up to `presenter::HORIZON_S` rather than the
     /// analyzer's own ~32 s ring. Read each frame by
@@ -147,6 +162,10 @@ impl ChronaApp {
         let theme = theme::theme_from_config(config.theme.as_deref());
         theme::install_fonts(&cc.egui_ctx);
         theme::apply_style(&cc.egui_ctx, theme);
+        // M4 Task 6: resolved once here, not re-resolved per frame — see
+        // the `tz` field's own doc comment for why, and for what "out of
+        // scope" covers.
+        let tz = TimeZone::system();
 
         let initial = if flags.simulate {
             SourceSpec::Simulate {
@@ -179,6 +198,7 @@ impl ChronaApp {
             controls,
             config,
             theme,
+            tz,
             beat_accum: BeatAccum::default(),
             amp_accum: AmpAccum::default(),
             trace_view: TraceView::default(),
@@ -477,6 +497,7 @@ impl eframe::App for ChronaApp {
                             engine: &self.engine,
                             rates: &rates,
                             selected_position: self.selected_position,
+                            tz: &self.tz,
                         },
                     );
                 });

@@ -15,6 +15,23 @@ rfd = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 directories = { workspace = true }
+# M4 Task 6 (local-time history display): `tzdb-bundle-always` forces the
+# `jiff-tzdb` crate in unconditionally, on every target. jiff's OWN default
+# feature set does NOT bundle a tzdb on Unix-like platforms: `tzdb-bundle-
+# platform` (on by default) only pulls in `jiff-tzdb-platform` under
+# `cfg(any(windows, target_family = "wasm"))` per jiff's own Cargo.toml;
+# elsewhere (macOS/Linux) the defaults instead lean entirely on
+# `tzdb-zoneinfo` reading `/usr/share/zoneinfo` from the OS at runtime.
+# Verified with `cargo tree -p chrona-app -e features -i jiff-tzdb` / `-i
+# jiff-tzdb-platform` on this (macOS) host: with only jiff's defaults,
+# NEITHER shows up in the resolved tree at all — i.e. the defaults alone
+# would leave a CI runner without zoneinfo installed unable to resolve any
+# IANA zone. `tzdb-bundle-always` embeds the full IANA database in the
+# binary regardless of platform, closing that gap; `tzdb-zoneinfo` (still
+# on, default) keeps taking priority over the bundled copy whenever the OS
+# copy exists (jiff's own doc comment), so a live desktop install still
+# benefits from a fresher OS-supplied tzdata.
+jiff = { version = "0.2.35", features = ["tzdb-bundle-always"] }
 
 [dev-dependencies]
 assert_cmd = "2"

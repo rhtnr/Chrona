@@ -4,6 +4,7 @@
 //! docs).
 
 use chrona_dsp::{AmplitudeGateFail, RateSource, Tier};
+use jiff::{Timestamp, Unit, civil::Date, tz::TimeZone};
 
 /// `"+12.3 s/d"`; an uncalibrated-clock warning is appended when
 /// `calibrated` is false, and `None` (no rate to attribute) renders as an
@@ -86,42 +87,43 @@ pub fn format_bph_grouped(bph: f64) -> String {
     }
 }
 
-/// Local re-implementation of `chrona_session::civil`'s day math (Howard
-/// Hinnant's `civil_from_days`, <https://howardhinnant.github.io/date_algorithms.html>)
-/// — kept dependency-free rather than reaching across the crate boundary
-/// for a private helper (`day_label` only ever needs the read side).
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
-
 /// `"Today"` / `"Yesterday"` / `"YYYY-MM-DD"` for a session-history row
 /// timestamp relative to now (design spec §7 — the history table's
-/// newest-entry-day header). Both timestamps are bucketed into UTC
-/// calendar days (`unix_secs / 86_400`); a viewer west of UTC can see an
-/// entry from a few hours ago labeled "Yesterday" a little early relative
-/// to their own clock — an accepted, GUI-only approximation (spec
-/// §10/§14), not used for anything honesty-sensitive.
-pub fn day_label(entry_unix: u64, now_unix: u64) -> String {
-    let entry_days = (entry_unix / 86_400) as i64;
-    let now_days = (now_unix / 86_400) as i64;
-    match now_days - entry_days {
+/// newest-entry-day header). Both timestamps are bucketed into `tz`'s
+/// LOCAL calendar days (`jiff::Zoned::date`, via `local_date` below) —
+/// NOT raw 86_400-second UTC buckets — so "Today"/"Yesterday" flip at the
+/// viewer's own local midnight, matching their wall clock (M4 Task 6; see
+/// `ChronaApp::tz`'s doc comment for where `tz` comes from in production).
+pub fn day_label(entry_unix: u64, now_unix: u64, tz: &TimeZone) -> String {
+    let entry_date = local_date(entry_unix, tz);
+    let now_date = local_date(now_unix, tz);
+    let days = now_date
+        .since((Unit::Day, entry_date))
+        .expect("civil Date::since(Unit::Day) never fails for two in-range dates")
+        .get_days();
+    match days {
         0 => "Today".to_string(),
         1 => "Yesterday".to_string(),
-        _ => {
-            let (y, m, d) = civil_from_days(entry_days);
-            format!("{y:04}-{m:02}-{d:02}")
-        }
+        _ => format!(
+            "{:04}-{:02}-{:02}",
+            entry_date.year(),
+            entry_date.month(),
+            entry_date.day()
+        ),
     }
+}
+
+/// `unix_s` converted to `tz`'s local calendar date — the shared
+/// conversion `day_label`'s two timestamps both go through, so they
+/// bucket by the exact same local-midnight boundary.
+fn local_date(unix_s: u64, tz: &TimeZone) -> Date {
+    Timestamp::from_second(unix_s as i64)
+        .expect(
+            "session/now timestamps are real wall-clock values, always within \
+             jiff's representable ±9999-year range",
+        )
+        .to_zoned(tz.clone())
+        .date()
 }
 
 #[cfg(test)]
@@ -155,19 +157,45 @@ mod tests {
         assert_eq!(format_bph_grouped(9_000.0), "9\u{2009}000");
         assert_eq!(format_bph_grouped(108_000.0), "108\u{2009}000");
         let now = 1_700_000_000u64;
-        assert_eq!(day_label(now, now), "Today");
+        assert_eq!(day_label(now, now, &TimeZone::UTC), "Today");
     }
 
     #[test]
     fn day_label_yesterday_and_older_dates() {
-        assert_eq!(day_label(0, 0), "Today");
-        assert_eq!(day_label(0, 86_400), "Yesterday");
-        assert_eq!(day_label(0, 172_800), "1970-01-01");
+        // Re-pointed through an explicit UTC `TimeZone` (M4 Task 6): pins
+        // the exact same literal continuity the old UTC-only
+        // implementation had, just via the injectable-timezone API.
+        assert_eq!(day_label(0, 0, &TimeZone::UTC), "Today");
+        assert_eq!(day_label(0, 86_400, &TimeZone::UTC), "Yesterday");
+        assert_eq!(day_label(0, 172_800, &TimeZone::UTC), "1970-01-01");
         // Known reference date (also pinned in chrona_session::civil's own
         // tests): 1_766_995_200 is 2025-12-29 UTC.
         assert_eq!(
-            day_label(1_766_995_200, 1_766_995_200 + 5 * 86_400),
+            day_label(1_766_995_200, 1_766_995_200 + 5 * 86_400, &TimeZone::UTC),
             "2025-12-29"
         );
+    }
+
+    #[test]
+    fn day_label_buckets_by_the_local_calendar_day_not_utc() {
+        // entry = 2025-12-31T20:00:00Z = 1_767_211_200
+        // now   = 2026-01-01T00:30:00Z = 1_767_227_400
+        // (both verified with `date -j -u -f "%Y-%m-%dT%H:%M:%SZ" ... +%s`;
+        // now - entry == 16_200s == 4h30m, i.e. 20:00 + 4:30 == 00:30 the
+        // next UTC day, so the two literals are mutually consistent.)
+        //
+        // UTC-bucketed (the old implementation this replaces): entry's UTC
+        // calendar day is Dec 31, now's is Jan 1 -> a 1-day gap ->
+        // "Yesterday".
+        //
+        // Asia/Kolkata is a fixed UTC+05:30 offset (no DST since 1945):
+        // entry's local time is 20:00 + 5:30 = 25:30 -> 01:30 IST on Jan 1;
+        // now's local time is 00:30 + 5:30 = 06:00 IST, also Jan 1. Both
+        // land on the SAME local calendar day, so the correct LOCAL answer
+        // is "Today" — the exact UTC-vs-local flip this task fixes.
+        let entry_unix = 1_767_211_200; // 2025-12-31T20:00:00Z
+        let now_unix = 1_767_227_400; // 2026-01-01T00:30:00Z
+        let tz = TimeZone::get("Asia/Kolkata").expect("Asia/Kolkata is a valid IANA zone");
+        assert_eq!(day_label(entry_unix, now_unix, &tz), "Today");
     }
 }
