@@ -34,7 +34,7 @@ use crate::presenter::{SignalClass, signal_meter};
 use crate::theme::{self, Palette};
 use crate::ui::controls::{ControlsState, current_device_name};
 use crate::ui::strip::rec_elapsed_label;
-use crate::ui::toolbar::apply_and_persist_ppm;
+use crate::ui::toolbar::{apply_and_persist_ppm, persist_config_now};
 
 /// Minimum capture length `chrona_dsp::cal::calibrate_quartz` accepts.
 /// Mirrors that module's own private `MIN_SECONDS` constant — duplicated
@@ -48,6 +48,18 @@ const MIN_CAPTURE_S: f64 = 300.0;
 /// worst case.
 const OPEN_RETRY_ATTEMPTS: u32 = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How long Phase 1 waits for `EngineSnapshot::recording` to confirm a
+/// `StartCapture` before giving up and surfacing an honest failure, rather
+/// than silently counting down a full 5-minute capture against a recording
+/// that never actually started (final-review IMPORTANT-2: e.g.
+/// `ControlMsg::StartRecording` was refused because the input source was
+/// idle, or the engine thread never got a chance to publish a confirming
+/// snapshot). The engine's own snapshot-publish latency is ~100 ms (see
+/// `CalWizard::Capturing`'s doc comment) — 3 s is a 30x margin over that,
+/// comfortably longer than any normal confirm but far short of making a
+/// stuck wizard indistinguishable from a slow one.
+const CAPTURE_CONFIRM_GRACE_S: f64 = 3.0;
 
 // ---------------------------------------------------------------------
 // Pure helpers — TDD'd in `tests` below.
@@ -96,6 +108,40 @@ pub fn min_capture_remaining(started: Instant, now: Instant) -> Option<Duration>
     } else {
         Some(min - elapsed)
     }
+}
+
+/// Whether Phase 1 should confirm `candidate` (`EngineSnapshot::recording`,
+/// borrowed via `.as_deref()`) as THIS wizard capture's own file, rather
+/// than some other in-flight recording that merely happens to be visible in
+/// the same snapshot tick. Closes the stale-snapshot race final review
+/// found (CRITICAL-1): `EngineSnapshot` publishes on a fixed tick, up to
+/// ~100 ms behind any single `ControlMsg`, so the FIRST `Some(path)` seen
+/// after `StartCapture` isn't guaranteed to be the wizard's own — if the
+/// user already had a SESSION recording running (or starts one in that same
+/// window), that recording's path could be confirmed instead, wrapped in
+/// `TempCaptureGuard`, and DELETED on wizard exit. A session recording is
+/// always written to the user's configured recordings directory, never to
+/// `dir` (the wizard's own `std::env::temp_dir().join(TEMP_CAPTURE_SUBDIR)`
+/// — see `WizardAction::StartCapture`), so confirming only a path inside
+/// `dir` closes the race: a foreign path is simply ignored, and Phase 1
+/// keeps waiting for the real one. `None` (no snapshot yet) is also
+/// rejected — nothing to confirm. Uses `Path::starts_with`, which compares
+/// whole path COMPONENTS, not a raw string prefix, so a sibling directory
+/// that merely shares `dir`'s string prefix is correctly rejected too.
+/// PURE.
+pub fn accepts_capture_path(dir: &Path, candidate: Option<&Path>) -> bool {
+    candidate.is_some_and(|p| p.starts_with(dir))
+}
+
+/// Whether Phase 1 should give up waiting for a `StartCapture` to be
+/// confirmed by a snapshot: true once `elapsed` (time since `Capturing`'s
+/// `started`) has passed `CAPTURE_CONFIRM_GRACE_S` with no path confirmed
+/// yet. `path_confirmed` makes a successful (if slow) confirm immune to a
+/// LATER timeout check — once the wizard's own capture path is known, the
+/// capture is real and counting down toward `min_capture_remaining`
+/// normally, however long the confirm itself took. PURE.
+pub fn capture_confirm_timed_out(elapsed: Duration, path_confirmed: bool) -> bool {
+    !path_confirmed && elapsed.as_secs_f64() >= CAPTURE_CONFIRM_GRACE_S
 }
 
 /// Reads `path`'s WAV (via `chrona_session::SessionReader`) and runs
@@ -148,13 +194,36 @@ pub enum CalWizard {
     /// What/why + "Start capture".
     Intro,
     /// Recording via the engine's existing tee into a temp WAV. `started`
-    /// is when the capture began (drives the elapsed clock and the
-    /// `min_capture_remaining` countdown); `path` is the temp WAV's path —
-    /// empty until `render_cal_wizard` fills it in from
-    /// `EngineSnapshot::recording` once the engine confirms it. It can't be
-    /// predicted client-side instead (the engine timestamps the filename
-    /// itself, from its own thread, when it processes `StartRecording`).
-    Capturing { started: Instant, path: PathBuf },
+    /// is when the capture began (drives the elapsed clock, the
+    /// `min_capture_remaining` countdown, and the `CAPTURE_CONFIRM_GRACE_S`
+    /// give-up timer); `path` is the temp WAV's path — empty until
+    /// `render_cal_wizard` fills it in from `EngineSnapshot::recording` once
+    /// the engine confirms it. It can't be predicted client-side instead
+    /// (the engine timestamps the filename itself, from its own thread,
+    /// when it processes `StartRecording`).
+    ///
+    /// `dir` is the capture directory `WizardAction::StartCapture` computed
+    /// (`std::env::temp_dir().join(TEMP_CAPTURE_SUBDIR)`), carried alongside
+    /// `path` so Phase 1 can guard against a race final review caught
+    /// (CRITICAL-1): `EngineSnapshot` publishes on a fixed tick, up to
+    /// ~100 ms behind any single `ControlMsg`, so the FIRST `Some(path)`
+    /// seen after `StartCapture` isn't necessarily the wizard's own file —
+    /// if the user already had a SESSION recording running (or starts one
+    /// in that same window) before the wizard's own capture is confirmed,
+    /// that recording's path would be confirmed instead, wrapped in
+    /// `TempCaptureGuard`, and DELETED (WAV + sidecar) the moment the
+    /// wizard exits. `accepts_capture_path` confirms a snapshot path only
+    /// when it falls inside `dir`, so a foreign path is ignored (Phase 1
+    /// just keeps waiting) rather than adopted. See also `ui::toolbar`'s
+    /// `cal_ppm_control`, which closes the other half of this same race by
+    /// disabling "Calibrate…" while a recording is already in progress —
+    /// so the wizard can't even open mid-session-recording in the first
+    /// place.
+    Capturing {
+        started: Instant,
+        path: PathBuf,
+        dir: PathBuf,
+    },
     /// `StopRecording` was sent and a background thread is running
     /// `analyze_wav` on the finalized capture; `rx` is polled once per
     /// frame via `try_recv` (`render_cal_wizard`'s Phase 2, below).
@@ -258,7 +327,13 @@ enum WizardAction {
 /// Three phases, each re-borrowing `*wizard` fresh so a later phase is free
 /// to replace it outright (Rust won't allow reassigning `*wizard` while an
 /// earlier phase's borrow of the old value is still alive):
-/// 1. Reconcile `Capturing`'s `path` from `wctx.snap.recording`.
+/// 1. Reconcile `Capturing`'s `path` from `wctx.snap.recording`, subject to
+///    `accepts_capture_path`'s own-directory guard (CRITICAL-1) — a
+///    confirmed path outside the wizard's own capture dir is ignored, not
+///    adopted; and `capture_confirm_timed_out`'s give-up timeout
+///    (IMPORTANT-2) — no valid path confirmed within
+///    `CAPTURE_CONFIRM_GRACE_S` gives up honestly instead of counting down a
+///    phantom 5-minute capture.
 /// 2. Poll `Analyzing`'s `rx`; on completion, delete the temp capture and
 ///    transition to `Result`.
 /// 3. Render whatever `*wizard` now holds, collect a `WizardAction`, and
@@ -278,14 +353,34 @@ pub fn render_cal_wizard(
 
     // Phase 1: reconcile the Capturing path from the snapshot — see
     // `CalWizard::Capturing`'s doc comment for why this can't just be
-    // predicted client-side instead.
-    if let Some(CalWizard::Capturing { path, .. }) = wizard.as_mut()
+    // predicted client-side instead, and for the stale-snapshot race
+    // `accepts_capture_path` guards against (CRITICAL-1).
+    if let Some(CalWizard::Capturing { started, path, dir }) = wizard.as_mut()
         && path.as_os_str().is_empty()
-        && let Some(confirmed) = &wctx.snap.recording
     {
-        *path = confirmed.clone();
-        if guard.is_none() {
-            *guard = Some(TempCaptureGuard::new(confirmed.clone()));
+        if accepts_capture_path(dir, wctx.snap.recording.as_deref()) {
+            let confirmed = wctx
+                .snap
+                .recording
+                .clone()
+                .expect("accepts_capture_path only returns true when recording is Some");
+            *path = confirmed.clone();
+            if guard.is_none() {
+                *guard = Some(TempCaptureGuard::new(confirmed));
+            }
+        } else if capture_confirm_timed_out(started.elapsed(), false) {
+            // IMPORTANT-2: give up honestly rather than count down a
+            // phantom 5-minute capture against a recording that never
+            // started. Defensively stop any recording anyway — if the
+            // engine actually did start one just as this timeout fired (the
+            // race is generous but not impossible), this ensures it doesn't
+            // run forever unattended with nothing left to stop it.
+            wctx.engine.send(ControlMsg::StopRecording);
+            *wizard = Some(CalWizard::Result {
+                outcome: Err(CalError::BadInput {
+                    reason: "recording never started \u{2014} check the input source".to_string(),
+                }),
+            });
         }
     }
 
@@ -387,13 +482,14 @@ fn apply_wizard_action(
             let dir = std::env::temp_dir().join(TEMP_CAPTURE_SUBDIR);
             let _ = std::fs::create_dir_all(&dir);
             wctx.engine.send(ControlMsg::StartRecording {
-                dir,
+                dir: dir.clone(),
                 meta_position: None,
                 watch: None,
             });
             *wizard = Some(CalWizard::Capturing {
                 started: Instant::now(),
                 path: PathBuf::new(),
+                dir,
             });
         }
         WizardAction::AskCancelCapture => *confirm_cancel = true,
@@ -424,6 +520,10 @@ fn apply_wizard_action(
         WizardAction::Save(ppm) => {
             wctx.controls.ppm = ppm;
             apply_and_persist_ppm(wctx.engine, wctx.config, wctx.controls, ppm);
+            // IMPORTANT-1: `apply_and_persist_ppm` alone only updates the
+            // in-memory `ConfigStore` + the live engine — without this, the
+            // measured ppm was lost the moment the app quit.
+            persist_config_now(wctx.config);
             *guard = None;
             *wizard = None;
         }
@@ -846,6 +946,69 @@ mod tests {
                 || too_short.contains("300")
                 || too_short.contains("minute"),
             "TooShort advice should mention the minimum duration: {too_short:?}"
+        );
+    }
+
+    /// Final-review CRITICAL-1: `accepts_capture_path` guards Phase 1
+    /// against confirming a snapshot path that belongs to some OTHER
+    /// in-flight recording (most dangerously, the user's own session
+    /// recording) rather than this wizard's own capture.
+    #[test]
+    fn accepts_capture_path_own_dir_and_foreign_and_none() {
+        let dir = Path::new("/tmp/chrona-cal");
+        let own = dir.join("chrona-1700000000.wav");
+        let foreign = Path::new("/Users/example/recordings/chrona-1700000000.wav");
+        assert!(
+            accepts_capture_path(dir, Some(&own)),
+            "a path inside the wizard's own capture dir must be accepted"
+        );
+        assert!(
+            !accepts_capture_path(dir, Some(foreign)),
+            "a path outside the wizard's capture dir (e.g. a session recording) \
+             must be rejected"
+        );
+        assert!(
+            !accepts_capture_path(dir, None),
+            "no confirmed snapshot path yet must be rejected (keep waiting)"
+        );
+        // `Path::starts_with` matches whole components, not raw string
+        // prefixes — a sibling directory that merely SHARES a string
+        // prefix must still be rejected.
+        let sibling_dir = Path::new("/tmp/chrona-cal-evil/chrona-1700000000.wav");
+        assert!(
+            !accepts_capture_path(dir, Some(sibling_dir)),
+            "a string-prefix-only sibling directory must not be mistaken for \
+             the real one"
+        );
+    }
+
+    /// Final-review IMPORTANT-2: `capture_confirm_timed_out` is Phase 1's
+    /// give-up signal for a `StartCapture` that the engine never confirms
+    /// (e.g. `StartRecording` was refused because the input source was
+    /// idle) — without it, the wizard silently counts down a full 5-minute
+    /// phantom capture against nothing.
+    #[test]
+    fn capture_confirm_timed_out_grace_period() {
+        assert!(
+            !capture_confirm_timed_out(Duration::from_millis(0), false),
+            "no time elapsed: keep waiting"
+        );
+        assert!(
+            !capture_confirm_timed_out(Duration::from_millis(2_999), false),
+            "1ms short of the grace period: keep waiting"
+        );
+        assert!(
+            capture_confirm_timed_out(Duration::from_secs_f64(3.0), false),
+            "exactly at the grace period with no path confirmed: give up"
+        );
+        assert!(
+            capture_confirm_timed_out(Duration::from_millis(10_000), false),
+            "well past the grace period with no path confirmed: give up"
+        );
+        assert!(
+            !capture_confirm_timed_out(Duration::from_millis(10_000), true),
+            "once a path IS confirmed, the grace period no longer applies — \
+             immune"
         );
     }
 

@@ -64,6 +64,18 @@ pub fn export_enabled(selected_watch: Option<&str>, has_sessions: bool) -> bool 
     selected_watch.is_some() && has_sessions
 }
 
+/// Whether the cal-ppm popup's "Calibrate…" row should be enabled: never
+/// while a recording is already in progress (final-review CRITICAL-1).
+/// Even with `ui::cal_wizard`'s own `accepts_capture_path` directory guard,
+/// opening the wizard mid-recording would still auto-finalize whichever
+/// recording the engine's single-writer policy already has open the moment
+/// `ControlMsg::StartRecording` goes out for the wizard's own capture —
+/// disabling the entry point makes that collision impossible rather than
+/// silent.
+pub fn cal_wizard_enabled(recording: bool) -> bool {
+    !recording
+}
+
 // ---------------------------------------------------------------------
 // Rendering: the toolbar. Exercised by `cargo build` + the workspace test
 // suite; no window in CI, so nothing here is unit-tested directly — see the
@@ -154,9 +166,12 @@ pub fn toolbar_row(
             palette,
             controls,
             engine,
-            config,
-            ctx.snap.health.clock_skew,
-            &mut state.cal_wizard_requested,
+            CalPpmCtx {
+                config,
+                clock_skew: ctx.snap.health.clock_skew,
+                recording,
+                cal_wizard_requested: &mut state.cal_wizard_requested,
+            },
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -207,9 +222,13 @@ pub fn toolbar_row(
 /// Saves `config` immediately (not the debounced save the continuous-drag
 /// controls use) — the same ignore-with-`eprintln!` error style as
 /// `ChronaApp::maybe_save_config`. Used by the watch combo/add-watch modal
-/// and the theme toggle, both of which are the M4a Task 6 "save
-/// immediately" behavior contract rather than a continuous drag.
-fn persist_config_now(config: &ConfigStore) {
+/// and the theme toggle (both the M4a Task 6 "save immediately" behavior
+/// contract rather than a continuous drag), and by `ui::cal_wizard`'s
+/// "Save for <device>" (final-review IMPORTANT-1 fix: `apply_and_persist_
+/// ppm` alone only updates the in-memory `ConfigStore` + the live engine, so
+/// without this the wizard's calibration was lost on quit + relaunch).
+/// `pub(crate)` for that last caller.
+pub(crate) fn persist_config_now(config: &ConfigStore) {
     if let Err(e) = config.save() {
         eprintln!("chrona: failed to save config: {e}");
     }
@@ -441,6 +460,22 @@ fn averaging_combo(
         });
 }
 
+/// Borrowed, per-frame context `cal_ppm_control` needs beyond its own
+/// leading arguments (`ui`/`palette`/`controls`/`engine`, the same
+/// widely-shared leading shape every render fn in this module uses):
+/// bundled purely to keep the argument count sane (`clippy::
+/// too_many_arguments` — final-review CRITICAL-1's `recording` addition
+/// pushed the previous 7-arg list to 8), same shape as `ToolbarCtx`/
+/// `RecordButtonCtx`.
+struct CalPpmCtx<'a> {
+    config: &'a mut ConfigStore,
+    clock_skew: Option<ClockSkew>,
+    /// Final-review CRITICAL-1: whether a recording (session or otherwise)
+    /// is already in progress — see `cal_wizard_enabled`.
+    recording: bool,
+    cal_wizard_requested: &'a mut bool,
+}
+
 /// `cal {ppm:+.1} ppm` — a click target opening a compact ppm editor (spec
 /// §14 deviation #10, pre-review fix: the mockup renders this as static
 /// text, but the app keeps it editable — manual-protocol B.7 and per-device
@@ -481,15 +516,28 @@ fn averaging_combo(
 /// legitimately belongs in this popup (it IS timebase calibration); the
 /// Doctor is a distinct, first-class flow, not a calibration setting, so it
 /// gets its own toolbar button instead of a buried popup row.
+///
+/// Final-review fix (CRITICAL-1): `recording` disables "Calibrate…" (with a
+/// "stop the current recording first" tooltip) whenever a recording —
+/// session or otherwise — is already in progress; see `cal_wizard_enabled`'s
+/// doc comment for why this is needed even with `ui::cal_wizard`'s own
+/// path guard. Carried on `CalPpmCtx` (above), not a bare parameter — adding
+/// it as a ninth positional argument would have tripped `clippy::
+/// too_many_arguments` (empirically 8/7, same threshold `RecordButtonCtx`'s
+/// own doc comment already measured for this file).
 fn cal_ppm_control(
     ui: &mut egui::Ui,
     palette: &Palette,
     controls: &mut ControlsState,
     engine: &Engine,
-    config: &mut ConfigStore,
-    clock_skew: Option<ClockSkew>,
-    cal_wizard_requested: &mut bool,
+    pctx: CalPpmCtx<'_>,
 ) -> bool {
+    let CalPpmCtx {
+        config,
+        clock_skew,
+        recording,
+        cal_wizard_requested,
+    } = pctx;
     let button_resp = ui
         .add(
             egui::Button::new(
@@ -541,13 +589,18 @@ fn cal_ppm_control(
             }
 
             ui.separator();
-            if ui
-                .small_button("Calibrate…")
-                .on_hover_text("Guided quartz-watch calibration (~10\u{2013}15 min)")
-                .clicked()
-            {
-                *cal_wizard_requested = true;
-            }
+            let cal_enabled = cal_wizard_enabled(recording);
+            ui.add_enabled_ui(cal_enabled, |ui| {
+                let resp = ui.small_button("Calibrate…");
+                let resp = if cal_enabled {
+                    resp.on_hover_text("Guided quartz-watch calibration (~10\u{2013}15 min)")
+                } else {
+                    resp.on_disabled_hover_text("Stop the current recording first")
+                };
+                if resp.clicked() {
+                    *cal_wizard_requested = true;
+                }
+            });
 
             match ppm_to_apply {
                 Some(ppm) => apply_and_persist_ppm(engine, config, controls, ppm),
@@ -821,5 +874,21 @@ mod tests {
         assert!(!export_enabled(Some("Seiko 5"), false));
         assert!(!export_enabled(None, true));
         assert!(!export_enabled(None, false));
+    }
+
+    /// Final-review CRITICAL-1: the "Calibrate…" row must disable while a
+    /// recording is already in progress — opening the wizard mid-recording
+    /// would auto-finalize the user's session via the engine's single-
+    /// writer policy, even with `ui::cal_wizard`'s own path guard in place.
+    #[test]
+    fn cal_wizard_enabled_truth_table() {
+        assert!(
+            cal_wizard_enabled(false),
+            "no recording in progress: Calibrate stays enabled"
+        );
+        assert!(
+            !cal_wizard_enabled(true),
+            "a recording is already in progress: Calibrate disabled"
+        );
     }
 }
