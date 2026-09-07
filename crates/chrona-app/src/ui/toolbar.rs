@@ -77,15 +77,18 @@ pub fn export_enabled(selected_watch: Option<&str>, has_sessions: bool) -> bool 
 /// `ControlsState::bph_mode_ui`, which only ever holds the free-text
 /// buffer for the `Other…` case — see `apply_bph_selection`), the add-watch
 /// modal, the export-report request flag the Export button sets (consumed
-/// each frame by `ChronaApp::run_export`, M4a Task 9), and the calibration-
+/// each frame by `ChronaApp::run_export`, M4a Task 9), the calibration-
 /// wizard request flag the cal-ppm popup's "Calibrate…" row sets (M4 Task
-/// 8, same "set here, consumed next frame" shape as `export_requested`).
+/// 8, same "set here, consumed next frame" shape as `export_requested`),
+/// and the Mic Doctor request flag the same popup's "Mic Doctor…" row sets
+/// (M4 Task 10, identical shape again).
 pub struct ToolbarState {
     pub selected_watch: Option<String>,
     pub bph_selection: BphComboItem,
     pub add_watch_modal: AddWatchModalState,
     pub export_requested: bool,
     pub cal_wizard_requested: bool,
+    pub doctor_requested: bool,
 }
 
 /// Borrowed, per-frame context `toolbar_row` needs beyond `ToolbarState`:
@@ -152,7 +155,10 @@ pub fn toolbar_row(
             engine,
             config,
             ctx.snap.health.clock_skew,
-            &mut state.cal_wizard_requested,
+            CalPpmRequests {
+                cal_wizard_requested: &mut state.cal_wizard_requested,
+                doctor_requested: &mut state.doctor_requested,
+            },
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -431,6 +437,17 @@ fn averaging_combo(
         });
 }
 
+/// The cal-ppm popup's two "open a modal" request flags (M4 Tasks 8/10):
+/// bundled purely to keep `cal_ppm_control`'s own argument count sane
+/// (`clippy::too_many_arguments` — 8 params without this, one over the
+/// 7-arg default threshold), same shape as `RecordButtonCtx` below. Both
+/// flags are owned by `ToolbarState`; the popup only ever sets one to
+/// `true` on its own row's click, never reads either back.
+struct CalPpmRequests<'a> {
+    cal_wizard_requested: &'a mut bool,
+    doctor_requested: &'a mut bool,
+}
+
 /// `cal {ppm:+.1} ppm` — a click target opening a compact ppm editor (spec
 /// §14 deviation #10, pre-review fix: the mockup renders this as static
 /// text, but the app keeps it editable — manual-protocol B.7 and per-device
@@ -464,6 +481,12 @@ fn averaging_combo(
 /// frame the same way it consumes `ToolbarState::export_requested` — the
 /// popup itself doesn't know about `CalWizard` at all, keeping the wizard's
 /// state machine entirely out of this module.
+///
+/// M4 Task 10 adds a second row, "Mic Doctor…", right below "Calibrate…":
+/// the Mic Doctor panel's entry point, identical "set a flag, consumed next
+/// frame" shape — this popup doesn't know about `ui::doctor::DoctorPanel`
+/// either. Its request flag travels in `requests` alongside `cal_wizard_
+/// requested` (see `CalPpmRequests`'s own doc comment for why).
 fn cal_ppm_control(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -471,8 +494,12 @@ fn cal_ppm_control(
     engine: &Engine,
     config: &mut ConfigStore,
     clock_skew: Option<ClockSkew>,
-    cal_wizard_requested: &mut bool,
+    requests: CalPpmRequests<'_>,
 ) -> bool {
+    let CalPpmRequests {
+        cal_wizard_requested,
+        doctor_requested,
+    } = requests;
     let button_resp = ui
         .add(
             egui::Button::new(
@@ -530,6 +557,13 @@ fn cal_ppm_control(
                 .clicked()
             {
                 *cal_wizard_requested = true;
+            }
+            if ui
+                .small_button("Mic Doctor…")
+                .on_hover_text("Check your mic setup: silence floor, tick clarity, AGC/gate")
+                .clicked()
+            {
+                *doctor_requested = true;
             }
 
             match ppm_to_apply {

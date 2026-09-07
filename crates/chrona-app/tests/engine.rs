@@ -1264,3 +1264,183 @@ fn cal_wizard_capture_on_simulate_snr30_yields_honest_not_quartz() {
         "sidecar should be gone after cleanup"
     );
 }
+
+/// M4 Task 10 (Mic Doctor engine plumbing, binding spec §3.2): a
+/// `ControlMsg::DoctorCapture` on a live Simulate source is delivered to
+/// EXACTLY ONE published snapshot, then cleared. `±1 chunk` per the task
+/// brief is derived from the DELIVERED sample rate rather than a hardcoded
+/// assumption (`sim_chunk_len`/`TICK_S` are private to `engine.rs`, not
+/// reachable from this separate integration-test binary) — `chunk_len * 2`
+/// gives a little slack around exact tick-boundary overshoot without
+/// tolerating a grossly wrong length.
+///
+/// Deliberately real-time paced (`Engine::start`, NOT `start_with_turbo`),
+/// unlike every other test in this file: turbo's uncapped tick rate makes
+/// the one-shot window genuinely too narrow to poll reliably. Empirically
+/// confirmed during development — turbo mode delivers the buffer within
+/// ~2ms of sending the request, but the very next publish (~1 tick later)
+/// already overwrites it with `None`; the analyzer's periodic "refold" over
+/// its averaging window (see `Engine::snapshot`'s doc comment: "spikes to
+/// ~88 ms on the ~1-in-10 polls that trigger a refold") only slows the loop
+/// down LATER, by which point the one-shot value is long gone. Even a tight
+/// no-sleep spin-poll from the test thread missed it under the CPU
+/// contention of the full test-file's parallel run (though it reliably
+/// caught it running alone) — a real race, not a slow-poller artifact. At
+/// the real ~50 ms/tick pace, the one-shot snapshot instead survives a full
+/// ~100 ms publish cycle (`SNAPSHOT_EVERY`) before being overwritten,
+/// comfortably longer than this loop's poll interval even under load.
+#[test]
+fn doctor_capture_on_simulate_delivers_one_shot_buffer_then_clears() {
+    let mut eng = Engine::start(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+    );
+    eng.send(ControlMsg::DoctorCapture { seconds: 2.0 });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (samples, sr) = loop {
+        if let Some(pair) = eng.snapshot().doctor_capture {
+            break pair;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "DoctorCapture{{seconds: 2.0}} never delivered a buffer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let chunk_len = (sr * 0.05).round();
+    let expected = 2.0 * sr;
+    assert!(
+        (samples.len() as f64 - expected).abs() <= chunk_len * 2.0,
+        "expected ~{expected} samples (2.0s @ {sr} Hz), got {} (~{:.2}s)",
+        samples.len(),
+        samples.len() as f64 / sr
+    );
+
+    // One-shot: the NEXT snapshot must carry None — generous sleep past at
+    // least one more ~10 Hz publish cycle (SNAPSHOT_EVERY, engine.rs)
+    // before checking, so this isn't just re-reading the same still-Some
+    // triple_buffer slot.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        eng.snapshot().doctor_capture.is_none(),
+        "doctor_capture must clear after the one snapshot that carried it"
+    );
+    drop(eng);
+}
+
+/// A second `DoctorCapture` arriving before the first has been delivered
+/// discards whatever the first had accumulated and starts fresh against its
+/// own `seconds` (task brief: "second replaces first"). Sent back-to-back
+/// with no sleep between them so both are drained in (or very near) the
+/// same inbox batch, well before the first (20s) request could complete —
+/// see `engine_loop`'s inbox-draining loop, `engine.rs`. If replacement
+/// didn't happen, the eventual buffer would reflect the first request's 20s
+/// target (~10x this test's tolerance), not the second's 2s.
+///
+/// Real-time paced (`Engine::start`), not turbo — see the sibling
+/// one-shot-delivery test's doc comment for why: turbo's one-shot window is
+/// too narrow to poll reliably (confirmed racy under this file's own
+/// parallel run), while the real ~50 ms/tick pace gives it a full ~100 ms
+/// publish cycle to be observed.
+#[test]
+fn doctor_capture_overlapping_request_replaces_the_first() {
+    let mut eng = Engine::start(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+    );
+    eng.send(ControlMsg::DoctorCapture { seconds: 20.0 });
+    eng.send(ControlMsg::DoctorCapture { seconds: 2.0 });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (samples, sr) = loop {
+        if let Some(pair) = eng.snapshot().doctor_capture {
+            break pair;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "overlapping DoctorCapture requests never delivered a buffer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let chunk_len = (sr * 0.05).round();
+    let expected = 2.0 * sr; // the SECOND request's target, not the first's 20.0s
+    assert!(
+        (samples.len() as f64 - expected).abs() <= chunk_len * 2.0,
+        "final buffer should reflect the second (2.0s) request, not the first's \
+         20.0s target — got {} samples (~{:.2}s @ {sr} Hz)",
+        samples.len(),
+        samples.len() as f64 / sr
+    );
+    drop(eng);
+}
+
+/// Defensive clamp (task brief): `seconds` below the 1.0s floor is clamped
+/// up to it, never honored as-is (and never produces a near-empty/zero-
+/// length buffer).
+///
+/// Real-time paced (`Engine::start`), not turbo — see `doctor_capture_on_
+/// simulate_delivers_one_shot_buffer_then_clears`'s doc comment for why.
+#[test]
+fn doctor_capture_clamps_seconds_below_minimum() {
+    let mut eng = Engine::start(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+    );
+    eng.send(ControlMsg::DoctorCapture { seconds: 0.1 });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (samples, sr) = loop {
+        if let Some(pair) = eng.snapshot().doctor_capture {
+            break pair;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "DoctorCapture{{seconds: 0.1}} never delivered a buffer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let chunk_len = (sr * 0.05).round();
+    let expected = 1.0 * sr; // clamped up to the 1.0s floor, not the requested 0.1s
+    assert!(
+        (samples.len() as f64 - expected).abs() <= chunk_len * 2.0,
+        "0.1s request should clamp to the 1.0s minimum — expected ~{expected} \
+         samples (1.0s @ {sr} Hz), got {} (~{:.2}s)",
+        samples.len(),
+        samples.len() as f64 / sr
+    );
+    drop(eng);
+}

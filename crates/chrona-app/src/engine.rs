@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrona_audio::{CaptureStream, StreamInfo};
@@ -78,6 +78,13 @@ const SKEW_SAMPLE_INTERVAL_S: f64 = 1.0;
 /// plus-explicit-adopt only, never silently applied — see `SkewTracker`'s
 /// doc comment.
 const SKEW_MIN_SPAN_S: f64 = 120.0;
+/// `ControlMsg::DoctorCapture`'s clamp range (M4 Task 10, defensive): the
+/// Mic Doctor panel only ever sends its own fixed 5/10/10s step durations,
+/// so neither bound is expected to bite in practice — this exists purely
+/// so a malformed/future caller can't request a near-zero (dishonest,
+/// under-evidenced) or unbounded (memory-blowup) capture.
+const MIN_DOCTOR_CAPTURE_S: f64 = 1.0;
+const MAX_DOCTOR_CAPTURE_S: f64 = 30.0;
 
 // ---------------------------------------------------------------------
 // Public control-plane types (spec §7): what the UI sends the engine, and
@@ -118,6 +125,25 @@ pub enum ControlMsg {
         watch: Option<String>,
     },
     StopRecording,
+    /// M4 Task 10 (Mic Doctor, binding spec §3.2): buffer the next `seconds`
+    /// (clamped to `[MIN_DOCTOR_CAPTURE_S, MAX_DOCTOR_CAPTURE_S]`) of PUSHED
+    /// samples from whatever source is currently active — Mic, Simulate, or
+    /// Replay alike (`pull_tick` tees every source arm into it the same way
+    /// it already tees into a recording `SessionWriter`). `Idle` pulls no
+    /// samples at all, so a request against it simply never completes — an
+    /// honest "no data yet", never a fabricated one.
+    ///
+    /// One-shot: the completed buffer is attached to EXACTLY the next
+    /// published `EngineSnapshot::doctor_capture`, then cleared back to
+    /// `None` on every publish after that (`engine_loop`'s `doctor_ready.
+    /// take()`). Overlapping requests: a second `DoctorCapture` arriving
+    /// before the first has completed (or been delivered) discards whatever
+    /// the first had accumulated/finished and restarts against its own
+    /// `seconds` — see `engine_loop`'s handler, the one place this is
+    /// applied.
+    DoctorCapture {
+        seconds: f64,
+    },
     Shutdown,
 }
 
@@ -205,6 +231,29 @@ pub struct EngineSnapshot {
     pub health: HealthView,
     pub recording: Option<PathBuf>,
     pub banner: Option<Banner>,
+    /// M4 Task 10 (Mic Doctor): the completed `ControlMsg::DoctorCapture`
+    /// buffer, `(samples, sample_rate_hz)` — bundled as one tuple rather
+    /// than a parallel `doctor_capture_sr` field so the two can never
+    /// desync (e.g. a stale sample rate surviving next to a `None`
+    /// buffer). `Arc`, not a plain `Vec`, so cloning a snapshot (every
+    /// `publish`, and `Engine::snapshot()`'s own `.clone()`) shares the one
+    /// allocation instead of deep-copying up to 30s of audio. `Some` on
+    /// EXACTLY the one snapshot published right after the requested length
+    /// was reached, `None` on every other — see `ControlMsg::
+    /// DoctorCapture`'s doc comment for the full one-shot contract. Relies
+    /// on `publish`'s existing `request_repaint()` (fired on every publish,
+    /// unconditionally) to give the UI a real chance to observe that one
+    /// snapshot rather than skip over it.
+    pub doctor_capture: Option<(Arc<Vec<f32>>, f64)>,
+    /// M4 Task 10: bumped once for every successful `ControlMsg::
+    /// SwitchSource` (never on startup, never on a config-only change —
+    /// see `engine_loop`'s `SwitchSource` handler, the only place this
+    /// changes). The Mic Doctor panel's own "stale setup" honesty signal:
+    /// it remembers the value it last saw and clears its step results (and
+    /// abandons any pending capture) the moment this changes, since a
+    /// different source invalidates whatever it measured against the old
+    /// one.
+    pub source_generation: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -916,7 +965,8 @@ fn publish(
 }
 
 /// Pulls one tick's worth of audio from `source` into `analyzer`, teeing it
-/// to `writer` if recording and folding it into the silence tracker.
+/// to `writer` if recording, to `doctor_capture` if a Mic Doctor capture is
+/// accumulating (M4 Task 10), and folding it into the silence tracker.
 /// Returns the number of samples pulled (0 for a starved mic, or a replay
 /// that has already finished) and, if the tee to `writer` failed this tick
 /// (M4 Task 4 — e.g. a full disk), that write error's message: state the
@@ -926,6 +976,7 @@ fn pull_tick(
     source: &mut SourceRuntime,
     analyzer: &mut Analyzer,
     writer: &mut Option<SessionWriter>,
+    doctor_capture: &mut Option<DoctorCaptureState>,
     silence: &mut SilenceTracker,
 ) -> (usize, Option<String>) {
     match source {
@@ -941,6 +992,8 @@ fn pull_tick(
             analyzer.push_samples(a);
             analyzer.push_samples(b);
             let write_error = push_tee(writer, a).or_else(|| push_tee(writer, b));
+            doctor_tee(doctor_capture, a);
+            doctor_tee(doctor_capture, b);
             let sr = stream.info.sample_rate_hz;
             silence.push(a, sr);
             silence.push(b, sr);
@@ -957,6 +1010,7 @@ fn pull_tick(
             let chunk = read_looping(buffer, pos, n);
             analyzer.push_samples(&chunk);
             let write_error = push_tee(writer, &chunk);
+            doctor_tee(doctor_capture, &chunk);
             silence.push(&chunk, *sample_rate_hz);
             (chunk.len(), write_error)
         }
@@ -974,6 +1028,7 @@ fn pull_tick(
             let chunk = &samples[*pos..end];
             analyzer.push_samples(chunk);
             let write_error = push_tee(writer, chunk);
+            doctor_tee(doctor_capture, chunk);
             silence.push(chunk, *sample_rate_hz);
             let pulled = chunk.len();
             *pos = end;
@@ -983,11 +1038,12 @@ fn pull_tick(
             (pulled, write_error)
         }
         // Deliberately a no-op (spec/M4 T3): no samples, so nothing reaches
-        // `analyzer`, `writer`, or `silence` — see `SourceRuntime::Idle`'s
-        // doc comment for why that's exactly the point (a silent
-        // `SilenceTracker` would otherwise eventually raise its own
-        // silence banner on top of the real Error banner explaining why
-        // there's no source at all).
+        // `analyzer`, `writer`, `doctor_capture`, or `silence` — see
+        // `SourceRuntime::Idle`'s doc comment for why that's exactly the
+        // point (a silent `SilenceTracker` would otherwise eventually raise
+        // its own silence banner on top of the real Error banner explaining
+        // why there's no source at all; a Doctor capture against Idle
+        // simply never completes, for the same reason).
         SourceRuntime::Idle(_) => (0, None),
     }
 }
@@ -1002,6 +1058,39 @@ fn pull_tick(
 /// lives there too (see `pull_tick`'s doc comment).
 fn push_tee(writer: &mut Option<SessionWriter>, samples: &[f32]) -> Option<String> {
     writer.as_mut()?.push(samples).err().map(|e| e.to_string())
+}
+
+/// M4 Task 10: in-progress accumulation for `ControlMsg::DoctorCapture` — a
+/// one-shot buffer of the next N seconds of PUSHED samples, from ANY source
+/// (`pull_tick` tees every arm into it, mirroring `push_tee`). `target_len`
+/// and `sample_rate_hz` are both fixed ONCE at request time (`engine_loop`'s
+/// `ControlMsg::DoctorCapture` handler), from the source's sample rate at
+/// that moment — mirrors `StartRecording`'s own `meta.sample_rate_hz`
+/// snapshot. A capture never straddles a sample-rate change mid-flight: a
+/// `SwitchSource` while accumulating discards this state outright (honesty
+/// — see `EngineSnapshot::source_generation`'s doc comment) rather than let
+/// a buffer silently splice old-source audio with new-source audio.
+struct DoctorCaptureState {
+    buffer: Vec<f32>,
+    target_len: usize,
+    sample_rate_hz: f64,
+}
+
+/// Tees `samples` into `capture`'s buffer if one is accumulating, stopping
+/// (but not truncating the chunk that crosses the line) once the buffer
+/// reaches its target length — this fn's caller (`engine_loop`, right after
+/// `pull_tick`) tolerates that overshoot, up to one tick's worth of samples
+/// (task brief: "±1 chunk"), so trimming here would only lose the tick/AGC
+/// analyzers' own trailing context for no honesty benefit.
+fn doctor_tee(capture: &mut Option<DoctorCaptureState>, samples: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
+    if let Some(state) = capture
+        && state.buffer.len() < state.target_len
+    {
+        state.buffer.extend_from_slice(samples);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1108,6 +1197,16 @@ fn engine_loop(
 
     let mut writer: Option<SessionWriter> = None;
     let mut recording_path: Option<PathBuf> = None;
+    // M4 Task 10 (Mic Doctor): `doctor_capture` accumulates the in-flight
+    // `ControlMsg::DoctorCapture` request, if any; `doctor_ready` holds a
+    // just-completed one until the next `publish` attaches it to exactly
+    // one `EngineSnapshot` and clears it via `.take()` — see both fields'
+    // doc comments on `EngineSnapshot`/`DoctorCaptureState`.
+    let mut doctor_capture: Option<DoctorCaptureState> = None;
+    let mut doctor_ready: Option<(Arc<Vec<f32>>, f64)> = None;
+    // M4 Task 10: bumped on every successful `SwitchSource` below — see
+    // `EngineSnapshot::source_generation`'s doc comment.
+    let mut source_generation: u64 = 0;
     let mut silence = SilenceTracker::default();
     // System-clock skew cross-check (binding spec §3.4, M4 Task 7):
     // `skew`'s own regression origin is internal (see `SkewTracker`'s doc
@@ -1227,6 +1326,19 @@ fn engine_loop(
                                 skew_epoch = Instant::now();
                                 mic_frames_delivered = 0;
                                 last_skew_sample_at = None;
+                                // M4 Task 10: a capture spanning the switch
+                                // would silently splice old-source audio
+                                // with new-source audio — discard rather
+                                // than publish a buffer that misrepresents
+                                // either setup (see `DoctorCaptureState`'s
+                                // doc comment). `source_generation` is
+                                // `ui::doctor`'s own signal to clear its
+                                // step results and abandon a pending Run —
+                                // see `EngineSnapshot::source_generation`'s
+                                // doc comment.
+                                doctor_capture = None;
+                                doctor_ready = None;
+                                source_generation += 1;
                                 // A mid-recording switch must not keep
                                 // teeing the old source's (now
                                 // semantically wrong, possibly
@@ -1355,6 +1467,23 @@ fn engine_loop(
                     }
                     recording_path = None;
                 }
+                ControlMsg::DoctorCapture { seconds } => {
+                    // Defensive clamp (task brief) — see MIN/MAX_DOCTOR_
+                    // CAPTURE_S's own doc comment.
+                    let seconds = seconds.clamp(MIN_DOCTOR_CAPTURE_S, MAX_DOCTOR_CAPTURE_S);
+                    let sr = source.sample_rate_hz();
+                    let target_len = ((seconds * sr).round() as usize).max(1);
+                    doctor_capture = Some(DoctorCaptureState {
+                        buffer: Vec::with_capacity(target_len),
+                        target_len,
+                        sample_rate_hz: sr,
+                    });
+                    // "Second replaces first" (task brief) covers a
+                    // not-yet-delivered completed capture too, not just an
+                    // in-progress accumulation — a fresh request supersedes
+                    // either.
+                    doctor_ready = None;
+                }
             }
         }
 
@@ -1367,7 +1496,29 @@ fn engine_loop(
         // ms/tick pace — over-generating Simulate/Replay audio and
         // over-triggering publishes for as long as the burst lasted.
         if turbo || Instant::now() >= next_tick {
-            let (n, write_error) = pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+            let (n, write_error) = pull_tick(
+                &mut source,
+                &mut analyzer,
+                &mut writer,
+                &mut doctor_capture,
+                &mut silence,
+            );
+
+            // M4 Task 10: once the in-progress capture's buffer has reached
+            // its target length, hand it off to `doctor_ready` (`Arc`'d
+            // here, once, so every later `EngineSnapshot::clone()` shares
+            // this one allocation rather than deep-copying it) — the next
+            // publish below attaches it to exactly that one snapshot, via
+            // `doctor_ready.take()`.
+            if doctor_capture
+                .as_ref()
+                .is_some_and(|c| c.buffer.len() >= c.target_len)
+            {
+                let finished = doctor_capture
+                    .take()
+                    .expect("is_some_and above just proved this is Some");
+                doctor_ready = Some((Arc::new(finished.buffer), finished.sample_rate_hz));
+            }
 
             // System-clock skew cross-check (binding spec §3.4, M4 Task 7):
             // mic path only — Simulate/Replay/Idle's delivery isn't real
@@ -1436,6 +1587,8 @@ fn engine_loop(
                         health,
                         recording: recording_path.clone(),
                         banner: banner.clone(),
+                        doctor_capture: doctor_ready.take(),
+                        source_generation,
                     },
                 );
             }
@@ -1507,11 +1660,21 @@ pub fn run_headless(flags: &AppFlags, seconds: f64) -> i32 {
         }
     };
     let mut writer: Option<SessionWriter> = None;
+    // Headless never sends `ControlMsg::DoctorCapture` (no control channel
+    // at all here) — a fixed `None` that's never touched, purely to match
+    // `pull_tick`'s signature.
+    let mut doctor_capture: Option<DoctorCaptureState> = None;
     let mut silence = SilenceTracker::default();
 
     let ticks = ((seconds / TICK_S).ceil() as u64).max(1);
     for _ in 0..ticks {
-        pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+        pull_tick(
+            &mut source,
+            &mut analyzer,
+            &mut writer,
+            &mut doctor_capture,
+            &mut silence,
+        );
     }
 
     match analyzer.current_metrics() {

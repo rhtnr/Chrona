@@ -28,10 +28,11 @@ use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
     AddWatchModalState, BottomGridCtx, BphComboItem, BphModeUi, CalWizard, CalWizardCtx, ChartsCtx,
-    ChartsUiState, ControlsState, CountWatermark, HelpTopicId, SessionPanelState, StripCtx,
-    TempCaptureGuard, ToolbarCtx, ToolbarState, WATERMARK_WINDOW, bottom_grid, charts_section,
-    default_recordings_dir, metrics_cards, pick_banner, position_strip, render_cal_wizard,
-    render_help_modal, resolve_app_banner, toolbar_row,
+    ChartsUiState, ControlsState, CountWatermark, DoctorCtx, DoctorPanel, HelpTopicId,
+    SessionPanelState, StripCtx, TempCaptureGuard, ToolbarCtx, ToolbarState, WATERMARK_WINDOW,
+    bottom_grid, charts_section, default_recordings_dir, metrics_cards, pick_banner,
+    position_strip, render_cal_wizard, render_doctor_panel, render_help_modal, resolve_app_banner,
+    toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -163,6 +164,13 @@ pub struct ChronaApp {
     /// here (a plain `ChronaApp` field) rather than nested inside
     /// `cal_wizard`, and for the OS-crash caveat this can't cover.
     cal_capture_guard: Option<TempCaptureGuard>,
+    /// The Mic Doctor panel (M4 Task 10, binding spec §3.2) — a plain
+    /// field, not `Option`, since the panel's own `open` flag tracks
+    /// visibility while its step results persist across close/reopen (see
+    /// `ui::doctor::DoctorPanel`'s doc comment). Opened by the cal-ppm
+    /// popup's "Mic Doctor…" row (`toolbar.doctor_requested`, consumed each
+    /// frame the same way `toolbar.cal_wizard_requested` is).
+    doctor: DoctorPanel,
 }
 
 impl ChronaApp {
@@ -175,6 +183,7 @@ impl ChronaApp {
             add_watch_modal: AddWatchModalState::default(),
             export_requested: false,
             cal_wizard_requested: false,
+            doctor_requested: false,
         };
 
         let theme = theme::theme_from_config(config.theme.as_deref());
@@ -234,6 +243,7 @@ impl ChronaApp {
             cal_wizard: None,
             cal_wizard_confirm_cancel: false,
             cal_capture_guard: None,
+            doctor: DoctorPanel::default(),
         }
     }
 
@@ -450,6 +460,26 @@ impl eframe::App for ChronaApp {
                 snap: &snap,
                 controls: &mut self.controls,
                 config: &mut self.config,
+            },
+        );
+
+        // M4 Task 10: the cal-ppm popup's "Mic Doctor…" row sets this —
+        // same "set on click, consumed next frame" shape as `cal_wizard_
+        // requested` just above. `DoctorPanel::open` (not a fresh value
+        // like `CalWizard::Intro`) since the panel is a plain field whose
+        // step results persist across close/reopen — see `ui::doctor::
+        // DoctorPanel`'s doc comment.
+        if self.toolbar.doctor_requested {
+            self.toolbar.doctor_requested = false;
+            self.doctor.open();
+        }
+        render_doctor_panel(
+            ui.ctx(),
+            theme::Palette::of(self.theme),
+            &mut self.doctor,
+            DoctorCtx {
+                engine: &self.engine,
+                snap: &snap,
             },
         );
 

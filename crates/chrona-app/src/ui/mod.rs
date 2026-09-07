@@ -2,13 +2,14 @@
 //! amplitude charts (M4a Task 8, `charts`) that replaced M3's paper-tape
 //! instrument view, the redesigned toolbar (M4a Task 6, `toolbar`) plus its
 //! add-watch and metric-help modals (`modals`), controls state shared with
-//! the toolbar (`controls`), and the position/session strip (M4a Task 7,
-//! `strip`).
+//! the toolbar (`controls`), the position/session strip (M4a Task 7,
+//! `strip`), and the Mic Doctor panel (M4 Task 10, `doctor`).
 
 mod cal_wizard;
 mod cards;
 mod charts;
 mod controls;
+mod doctor;
 mod history_ui;
 mod modals;
 mod strip;
@@ -21,6 +22,7 @@ pub use controls::{
     BphModeUi, ControlsState, CountWatermark, WATERMARK_WINDOW, pick_banner, resolve_app_banner,
     to_bph_mode,
 };
+pub use doctor::{DoctorCtx, DoctorPanel, render_doctor_panel};
 pub use history_ui::{
     BottomGridCtx, ComparisonRow, bottom_grid, comparison_rows, session_time_label,
 };
