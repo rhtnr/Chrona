@@ -226,14 +226,22 @@ pub struct ChartsCtx<'a> {
 /// amplitude strip). Replaces M3's `ui::instrument_view` in `ChronaApp`'s
 /// `CentralPanel`. Any space left below (Task 9's session-history/
 /// position-comparison cards) is simply not drawn into.
+///
+/// Returns `true` iff the beat-trace header's classic-pattern-legend "?"
+/// button was clicked this frame (M4 Task 13) — the caller (`ChronaApp::
+/// ui`) owns the pattern-legend modal's `open`/`just_opened` state and
+/// decides what "just opened" means for `ui::patterns::
+/// render_pattern_legend_modal`'s click-outside guard, so this function
+/// only ever reports the request, never mutates modal state itself (same
+/// shape as `ui::cards::metrics_cards`' `Option<HelpTopicId>` return).
 pub fn charts_section(
     ui: &mut egui::Ui,
     palette: &Palette,
     view: &mut TraceView,
     charts_ui: &mut ChartsUiState,
     ctx: ChartsCtx<'_>,
-) {
-    chart_header_row(ui, palette, view, &mut charts_ui.wrap_ms);
+) -> bool {
+    let patterns_clicked = chart_header_row(ui, palette, view, &mut charts_ui.wrap_ms);
     ui.add_space(SECTION_GAP);
 
     let reserved_below = SECTION_GAP + AMP_HEADER_H + SECTION_GAP + AMP_STRIP_H;
@@ -260,6 +268,8 @@ pub fn charts_section(
         ctx.beat_accum.newest_t(),
         AMP_STRIP_H,
     );
+
+    patterns_clicked
 }
 
 // ---------------------------------------------------------------------
@@ -278,16 +288,26 @@ fn section_title(text: &str, color: egui::Color32) -> egui::RichText {
 }
 
 /// The beat-trace panel's header row (mockup: "Beat trace" semibold, the
-/// Tick/Tock/Rate-trend legend, a spacer, the pan/zoom hint, a `Live ⏵`
-/// chip when panned away from live, the `+`/`−`/`Fit` buttons, and the
-/// wrap-band selector).
-fn chart_header_row(ui: &mut egui::Ui, palette: &Palette, view: &mut TraceView, wrap_ms: &mut f64) {
+/// Tick/Tock/Rate-trend legend, the classic-pattern-legend "?" button (M4
+/// Task 13), a spacer, the pan/zoom hint, a `Live ⏵` chip when panned away
+/// from live, the `+`/`−`/`Fit` buttons, and the wrap-band selector).
+///
+/// Returns `true` iff the "?" button was clicked this frame — see
+/// `charts_section`'s own doc comment for why this function only reports
+/// the request rather than owning the modal's open state itself.
+fn chart_header_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    view: &mut TraceView,
+    wrap_ms: &mut f64,
+) -> bool {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 14.0;
         ui.label(section_title("Beat trace", palette.text));
         legend_dot_item(ui, palette, palette.tick, "Tick");
         legend_dot_item(ui, palette, palette.accent, "Tock");
         legend_line_item(ui, palette, palette.good, "Rate trend");
+        let patterns_clicked = pattern_legend_button(ui, palette).clicked();
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -308,7 +328,10 @@ fn chart_header_row(ui: &mut egui::Ui, palette: &Palette, view: &mut TraceView, 
             }
             hint_label(ui, palette);
         });
-    });
+
+        patterns_clicked
+    })
+    .inner
 }
 
 fn legend_dot_item(ui: &mut egui::Ui, palette: &Palette, color: egui::Color32, text: &str) {
@@ -331,6 +354,21 @@ fn legend_line_item(ui: &mut egui::Ui, palette: &Palette, color: egui::Color32, 
         }
         ui.label(egui::RichText::new(text).size(12.0).color(palette.muted));
     });
+}
+
+/// The classic-pattern-legend "?" button (M4 Task 13), placed after the
+/// beat-trace header's legend items. Same 16×16 faint-outline style as
+/// `ui::cards`'s own `help_button` (not imported from it — that fn is
+/// private, same "each module owns its own tiny presentational helpers"
+/// precedent as `ui::scope`'s `SCOPE_ROW_INSET`).
+fn pattern_legend_button(ui: &mut egui::Ui, palette: &Palette) -> egui::Response {
+    ui.add_sized(
+        [16.0, 16.0],
+        egui::Button::new(egui::RichText::new("?").size(10.0).color(palette.faint))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0, palette.border2))
+            .corner_radius(8.0),
+    )
 }
 
 fn hint_label(ui: &mut egui::Ui, palette: &Palette) {

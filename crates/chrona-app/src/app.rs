@@ -32,8 +32,8 @@ use crate::ui::{
     ChartsUiState, ControlsState, CountWatermark, DoctorCtx, DoctorPanel, HelpTopicId, ScopeCtx,
     SessionPanelState, StripCtx, TempCaptureGuard, ToolbarCtx, ToolbarState, WATERMARK_WINDOW,
     bottom_grid, charts_section, default_recordings_dir, metrics_cards, pick_banner,
-    position_strip, render_cal_wizard, render_doctor_panel, render_help_modal, resolve_app_banner,
-    scope_section, toolbar_row,
+    position_strip, render_cal_wizard, render_doctor_panel, render_help_modal,
+    render_pattern_legend_modal, resolve_app_banner, scope_section, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -130,6 +130,15 @@ pub struct ChronaApp {
     /// (`ui::cards::metrics_cards`'s return value) and cleared by
     /// `ui::modals::render_help_modal` (✕, click-outside, or Esc).
     open_help: Option<HelpTopicId>,
+    /// Whether the classic tape-pattern legend modal is open (M4 Task 13,
+    /// binding spec §6); `false` most of the time. Set from the beat-trace
+    /// header's "?" button (`ui::charts::charts_section`'s return value)
+    /// and cleared by `ui::patterns::render_pattern_legend_modal` (✕,
+    /// click-outside, or Esc) — same shape as `open_help`, just a bare
+    /// `bool` rather than `Option<HelpTopicId>` since there's only ever one
+    /// thing this modal can show (all six rows at once, not a per-topic
+    /// selection).
+    patterns_open: bool,
     /// A transient app-side notice (M4a Task 9, spec §9) — currently only
     /// the Export-report success/failure outcome (`run_export`) — shown in
     /// the same banner strip as the engine's own banner, but ONLY when the
@@ -249,6 +258,7 @@ impl ChronaApp {
             toolbar,
             selected_position: 0,
             open_help: None,
+            patterns_open: false,
             app_banner: None,
             cal_wizard: None,
             cal_wizard_confirm_cancel: false,
@@ -538,7 +548,7 @@ impl eframe::App for ChronaApp {
                     render_help_modal(ui.ctx(), palette, &mut self.open_help, help_just_opened);
 
                     ui.add_space(8.0);
-                    charts_section(
+                    let patterns_clicked = charts_section(
                         ui,
                         palette,
                         &mut self.trace_view,
@@ -548,6 +558,21 @@ impl eframe::App for ChronaApp {
                             amp_accum: &self.amp_accum,
                             metrics: snap.metrics.as_ref(),
                         },
+                    );
+                    // M4 Task 13: the beat-trace header's "?" button opens
+                    // the classic tape-pattern legend — same "set on click,
+                    // caller computes just_opened" shape as `open_help`/
+                    // `help_just_opened` just above.
+                    let mut patterns_just_opened = false;
+                    if patterns_clicked {
+                        self.patterns_open = true;
+                        patterns_just_opened = true;
+                    }
+                    render_pattern_legend_modal(
+                        ui.ctx(),
+                        palette,
+                        &mut self.patterns_open,
+                        patterns_just_opened,
                     );
 
                     // M4 Task 12: the collapsible Scope section, between the
