@@ -13,6 +13,13 @@ info-banners-render-red items (annotated there). This file adds the redesign's o
 - Recording tee swallows `writer.push` errors; overrun banner latches; the
   `chrona_session::replay` vs engine-path semantic divergence; `assert_no_alloc`.
 
+**ALL FIVE DISCHARGED by M4's debt queue** (design doc
+`docs/superpowers/specs/2026-09-07-m4-trust-features-design.md` §2, Tasks 1-5) — see the
+matching items in `m3-followups.md`'s "M4 first-week debt" and "App/engine debt from the
+final review" sections for the full annotations and commits (`parabolic3`:
+a5fdb14+42a215f; startup survival: fa502f9; recording tee + overrun latch: d9c2d99;
+replay-path alignment: 598d3e8; `assert_no_alloc`: e572936).
+
 ## New accepted characteristics from the redesign (deliberate, documented)
 
 - Toolbar does not wrap on narrow windows (mockup's CSS wraps; egui right-aligned
@@ -75,6 +82,13 @@ info-banners-render-red items (annotated there). This file adds the redesign's o
 3. **Spec text sync**: §7's ordering-fallback wording (filename-civil vs the
    implemented started_unix_s → sidecar-mtime), §5's "No watch" vs the implemented
    "Select watch" combo text — amend both + §14 entries. (M-3, M-4.)
+   **DISCHARGED by M4 (Task 5, commit c7e1f78):** the 2026-08-23 UI-redesign spec's §7
+   now matches `history.rs`'s actual `started_unix_s`-desc / sidecar-mtime-fallback
+   ordering (no filename-civil-timestamp fallback ever existed in real code); §5 now
+   reads "combo shows `Select watch`" — verified against `toolbar.rs` AND `git log
+   --follow -p --all` on that file, which shows "Select watch" is the only string that
+   has ever appeared there; §14 gained items 11-12 recording both corrections. See
+   task-5-report.md's "Step 3: spec text syncs".
 4. **Export "BPH mode" line echoes the raw Other-field buffer**, which can hold
    unsent/unparseable text; echo the engine-effective mode instead. (M-5.)
 5. **Free-mode amplitude strip shows "listening…" forever** while the amplitude CARD

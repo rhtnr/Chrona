@@ -5,9 +5,11 @@ rate (s/day), beat error (ms), and amplitude (°) — with honest, signal-aware 
 instead of fabricated numbers on weak microphones.
 
 **Status:** milestones M1 (headless DSP pipeline), M2 (full metrics + calibration), M3
-(live app: microphone capture, real-time instrument UI, record/replay), and M4a (redesigned
-instrument UI: watch library, session history, position comparison, report export) are
-complete. Still open from M4: Mic Doctor, calibration wizard UI, scope view.
+(live app: microphone capture, real-time instrument UI, record/replay), M4a (redesigned
+instrument UI: watch library, session history, position comparison, report export), and M4
+(trust features: calibration wizard, Mic Doctor, scope view, pattern legend — see below)
+are complete. Still open: M5 (packaging/signing, first release, and Mic Doctor's
+OS-specific layer — Windows effects enumeration, gain writeback, Bluetooth refusal).
 The binding design document is
 [docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md](docs/superpowers/specs/2026-08-20-chrona-timegrapher-design.md);
 known debt and deferred work live in [docs/superpowers/notes/](docs/superpowers/notes/).
@@ -35,6 +37,20 @@ HTML report export, and a light/dark theme toggle. Controls cover input device, 
 angle, averaging window, BPH mode, and per-device timebase correction (persisted).
 Sessions can be recorded to WAV + JSON sidecar and replayed bit-faithfully.
 `--headless-seconds N` prints the metrics line and exits (used by CI).
+
+Trust features round out the instrument. A guided **calibration wizard** (toolbar's
+cal-ppm popup → "Calibrate…") records ≥ 5 minutes of a quartz watch's 1 Hz tick and
+regresses it into a per-device ppm correction — it refuses a mechanical-watch signal
+outright ("this doesn't look like a quartz tick") rather than fabricating a
+plausible-looking ppm, and a live-mic session grows a **system-clock skew
+cross-check** (an NTP-style sanity line, "use as correction" only on explicit click,
+never applied automatically). **Mic Doctor** (its own toolbar button) runs three short
+checks — silence floor, tick clarity, AGC/gate pumping — against whatever source is
+active and reports a 0–100 setup score with ranked, concrete fixes. A collapsible
+**Scope** view stacks the newest per-beat waveforms with drop/unlock markers and
+per-beat SNR, and the beat-trace header's "?" opens a **classic tape-pattern legend**
+(level / sloped / banded / wavy / scattered / sudden-jumps) explaining what each trace
+shape means.
 
 Before any release, run the complete manual test protocol in
 [docs/manual-testing.md](docs/manual-testing.md) — live-mic behavior can only be
