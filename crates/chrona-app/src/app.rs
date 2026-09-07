@@ -6,7 +6,8 @@
 //! (`ui::strip`, M4a Task 7) — stays on screen regardless of window height,
 //! while everything below it (the metric cards, `ui::cards`, M4a Task 7;
 //! the beat-trace/amplitude charts that replaced M3's paper tape,
-//! `ui::charts::charts_section`, M4a Task 8; and the session-history/
+//! `ui::charts::charts_section`, M4a Task 8; the collapsible per-beat Scope
+//! view, `ui::scope::scope_section`, M4 Task 12; and the session-history/
 //! position-comparison cards that complete the mockup's layout,
 //! `ui::history_ui::bottom_grid`, M4a Task 9) sits inside the central
 //! panel's `egui::ScrollArea::vertical`, so a short window scrolls to reach
@@ -28,11 +29,11 @@ use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
     AddWatchModalState, BottomGridCtx, BphComboItem, BphModeUi, CalWizard, CalWizardCtx, ChartsCtx,
-    ChartsUiState, ControlsState, CountWatermark, DoctorCtx, DoctorPanel, HelpTopicId,
+    ChartsUiState, ControlsState, CountWatermark, DoctorCtx, DoctorPanel, HelpTopicId, ScopeCtx,
     SessionPanelState, StripCtx, TempCaptureGuard, ToolbarCtx, ToolbarState, WATERMARK_WINDOW,
     bottom_grid, charts_section, default_recordings_dir, metrics_cards, pick_banner,
     position_strip, render_cal_wizard, render_doctor_panel, render_help_modal, resolve_app_banner,
-    toolbar_row,
+    scope_section, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -171,6 +172,15 @@ pub struct ChronaApp {
     /// top-level "Mic Doctor" button (`toolbar.doctor_requested`, consumed
     /// each frame the same way `toolbar.cal_wizard_requested` is).
     doctor: DoctorPanel,
+    /// The Scope view's own open/closed state (M4 Task 12, binding spec
+    /// §6). A plain `bool`, not a richer state struct like `ChartsUiState`:
+    /// `ui::scope::scope_section` needs nothing else per-frame — it reads
+    /// `EngineSnapshot::scope` straight off this frame's snapshot rather
+    /// than caching anything here. Toggling this is the ONLY thing that
+    /// drives `ControlMsg::SetScope` — see `ui::scope::scope_section`'s own
+    /// doc comment for exactly where that send happens (on the open/close
+    /// flip, never unconditionally every frame).
+    scope_open: bool,
 }
 
 impl ChronaApp {
@@ -244,6 +254,7 @@ impl ChronaApp {
             cal_wizard_confirm_cancel: false,
             cal_capture_guard: None,
             doctor: DoctorPanel::default(),
+            scope_open: false,
         }
     }
 
@@ -536,6 +547,23 @@ impl eframe::App for ChronaApp {
                             beat_accum: &self.beat_accum,
                             amp_accum: &self.amp_accum,
                             metrics: snap.metrics.as_ref(),
+                        },
+                    );
+
+                    // M4 Task 12: the collapsible Scope section, between the
+                    // amplitude strip above and the bottom grid below (spec
+                    // §6). Closed by default (`scope_open` inits `false`) —
+                    // opening/closing drives `ControlMsg::SetScope` from
+                    // inside `scope_section` itself, only on the actual
+                    // flip; see that fn's own doc comment.
+                    ui.add_space(8.0);
+                    scope_section(
+                        ui,
+                        palette,
+                        &mut self.scope_open,
+                        ScopeCtx {
+                            engine: &self.engine,
+                            scope: snap.scope.as_deref(),
                         },
                     );
 
