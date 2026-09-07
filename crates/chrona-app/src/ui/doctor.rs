@@ -25,6 +25,29 @@
 //! ONLY the reports that have (its `Option` params) — a step nobody ran
 //! contributes no penalty and no advice.
 //!
+//! **Cancel (fix round 1, post-review):** a step's capture can never reach
+//! `EngineSnapshot::doctor_capture` at all if the active source runs out
+//! before the requested length — most concretely, a `Replay` source
+//! (which doesn't loop, unlike `Simulate`) with less audio remaining than
+//! the step needs. Before this fix, that left the panel stuck showing
+//! "Capturing…" forever, with the other two Run buttons disabled, until a
+//! `SwitchSource` (which clears `pending` as a side effect of the stale-
+//! setup guard above) or an app restart — `cal_wizard` has exactly this
+//! escape-hatch affordance on its own Capturing screen, which this panel
+//! was missing. Every pending row now offers an instant Cancel (no confirm
+//! dialog, unlike the wizard's multi-minute capture — these are 5–10s, so
+//! an accidental cancel costs nothing) that clears `DoctorPanel::pending`.
+//! The ENGINE has no matching "cancel" message: cancelling is purely a
+//! panel-side decision to stop caring about a capture it already asked
+//! for. The engine may still eventually deliver that buffer (or, on a live
+//! source, a NEW request the panel sends afterward simply supersedes it —
+//! "second replaces first", `ControlMsg::DoctorCapture`'s own doc
+//! comment) — safety rests on `pending_capturing_step` (below): Phase 1
+//! only ever consumes a `doctor_capture` arrival when `pending` is
+//! `Some(Capturing{..})` for a matching step, so a cancelled request's
+//! buffer, however late it arrives, is silently ignored — never
+//! fabricated into a report.
+//!
 //! The pure helpers below (`silence_verdict`, `tick_verdict`, `agc_verdict`,
 //! `doctor_capture_remaining`) are TDD'd first; the egui-facing rendering
 //! that follows is exercised only by `cargo build` + the workspace test
@@ -237,6 +260,26 @@ enum PendingCapture {
     },
 }
 
+/// The step whose buffer a `doctor_capture` arrival should be handed off
+/// to this frame, if any — `None` whenever `pending` isn't `Some(
+/// Capturing{..})`. That covers three cases: nothing pending at all, a
+/// step already past capturing and into `Analyzing`, and — the case fix
+/// round 1 (post-review) adds Cancel for — right after a Cancel cleared
+/// `pending` back to `None`.
+///
+/// This is the ENTIRE safety argument for Cancel being a purely panel-side
+/// decision with no matching engine-side "cancel" message: a cancelled
+/// request's buffer, however late the engine eventually publishes it,
+/// arrives to find this fn returning `None` and is silently ignored by
+/// `render_doctor_panel`'s Phase 1 — never fabricated into a report for a
+/// step nobody is waiting on. PURE, tested in `tests` below.
+fn pending_capturing_step(pending: &Option<PendingCapture>) -> Option<DoctorStep> {
+    match pending {
+        Some(PendingCapture::Capturing { step, .. }) => Some(*step),
+        _ => None,
+    }
+}
+
 /// The Mic Doctor panel's own state: whether it's currently shown, each
 /// step's completed report (`None` = "not run" — honesty gate), and the one
 /// pending capture, if any. Kept as a plain `ChronaApp` field (not
@@ -281,6 +324,11 @@ pub struct DoctorCtx<'a> {
 enum DoctorAction {
     None,
     Run(DoctorStep),
+    /// Fix round 1 (post-review): abandon whatever's pending (`Capturing`
+    /// or `Analyzing`, either — no need to distinguish, since only the
+    /// pending step's own row ever shows a Cancel button) — see the module
+    /// doc comment's "Cancel" section.
+    Cancel,
     Close,
 }
 
@@ -312,12 +360,10 @@ pub fn render_doctor_panel(
 
     // Phase 1: a Capturing step whose buffer just arrived hands off to a
     // worker thread running the matching `chrona_dsp::doctor` fn — mirrors
-    // `ui::cal_wizard`'s own Capturing -> Analyzing handoff.
-    let capturing_step = match &panel.pending {
-        Some(PendingCapture::Capturing { step, .. }) => Some(*step),
-        _ => None,
-    };
-    if let Some(step) = capturing_step
+    // `ui::cal_wizard`'s own Capturing -> Analyzing handoff. Also the
+    // "ignore a cancelled request's late buffer" guard — see `pending_
+    // capturing_step`'s doc comment.
+    if let Some(step) = pending_capturing_step(&panel.pending)
         && let Some((samples, sample_rate_hz)) = dctx.snap.doctor_capture.clone()
     {
         let (tx, rx) = mpsc::channel();
@@ -425,6 +471,12 @@ fn apply_doctor_action(action: DoctorAction, panel: &mut DoctorPanel, engine: &E
                 });
             }
         }
+        // No message to the engine — see the module doc comment's
+        // "Cancel" section for why clearing `pending` here is the whole
+        // fix, and `pending_capturing_step`'s doc comment for why a late
+        // buffer from the abandoned request can never resurface as a
+        // fabricated report.
+        DoctorAction::Cancel => panel.pending = None,
         DoctorAction::Close => panel.open = false,
     }
 }
@@ -556,13 +608,25 @@ fn render_step_row(
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if analyzing {
+                // Call order [Cancel, Spinner, label] -> visual left-to-
+                // right "Analyzing… [spinner] [Cancel]" (right_to_left
+                // stacks first-call=rightmost).
+                if outline_button(ui, palette, "Cancel").clicked() {
+                    action = DoctorAction::Cancel;
+                }
+                ui.add(egui::Spinner::new().color(palette.accent));
                 ui.label(
                     egui::RichText::new("Analyzing\u{2026}")
                         .size(12.0)
                         .color(palette.muted),
                 );
-                ui.add(egui::Spinner::new().color(palette.accent));
             } else if let Some((started, seconds)) = capturing {
+                // Fix round 1 (post-review): Cancel is the escape hatch
+                // for a source that runs out before this step's requested
+                // length — see the module doc comment's "Cancel" section.
+                if outline_button(ui, palette, "Cancel").clicked() {
+                    action = DoctorAction::Cancel;
+                }
                 let label = match doctor_capture_remaining(started, seconds, now) {
                     Some(r) => format!("Capturing\u{2026} {}s", ceil_secs(r)),
                     None => "Finishing up\u{2026}".to_string(),
@@ -611,6 +675,24 @@ fn render_step_row(
             );
         }
         None => {} // currently capturing/analyzing — no stale "not run" line
+    }
+
+    // Fix round 1 (post-review): honest, no-timeout-magic note about the
+    // one way a capture can hang forever on its own — shown only while
+    // actively `Capturing` (not `Analyzing`, which runs a fast in-memory
+    // fn and isn't at risk of this). No attempt to detect or predict
+    // whether THIS capture is doomed (that would need engine-side
+    // signaling this task doesn't add) — just the plain fact plus the
+    // escape hatch, always available while waiting.
+    if capturing.is_some() {
+        ui.label(
+            egui::RichText::new(
+                "A source with less audio remaining than this step needs will never \
+                 finish on its own \u{2014} Cancel, then try a different source.",
+            )
+            .size(11.0)
+            .color(palette.faint),
+        );
     }
 
     action
@@ -843,6 +925,37 @@ mod tests {
             doctor_capture_remaining(t0, 10.0, t0 + Duration::from_secs(11)),
             None,
             "past the requested span: still None"
+        );
+    }
+
+    /// Fix round 1 (post-review): the entire safety argument for Cancel
+    /// having no matching engine-side message — a late `doctor_capture`
+    /// arrival is only ever consumed by `render_doctor_panel`'s Phase 1
+    /// when this fn returns `Some`.
+    #[test]
+    fn pending_capturing_step_ignores_everything_but_a_matching_capturing_step() {
+        assert_eq!(
+            pending_capturing_step(&None),
+            None,
+            "nothing pending (including right after a Cancel): ignore"
+        );
+        assert_eq!(
+            pending_capturing_step(&Some(PendingCapture::Capturing {
+                step: DoctorStep::Tick,
+                started: Instant::now(),
+                seconds: 10.0,
+            })),
+            Some(DoctorStep::Tick),
+            "actively capturing Tick: consume for Tick"
+        );
+        let (_tx, rx) = mpsc::channel();
+        assert_eq!(
+            pending_capturing_step(&Some(PendingCapture::Analyzing {
+                step: DoctorStep::Agc,
+                rx,
+            })),
+            None,
+            "already past Capturing into Analyzing: ignore (nothing left to hand off)"
         );
     }
 }
