@@ -167,9 +167,9 @@ pub struct ChronaApp {
     /// The Mic Doctor panel (M4 Task 10, binding spec §3.2) — a plain
     /// field, not `Option`, since the panel's own `open` flag tracks
     /// visibility while its step results persist across close/reopen (see
-    /// `ui::doctor::DoctorPanel`'s doc comment). Opened by the cal-ppm
-    /// popup's "Mic Doctor…" row (`toolbar.doctor_requested`, consumed each
-    /// frame the same way `toolbar.cal_wizard_requested` is).
+    /// `ui::doctor::DoctorPanel`'s doc comment). Opened by the toolbar's
+    /// top-level "Mic Doctor" button (`toolbar.doctor_requested`, consumed
+    /// each frame the same way `toolbar.cal_wizard_requested` is).
     doctor: DoctorPanel,
 }
 
@@ -463,12 +463,12 @@ impl eframe::App for ChronaApp {
             },
         );
 
-        // M4 Task 10: the cal-ppm popup's "Mic Doctor…" row sets this —
-        // same "set on click, consumed next frame" shape as `cal_wizard_
-        // requested` just above. `DoctorPanel::open` (not a fresh value
-        // like `CalWizard::Intro`) since the panel is a plain field whose
-        // step results persist across close/reopen — see `ui::doctor::
-        // DoctorPanel`'s doc comment.
+        // M4 Task 10: the toolbar's top-level "Mic Doctor" button sets
+        // this — same "set on click, consumed next frame" shape as
+        // `cal_wizard_requested` just above. `DoctorPanel::open` (not a
+        // fresh value like `CalWizard::Intro`) since the panel is a plain
+        // field whose step results persist across close/reopen — see
+        // `ui::doctor::DoctorPanel`'s doc comment.
         if self.toolbar.doctor_requested {
             self.toolbar.doctor_requested = false;
             self.doctor.open();

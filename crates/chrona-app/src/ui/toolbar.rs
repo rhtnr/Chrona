@@ -80,8 +80,9 @@ pub fn export_enabled(selected_watch: Option<&str>, has_sessions: bool) -> bool 
 /// each frame by `ChronaApp::run_export`, M4a Task 9), the calibration-
 /// wizard request flag the cal-ppm popup's "Calibrate…" row sets (M4 Task
 /// 8, same "set here, consumed next frame" shape as `export_requested`),
-/// and the Mic Doctor request flag the same popup's "Mic Doctor…" row sets
-/// (M4 Task 10, identical shape again).
+/// and the Mic Doctor request flag the top-level "Mic Doctor" button sets
+/// (M4 Task 10, identical shape again — `mic_doctor_button`, beside "Open
+/// recording…"/"Export report", not the cal-ppm popup).
 pub struct ToolbarState {
     pub selected_watch: Option<String>,
     pub bph_selection: BphComboItem,
@@ -155,16 +156,18 @@ pub fn toolbar_row(
             engine,
             config,
             ctx.snap.health.clock_skew,
-            CalPpmRequests {
-                cal_wizard_requested: &mut state.cal_wizard_requested,
-                doctor_requested: &mut state.doctor_requested,
-            },
+            &mut state.cal_wizard_requested,
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Added in reverse of visual left-to-right order (mockup:
-            // theme toggle, Open recording…, Export report, Record) since
-            // `right_to_left` stacks from the row's right edge inward.
+            // theme toggle, Open recording…, Mic Doctor, Export report,
+            // Record) since `right_to_left` stacks from the row's right
+            // edge inward. Mic Doctor (M4 Task 10 pre-review fix) sits
+            // beside Open recording…/Export report — the binding spec
+            // treats it as a first-class flow (first-launch auto-run lands
+            // in M5), so it gets toolbar presence, not a buried cal-ppm
+            // popup row.
             record_stop_button(
                 ui,
                 palette,
@@ -184,6 +187,7 @@ pub fn toolbar_row(
                 ctx.history,
                 &mut state.export_requested,
             );
+            mic_doctor_button(ui, palette, &mut state.doctor_requested);
             open_recording_button(ui, palette, engine, ctx.session);
             theme_toggle_button(ui, palette, theme, config);
         });
@@ -437,17 +441,6 @@ fn averaging_combo(
         });
 }
 
-/// The cal-ppm popup's two "open a modal" request flags (M4 Tasks 8/10):
-/// bundled purely to keep `cal_ppm_control`'s own argument count sane
-/// (`clippy::too_many_arguments` — 8 params without this, one over the
-/// 7-arg default threshold), same shape as `RecordButtonCtx` below. Both
-/// flags are owned by `ToolbarState`; the popup only ever sets one to
-/// `true` on its own row's click, never reads either back.
-struct CalPpmRequests<'a> {
-    cal_wizard_requested: &'a mut bool,
-    doctor_requested: &'a mut bool,
-}
-
 /// `cal {ppm:+.1} ppm` — a click target opening a compact ppm editor (spec
 /// §14 deviation #10, pre-review fix: the mockup renders this as static
 /// text, but the app keeps it editable — manual-protocol B.7 and per-device
@@ -482,11 +475,12 @@ struct CalPpmRequests<'a> {
 /// popup itself doesn't know about `CalWizard` at all, keeping the wizard's
 /// state machine entirely out of this module.
 ///
-/// M4 Task 10 adds a second row, "Mic Doctor…", right below "Calibrate…":
-/// the Mic Doctor panel's entry point, identical "set a flag, consumed next
-/// frame" shape — this popup doesn't know about `ui::doctor::DoctorPanel`
-/// either. Its request flag travels in `requests` alongside `cal_wizard_
-/// requested` (see `CalPpmRequests`'s own doc comment for why).
+/// M4 Task 10 pre-review fix: the Mic Doctor entry does NOT live here — it
+/// was moved to a top-level toolbar button (`mic_doctor_button`) once
+/// review flagged that "mirror Calibrate's entry" was ambiguous. Calibrate
+/// legitimately belongs in this popup (it IS timebase calibration); the
+/// Doctor is a distinct, first-class flow, not a calibration setting, so it
+/// gets its own toolbar button instead of a buried popup row.
 fn cal_ppm_control(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -494,12 +488,8 @@ fn cal_ppm_control(
     engine: &Engine,
     config: &mut ConfigStore,
     clock_skew: Option<ClockSkew>,
-    requests: CalPpmRequests<'_>,
+    cal_wizard_requested: &mut bool,
 ) -> bool {
-    let CalPpmRequests {
-        cal_wizard_requested,
-        doctor_requested,
-    } = requests;
     let button_resp = ui
         .add(
             egui::Button::new(
@@ -557,13 +547,6 @@ fn cal_ppm_control(
                 .clicked()
             {
                 *cal_wizard_requested = true;
-            }
-            if ui
-                .small_button("Mic Doctor…")
-                .on_hover_text("Check your mic setup: silence floor, tick clarity, AGC/gate")
-                .clicked()
-            {
-                *doctor_requested = true;
             }
 
             match ppm_to_apply {
@@ -630,6 +613,22 @@ fn theme_toggle_button(
         theme::apply_style(ui.ctx(), *theme);
         config.theme = Some(theme::theme_config_value(*theme).to_string());
         persist_config_now(config);
+    }
+}
+
+/// "Mic Doctor" (M4 Task 10, pre-review fix): a top-level button, not a
+/// cal-ppm popup row — the binding spec treats the Doctor as a first-class
+/// flow (first-launch auto-run lands in M5), so it gets toolbar presence
+/// beside "Open recording…"/"Export report" rather than being buried
+/// behind the timebase-calibration popup. A click only sets `*doctor_
+/// requested = true`; `ChronaApp::ui` consumes it on the next frame the
+/// same way it consumes `ToolbarState::export_requested`/`cal_wizard_
+/// requested` — this fn doesn't know `ui::doctor::DoctorPanel` exists.
+fn mic_doctor_button(ui: &mut egui::Ui, palette: &Palette, doctor_requested: &mut bool) {
+    let resp = outline_button(ui, palette, "Mic Doctor")
+        .on_hover_text("Check your mic setup: silence floor, tick clarity, AGC/gate");
+    if resp.clicked() {
+        *doctor_requested = true;
     }
 }
 

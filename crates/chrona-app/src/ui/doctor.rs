@@ -5,8 +5,11 @@
 //! and, once the engine delivers the buffer, handing it to the matching
 //! `chrona_dsp::doctor` fn on a worker thread (mirrors `ui::cal_wizard`'s
 //! own Capturing -> Analyzing handoff — see that module's doc comment).
-//! Entry point is the toolbar's cal-ppm popup's "Mic Doctor…" row, right
-//! below "Calibrate…" (`ui::toolbar`'s `cal_ppm_control`).
+//! Entry point is the toolbar's top-level "Mic Doctor" button, beside "Open
+//! recording…"/"Export report" (`ui::toolbar`'s `mic_doctor_button`) — a
+//! pre-review fix moved it out of the cal-ppm popup, since Calibrate is
+//! genuinely a calibration setting but the Doctor is a distinct, first-class
+//! flow (first-launch auto-run lands in M5) that deserves its own button.
 //!
 //! **Honesty (binding):** a step that hasn't run shows "not run", never a
 //! guess — `DoctorPanel`'s three report fields are `Option`, and nothing
@@ -256,9 +259,10 @@ pub struct DoctorPanel {
 }
 
 impl DoctorPanel {
-    /// Opens the panel (toolbar "Mic Doctor…" row — `ChronaApp::ui`
-    /// consumes `ToolbarState::doctor_requested` the same "set on click,
-    /// consumed next frame" way it consumes `cal_wizard_requested`).
+    /// Opens the panel (toolbar's top-level "Mic Doctor" button —
+    /// `ChronaApp::ui` consumes `ToolbarState::doctor_requested` the same
+    /// "set on click, consumed next frame" way it consumes `cal_wizard_
+    /// requested`).
     pub fn open(&mut self) {
         self.open = true;
     }
