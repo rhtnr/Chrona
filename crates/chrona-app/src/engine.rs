@@ -2,9 +2,11 @@
 //! snapshot publishing (spec §7/§9).
 //!
 //! One `std::thread` owns everything DSP-adjacent: the active source (mic
-//! consumer / simulate generator / replay data), the `Analyzer`, an
-//! optional recording `SessionWriter`, and the input side of a
-//! `triple_buffer::TripleBuffer<EngineSnapshot>`. The UI thread never
+//! consumer / simulate generator / replay data — or, when every way of
+//! starting one has fatally failed, an idle placeholder that keeps the
+//! thread alive for a later recovery; see `SourceRuntime::Idle`), the
+//! `Analyzer`, an optional recording `SessionWriter`, and the input side of
+//! a `triple_buffer::TripleBuffer<EngineSnapshot>`. The UI thread never
 //! touches the `Analyzer` directly — see [`Engine::snapshot`] for why that
 //! matters. Control flows in one direction, UI → engine, over an
 //! `std::sync::mpsc` channel; state flows the other way, engine → UI, over
@@ -58,6 +60,14 @@ const REPLAY_CHUNK_S: f64 = 1.0;
 /// slow control-message batch, or the OS briefly starving this thread)
 /// before `chrona_audio` starts counting overruns.
 const MIC_RING_S: f64 = 5.0;
+/// `SourceRuntime::Idle`'s fixed sample rate (spec/M4 T3). Any real
+/// negotiated rate would do — this is never fed samples — but 48 kHz
+/// matches `CaptureStream`'s own first-choice negotiation target
+/// (`chrona_audio::capture::negotiate`) and comfortably clears every
+/// DSP-side Nyquist requirement (spec's 3 kHz high-pass among them), so an
+/// `Analyzer` can always be built against it regardless of *why* the engine
+/// ended up idle.
+const IDLE_SAMPLE_RATE_HZ: f64 = 48_000.0;
 
 // ---------------------------------------------------------------------
 // Public control-plane types (spec §7): what the UI sends the engine, and
@@ -320,6 +330,41 @@ enum SourceRuntime {
         sample_rate_hz: f64,
         done: bool,
     },
+    /// A live-nothing placeholder `engine_loop`'s initial-build fallback
+    /// runs on once every way of starting a real source (or its `Analyzer`)
+    /// has fatally failed — see the fall-through arms in `engine_loop`
+    /// below (T3, M4: this used to be a `return`, killing the thread).
+    /// `pull_tick` pulls zero samples for it, forever: no data ever reaches
+    /// the `Analyzer`, the `SilenceTracker`, or a `SessionWriter` (which is
+    /// why `ControlMsg::StartRecording`'s handler refuses to create one
+    /// while idle — recording silence under a name implying real capture
+    /// would be a lie). A fixed `IDLE_SAMPLE_RATE_HZ`, rather than carrying
+    /// no rate at all, means a real `Analyzer` still gets built against it —
+    /// every downstream invariant ("there is always a current `Analyzer`",
+    /// config changes rebuild it, etc.) stays intact; Idle just never feeds
+    /// it anything, rather than every caller needing to special-case an
+    /// `Option<Analyzer>`. The carried `SourceKind` is whatever was last
+    /// *attempted* (not necessarily built) — see `spec_kind` — so
+    /// `EngineSnapshot::source_kind` (the UI's device-picker context) still
+    /// reflects what the user was trying to run, instead of resetting to
+    /// `SourceKind::default()` out of nowhere. The only way out is a
+    /// successful `SwitchSource`.
+    ///
+    /// Banner lifecycle: the fatal-fallthrough arms set an
+    /// `Error`-severity `banner` alongside the `Idle` runtime; nothing
+    /// while idle ever clears it back to `None` — `apply_config`'s
+    /// `source_is_idle` gate refuses to (see its doc comment), the
+    /// silence/clipping/overrun paths above never fire (no samples ever
+    /// pulled), and `SwitchSource`'s own Err arms only ever *replace* it
+    /// with another `Error` banner, never clear it. The one path that does
+    /// clear it — `SwitchSource` actually succeeding — is also the only
+    /// path that ever moves `source` off `Idle`, so the two stay
+    /// correctly in lockstep. On the UI side, `ui::controls::pick_banner`
+    /// checks the engine's `banner` first and returns it immediately when
+    /// present, before even looking at health counters — so this banner is
+    /// guaranteed to be what's rendered while idle regardless of anything
+    /// else in the published snapshot.
+    Idle(SourceKind),
 }
 
 impl SourceRuntime {
@@ -445,6 +490,7 @@ impl SourceRuntime {
             SourceRuntime::Mic(s) => s.info.sample_rate_hz,
             SourceRuntime::Simulate { sample_rate_hz, .. } => *sample_rate_hz,
             SourceRuntime::Replay { sample_rate_hz, .. } => *sample_rate_hz,
+            SourceRuntime::Idle(_) => IDLE_SAMPLE_RATE_HZ,
         }
     }
 
@@ -453,6 +499,7 @@ impl SourceRuntime {
             SourceRuntime::Mic(_) => SourceKind::Mic,
             SourceRuntime::Simulate { .. } => SourceKind::Simulate,
             SourceRuntime::Replay { .. } => SourceKind::Replay,
+            SourceRuntime::Idle(kind) => *kind,
         }
     }
 
@@ -468,11 +515,26 @@ impl SourceRuntime {
             SourceRuntime::Mic(s) => s.info.device_name.clone(),
             SourceRuntime::Simulate { .. } => "simulate".to_string(),
             SourceRuntime::Replay { .. } => "replay".to_string(),
+            SourceRuntime::Idle(_) => "idle".to_string(),
         }
     }
 
     fn replay_done(&self) -> bool {
         matches!(self, SourceRuntime::Replay { done: true, .. })
+    }
+}
+
+/// Maps a `SourceSpec` to the `SourceKind` it would build (mirrors
+/// `SourceRuntime::kind`'s own mapping one level up, before anything has
+/// necessarily built) — used by `engine_loop`'s initial-build fallback to
+/// give `SourceRuntime::Idle` a sensible `kind` even when nothing actually
+/// built, so `EngineSnapshot::source_kind` still reflects what was
+/// attempted rather than resetting to `SourceKind::default()`.
+fn spec_kind(spec: &SourceSpec) -> SourceKind {
+    match spec {
+        SourceSpec::Mic { .. } => SourceKind::Mic,
+        SourceSpec::Simulate { .. } => SourceKind::Simulate,
+        SourceSpec::ReplayFile { .. } => SourceKind::Replay,
     }
 }
 
@@ -540,6 +602,39 @@ fn build_analyzer(config: &EngineConfig, sample_rate_hz: f64) -> Result<Analyzer
         ppm_correction: config.ppm_correction,
         lift_angle_deg: config.lift_angle_deg,
         averaging_s: config.averaging_s,
+    })
+}
+
+/// Builds the `Analyzer` `SourceRuntime::Idle` runs with — called only from
+/// `engine_loop`'s initial-build fallback, once every other option (a real
+/// source, or an `Analyzer` built against its real negotiated rate) has
+/// already failed.
+///
+/// `IDLE_SAMPLE_RATE_HZ` already rules out a pathological source sample
+/// rate (e.g. an oddball Mic negotiation too low for the spec's 3 kHz
+/// high-pass) as a reason this could still fail — so the only remaining way
+/// it can is `*config` itself being invalid (e.g. a corrupted persisted
+/// `lift_angle_deg`, read at app startup independently of which source was
+/// being attempted). In that case `*config` is reset to the same
+/// known-valid literals `run_headless` and
+/// `chrona_dsp::AnalyzerConfig::default()` both use, for the same reason
+/// `SourceRuntime::build`'s Replay-sidecar clamp exists (see its doc
+/// comment): every later `apply_config`/`SwitchSource` call starts from
+/// `*config`, so leaving it poisoned here would keep failing validation
+/// "for the same reason" until the user happened to fix that exact field.
+/// These literals are unconditionally analyzer-valid at
+/// `IDLE_SAMPLE_RATE_HZ`, so the second attempt can never fail — this
+/// function never fails.
+fn build_idle_analyzer(config: &mut EngineConfig) -> Analyzer {
+    build_analyzer(config, IDLE_SAMPLE_RATE_HZ).unwrap_or_else(|_| {
+        *config = EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: BphMode::Auto,
+            ppm_correction: 0.0,
+        };
+        build_analyzer(config, IDLE_SAMPLE_RATE_HZ)
+            .expect("EngineConfig defaults at IDLE_SAMPLE_RATE_HZ are always analyzer-valid")
     })
 }
 
@@ -620,10 +715,20 @@ fn parse_sidecar_bph_mode(s: &str) -> Option<BphMode> {
 /// A rejected candidate (e.g. lift angle out of [10, 90]) leaves both the
 /// running analyzer and `config` untouched, rather than corrupting `config`
 /// with a value that never actually took effect.
+///
+/// `source_is_idle` gates whether this touches `banner` at all (T3, M4):
+/// while `SourceRuntime::Idle`, the published Error banner is reporting
+/// "there is no active source" — a fact no config tweak can change, only a
+/// successful `SwitchSource` can — so it must survive here regardless of
+/// whether this particular candidate happened to validate. `config` and
+/// `analyzer` still update normally either way: rebuilding the (unfed, so
+/// harmless) idle `Analyzer` keeps it in sync with the user's latest knobs
+/// for whenever a real source does arrive, same as it would for a live one.
 fn apply_config(
     config: &mut EngineConfig,
     analyzer: &mut Analyzer,
     sample_rate_hz: f64,
+    source_is_idle: bool,
     banner: &mut Option<Banner>,
     mutate: impl FnOnce(&mut EngineConfig),
 ) {
@@ -633,13 +738,17 @@ fn apply_config(
         Ok(a) => {
             *config = candidate;
             *analyzer = a;
-            *banner = None;
+            if !source_is_idle {
+                *banner = None;
+            }
         }
         Err(e) => {
-            *banner = Some(Banner {
-                severity: BannerSeverity::Error,
-                text: format!("invalid config: {e}"),
-            })
+            if !source_is_idle {
+                *banner = Some(Banner {
+                    severity: BannerSeverity::Error,
+                    text: format!("invalid config: {e}"),
+                })
+            }
         }
     }
 }
@@ -732,6 +841,13 @@ fn pull_tick(
             }
             pulled
         }
+        // Deliberately a no-op (spec/M4 T3): no samples, so nothing reaches
+        // `analyzer`, `writer`, or `silence` — see `SourceRuntime::Idle`'s
+        // doc comment for why that's exactly the point (a silent
+        // `SilenceTracker` would otherwise eventually raise its own
+        // silence banner on top of the real Error banner explaining why
+        // there's no source at all).
+        SourceRuntime::Idle(_) => 0,
     }
 }
 
@@ -773,8 +889,10 @@ fn engine_loop(
             // build failure never mutates `config` (only Replay does — see
             // `SourceRuntime::build`'s doc comment), so retrying against
             // the same `config` is safe. This is deliberately a single
-            // retry, not a stay-alive-on-total-failure loop — that's an M4
-            // followup.
+            // retry, not an unbounded one — if it ALSO fails, the
+            // fall-through below (T3, M4) keeps the engine alive on an
+            // `Idle` source rather than exiting, so a later `SwitchSource`
+            // can still recover.
             if matches!(initial, SourceSpec::Mic { device_id: Some(_) }) {
                 match SourceRuntime::build(&SourceSpec::Mic { device_id: None }, &mut config) {
                     Ok((s, _info)) => {
@@ -787,60 +905,51 @@ fn engine_loop(
                         s
                     }
                     Err(e2) => {
-                        publish(
-                            buf_input,
-                            last_snapshot,
-                            &egui_ctx,
-                            EngineSnapshot {
-                                banner: Some(Banner {
-                                    severity: BannerSeverity::Error,
-                                    text: format!(
-                                        "failed to start: {e}; default input also failed: {e2}"
-                                    ),
-                                }),
-                                ..Default::default()
-                            },
-                        );
-                        return;
+                        // Total startup failure: both the requested device
+                        // and the default-input retry failed. Previously
+                        // this published the fault and `return`ed, killing
+                        // the thread — the UI was left wired to a dead
+                        // control channel until restart. Falls through to
+                        // `SourceRuntime::Idle` instead: the loop stays
+                        // alive, this banner is retained (see
+                        // `apply_config`'s `source_is_idle` gate for how it
+                        // survives later config tweaks) until a successful
+                        // `SwitchSource` replaces it.
+                        banner = Some(Banner {
+                            severity: BannerSeverity::Error,
+                            text: format!("failed to start: {e}; default input also failed: {e2}"),
+                        });
+                        SourceRuntime::Idle(spec_kind(&initial))
                     }
                 }
             } else {
-                // No source at all — nothing to run. Publish the fault and
-                // return; the thread exits cleanly (not a panic, so the
-                // catch_unwind wrapper in `Engine::start_with_turbo` sees Ok
-                // and does not double-publish).
-                publish(
-                    buf_input,
-                    last_snapshot,
-                    &egui_ctx,
-                    EngineSnapshot {
-                        banner: Some(Banner {
-                            severity: BannerSeverity::Error,
-                            text: format!("failed to start: {e}"),
-                        }),
-                        ..Default::default()
-                    },
-                );
-                return;
+                // No source at all (not a Mic-with-explicit-device spec, so
+                // no retry applies) — same idle fall-through as the
+                // mic-double-failure arm above, for the same reason.
+                banner = Some(Banner {
+                    severity: BannerSeverity::Error,
+                    text: format!("failed to start: {e}"),
+                });
+                SourceRuntime::Idle(spec_kind(&initial))
             }
         }
     };
     let mut analyzer = match build_analyzer(&config, source.sample_rate_hz()) {
         Ok(a) => a,
         Err(e) => {
-            publish(
-                buf_input,
-                last_snapshot,
-                &egui_ctx,
-                EngineSnapshot {
-                    banner: Some(Banner {
-                        severity: BannerSeverity::Error,
-                        text: format!("invalid initial config: {e}"),
-                    }),
-                    ..Default::default()
-                },
-            );
-            return;
+            // The source (real, or already `Idle` from the arm above) is
+            // set, but the `Analyzer` isn't — same idle fall-through, one
+            // level up: retain an Error banner and swap `source` for an
+            // `Idle` runtime carrying its own last-attempted kind (a no-op
+            // if it's already `Idle`). `build_idle_analyzer` can't fail
+            // (see its doc comment), so — unlike the two arms above —
+            // there's no further failure mode to handle here.
+            banner = Some(Banner {
+                severity: BannerSeverity::Error,
+                text: format!("invalid initial config: {e}"),
+            });
+            source = SourceRuntime::Idle(source.kind());
+            build_idle_analyzer(&mut config)
         }
     };
 
@@ -901,6 +1010,7 @@ fn engine_loop(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
+                    matches!(source, SourceRuntime::Idle(_)),
                     &mut banner,
                     |c| c.lift_angle_deg = v,
                 ),
@@ -908,6 +1018,7 @@ fn engine_loop(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
+                    matches!(source, SourceRuntime::Idle(_)),
                     &mut banner,
                     |c| c.averaging_s = v,
                 ),
@@ -915,6 +1026,7 @@ fn engine_loop(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
+                    matches!(source, SourceRuntime::Idle(_)),
                     &mut banner,
                     |c| c.bph_mode = m,
                 ),
@@ -922,6 +1034,7 @@ fn engine_loop(
                     &mut config,
                     &mut analyzer,
                     source.sample_rate_hz(),
+                    matches!(source, SourceRuntime::Idle(_)),
                     &mut banner,
                     |c| c.ppm_correction = v,
                 ),
@@ -980,6 +1093,26 @@ fn engine_loop(
                     meta_position,
                     watch,
                 } => {
+                    // T3 (M4) ruling: refuse to record while idle rather
+                    // than silently creating a writer that would capture
+                    // nothing but silence under a filename implying real
+                    // audio. No writer can exist yet in this state — Idle
+                    // is only ever entered by the initial-build fallback
+                    // above, *before* `writer` is declared below, and
+                    // `SwitchSource` never sets `source` to `Idle` (only
+                    // this function's own initial-build region does) — so
+                    // unlike the live-source path there's never an old
+                    // writer here to finalize.
+                    if matches!(source, SourceRuntime::Idle(_)) {
+                        recording_path = None;
+                        banner = Some(Banner {
+                            severity: BannerSeverity::Error,
+                            text: "failed to start recording: no active source — fix the \
+                                   input first"
+                                .to_string(),
+                        });
+                        continue;
+                    }
                     if let Some(w) = writer.take() {
                         let _ = w.finalize_with(Some(stop_summary(&last_metrics)));
                     }
@@ -1238,6 +1371,51 @@ mod tests {
             s.push(&chunk, sr);
             assert_eq!(s.silent_for_s, 0.0, "flickered silent at chunk {i}");
         }
+    }
+
+    #[test]
+    fn build_idle_analyzer_heals_a_poisoned_config_to_safe_defaults() {
+        // A config that's invalid regardless of sample rate (averaging_s
+        // outside AnalyzerConfig's [2, 60]) must not survive into `config`
+        // — every later apply_config/SwitchSource call starts from
+        // `*config`, so leaving it poisoned would keep failing "for the
+        // same reason" until the user happened to fix that exact field.
+        let mut config = EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 999.0,
+            bph_mode: BphMode::Fixed(21_600),
+            ppm_correction: 5.0,
+        };
+        let _ = build_idle_analyzer(&mut config); // must not panic
+        assert!(
+            build_analyzer(&config, IDLE_SAMPLE_RATE_HZ).is_ok(),
+            "healed config must be analyzer-valid"
+        );
+        assert_eq!(config.averaging_s, 30.0);
+        assert_eq!(config.lift_angle_deg, 52.0);
+        assert_eq!(config.bph_mode, BphMode::Auto);
+        assert_eq!(config.ppm_correction, 0.0);
+    }
+
+    #[test]
+    fn build_idle_analyzer_preserves_an_already_valid_config() {
+        // The common case: the source failed (or its sample rate was the
+        // problem), not the config — the user's real lift/averaging/bph/ppm
+        // settings must survive into the idle state untouched, so a later
+        // successful SwitchSource picks them back up rather than silently
+        // reverting to defaults.
+        let mut config = EngineConfig {
+            lift_angle_deg: 44.0,
+            averaging_s: 10.0,
+            bph_mode: BphMode::Fixed(21_600),
+            ppm_correction: 5.0,
+        };
+        let original = config;
+        let _ = build_idle_analyzer(&mut config);
+        assert_eq!(config.lift_angle_deg, original.lift_angle_deg);
+        assert_eq!(config.averaging_s, original.averaging_s);
+        assert_eq!(config.bph_mode, original.bph_mode);
+        assert_eq!(config.ppm_correction, original.ppm_correction);
     }
 
     #[test]

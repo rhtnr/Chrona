@@ -374,3 +374,340 @@ fn stop_recording_writes_summary_sidecar() {
     assert!(summary.duration_s > 0.0);
     drop(eng); // Shutdown + join must complete (test would hang otherwise)
 }
+
+#[test]
+fn engine_survives_total_startup_failure_and_recovers() {
+    // T3 (M4): today, when EVERY way of starting a source fails, engine_loop
+    // publishes an Error banner and `return`s — the DSP thread exits, and
+    // the control channel's receiver half is dropped with it, so every
+    // later `eng.send(..)` (including a would-be-recovering SwitchSource) is
+    // silently swallowed by `Engine::send`'s best-effort `let _ =
+    // self.tx.send(msg)`, and `eng.snapshot()` just keeps replaying the same
+    // stale Error snapshot forever. This confirms the loop instead survives
+    // that failure (an idle placeholder source in place of a dead thread)
+    // and genuinely recovers once a working source arrives.
+    //
+    // The design brief's suggested trigger for "every way of starting a
+    // source fails" was a bogus mic device_id
+    // (`Mic { device_id: Some("chrona-bogus-device") }`), which relies on
+    // the mic-fallback retry (against the default input device — see
+    // `engine_loop`'s initial-build region) ALSO failing, i.e. no audio
+    // input hardware at all. Empirically checked in this dev sandbox (a
+    // throwaway probe calling `chrona_audio::CaptureStream::start(None,
+    // ..)` directly): a real default input device ("MacBook Pro
+    // Microphone") is present and negotiates successfully, so that specific
+    // trigger does NOT reach total failure here — the retry recovers and
+    // the engine starts normally. Using it would make this test pass today
+    // for the wrong reason (never RED on this machine) and be flaky
+    // depending on whatever hardware happens to be attached to whatever
+    // machine runs it. `ReplayFile` with a nonexistent path instead hits
+    // `engine_loop`'s *other* source-build fatal arm (the non-mic-or-
+    // explicit-default-device Err arm — no retry attempted at all, straight
+    // to fatal) — same class of failure (every way of starting a source is
+    // exhausted), zero hardware dependency, deterministic on every machine.
+    // The mic-double-failure arm shares the identical post-match
+    // construction (set the Error banner, yield `SourceRuntime::Idle`) —
+    // see task-3-report.md for why that arm is judged low-risk without its
+    // own dedicated integration test.
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::ReplayFile {
+            path: std::path::PathBuf::from("/nonexistent/chrona-total-failure-probe.wav"),
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let snap = loop {
+        let s = eng.snapshot();
+        if s.banner.is_some() {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no banner published within 10s of a total startup failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let b = snap.banner.as_ref().expect("banner present");
+    assert_eq!(b.severity, BannerSeverity::Error);
+    assert!(
+        b.text.contains("failed to start"),
+        "unexpected banner text: {}",
+        b.text
+    );
+    assert_eq!(
+        snap.source_kind,
+        SourceKind::Replay,
+        "Idle must report the last-attempted source kind, not SourceKind::default()"
+    );
+    assert_eq!(
+        snap.health.silent_for_s, 0.0,
+        "an idle source pulls no samples — it must not feed the silence tracker"
+    );
+
+    // Idle a while longer (well past a single publish cycle) and confirm
+    // the SAME truthful Error banner is still the only signal — it must
+    // not decay into (or get joined by) a silence banner, and nothing
+    // clears it on its own.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let still_idle = eng.snapshot();
+    assert_eq!(still_idle.banner.as_ref(), Some(b));
+    assert_eq!(still_idle.health.silent_for_s, 0.0);
+    assert!(still_idle.recording.is_none());
+
+    // Today (pre-fix) this SwitchSource is dropped on the floor (dead
+    // channel) and the loop below times out: RED.
+    eng.send(ControlMsg::SwitchSource(SourceSpec::Simulate {
+        rate: 12.0,
+        beat_error: 0.8,
+        amplitude: 270.0,
+        snr: 30.0,
+    }));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let s = eng.snapshot();
+        if s.metrics
+            .as_ref()
+            .is_some_and(|m| m.tier == chrona_dsp::Tier::T3)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never recovered to Tier 3 after SwitchSource following a total startup \
+             failure (engine loop likely dead) — last banner {:?}, source_kind {:?}",
+            s.banner,
+            s.source_kind,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(eng); // Shutdown + join must complete (test would hang otherwise)
+}
+
+#[test]
+fn engine_survives_initial_analyzer_failure_and_recovers() {
+    // Distinct fatal exit from the test above: here the *source* builds
+    // fine (Simulate never touches hardware) but the initial `EngineConfig`
+    // is analyzer-invalid (`averaging_s` must be in [2, 60] —
+    // `AnalyzerConfig`'s own validation, chrona-dsp untouched by this task).
+    // Exercises `engine_loop`'s separate initial-analyzer-build fatal arm,
+    // including the "heal a poisoned config back to safe defaults" fallback
+    // (T3-design: rebuilding the idle analyzer against the SAME invalid
+    // config at 48 kHz would fail identically, and every later
+    // apply_config/SwitchSource starts from that same `config`).
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 0.0,
+            beat_error: 0.0,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 999.0, // outside AnalyzerConfig's [2, 60]
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let snap = loop {
+        let s = eng.snapshot();
+        if s.banner.is_some() {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no banner published within 10s of a total startup failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let b = snap.banner.as_ref().expect("banner present");
+    assert_eq!(b.severity, BannerSeverity::Error);
+    assert!(
+        b.text.contains("invalid initial config"),
+        "unexpected banner text: {}",
+        b.text
+    );
+    assert_eq!(snap.source_kind, SourceKind::Simulate);
+
+    // Recovery: a fresh Simulate with a *valid* config must succeed even
+    // though the poisoned `averaging_s: 999.0` was never explicitly reset
+    // by this message — proof `config` was healed when the engine fell
+    // through to idle, not left poisoned for every later config change to
+    // keep tripping over.
+    eng.send(ControlMsg::SwitchSource(SourceSpec::Simulate {
+        rate: 12.0,
+        beat_error: 0.8,
+        amplitude: 270.0,
+        snr: 30.0,
+    }));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let s = eng.snapshot();
+        if s.metrics
+            .as_ref()
+            .is_some_and(|m| m.tier == chrona_dsp::Tier::T3)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never recovered to Tier 3 after SwitchSource following an initial analyzer \
+             failure — last banner {:?}",
+            s.banner,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(eng);
+}
+
+#[test]
+fn start_recording_while_idle_fails_without_creating_a_writer() {
+    // T3 ruling (see task-3-report.md): a writer created while idle would
+    // record silence forever under a name implying real capture — refused
+    // instead, via the same "failed to start recording" Error-banner shape
+    // `SessionWriter::create` failures already use.
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::ReplayFile {
+            path: std::path::PathBuf::from("/nonexistent/chrona-total-failure-probe-2.wav"),
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if eng.snapshot().banner.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no banner published within 10s of a total startup failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    eng.send(ControlMsg::StartRecording {
+        dir: dir.path().to_path_buf(),
+        meta_position: None,
+        watch: None,
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let snap = loop {
+        let s = eng.snapshot();
+        if s.banner
+            .as_ref()
+            .is_some_and(|b| b.text.contains("no active source"))
+        {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "StartRecording-while-idle never surfaced the 'no active source' banner \
+             (last banner {:?}) — engine loop likely dead",
+            eng.snapshot().banner,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let b = snap.banner.as_ref().expect("banner present");
+    assert_eq!(b.severity, BannerSeverity::Error);
+    assert!(b.text.contains("failed to start recording"));
+    assert!(
+        snap.recording.is_none(),
+        "no writer may exist while idle, got {:?}",
+        snap.recording
+    );
+    drop(eng);
+}
+
+#[test]
+fn config_changes_do_not_clear_the_idle_error_banner() {
+    // T3 design note: `apply_config` (SetLift/SetAveraging/SetBphMode/
+    // SetPpm) clears `banner` to `None` on a successful candidate — correct
+    // for a live source, but while idle the published Error banner is
+    // reporting "there is no active source", a fact no config tweak can
+    // change (only a successful SwitchSource can). A *valid* SetLift must
+    // not silently wipe that Error into a falsely-healthy `None` banner.
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::ReplayFile {
+            path: std::path::PathBuf::from("/nonexistent/chrona-total-failure-probe-3.wav"),
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if eng.snapshot().banner.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no banner published within 10s of a total startup failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    eng.send(ControlMsg::SetLift(44.0)); // valid — must not clear the banner
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let snap = eng.snapshot();
+    let b = snap
+        .banner
+        .as_ref()
+        .expect("a valid SetLift while idle must not clear the no-source Error banner");
+    assert_eq!(b.severity, BannerSeverity::Error);
+    assert!(b.text.contains("failed to start"));
+
+    // And prove the loop is genuinely alive (not just "the banner happens
+    // to survive because the thread died and nothing ever overwrites
+    // anything") by recovering from here too.
+    eng.send(ControlMsg::SwitchSource(SourceSpec::Simulate {
+        rate: 12.0,
+        beat_error: 0.8,
+        amplitude: 270.0,
+        snr: 30.0,
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if eng
+            .snapshot()
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.tier == chrona_dsp::Tier::T3)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never recovered to Tier 3 — engine loop likely dead"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(eng);
+}
