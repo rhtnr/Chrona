@@ -72,6 +72,11 @@ pub fn cal_advice(err: &CalError) -> &'static str {
              during capture. Re-record in a quieter, temperature-stable setup and don't \
              disturb the pickup while it runs."
         }
+        CalError::NotQuartz { .. } => {
+            "This looks like a mechanical watch, not quartz — the wizard needs a quartz watch \
+             (one tick per second). Rate measurement of mechanical watches is the main \
+             screen's job."
+        }
         CalError::BadInput { .. } => {
             "Internal error while analyzing the capture. Try recording again; if this keeps \
              happening, it's likely a bug worth reporting."
@@ -770,6 +775,9 @@ mod tests {
             },
             CalError::NoTicks,
             CalError::Unstable { residual_ppm: 5.0 },
+            CalError::NotQuartz {
+                off_gate_ratio: 5.0,
+            },
             CalError::BadInput {
                 reason: "x".to_string(),
             },
@@ -813,6 +821,19 @@ mod tests {
         assert!(
             bad_input.contains("internal"),
             "BadInput advice should mention 'internal': {bad_input:?}"
+        );
+
+        let not_quartz = cal_advice(&CalError::NotQuartz {
+            off_gate_ratio: 5.0,
+        })
+        .to_lowercase();
+        assert!(
+            not_quartz.contains("mechanical"),
+            "NotQuartz advice should mention 'mechanical': {not_quartz:?}"
+        );
+        assert!(
+            not_quartz.contains("quartz"),
+            "NotQuartz advice should mention 'quartz': {not_quartz:?}"
         );
 
         let too_short = cal_advice(&CalError::TooShort {

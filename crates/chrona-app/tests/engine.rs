@@ -955,76 +955,79 @@ fn simulate_source_snapshots_never_carry_a_clock_skew_reading() {
     drop(eng);
 }
 
-/// M4 Task 8 pre-review addition: the design spec's (2026-09-07-m4-trust-
-/// features-design.md §3) headless-testability bullet for the calibration
-/// wizard — "the capture stage's engine plumbing is tested on the Simulate
-/// source (flow, cancel, temp-file cleanup — cal reporting NoTicks/Unstable
-/// on a watch signal is itself the honest-failure path under test)" — which
-/// the task-8 brief's own dispatch had dropped. End to end through the real
-/// public `Engine`, same as every other test in this file: `StartRecording`
-/// into a temp dir (same shape `ui::cal_wizard`'s `apply_wizard_action`
-/// itself sends: no position, no watch metadata), confirm the path via the
-/// snapshot, record real audio, `StopRecording`, confirm the finalize, then
-/// run the same read-and-calibrate pipeline `ui::cal_wizard::analyze_wav`
-/// wraps (`SessionReader::open` + `calibrate_quartz`, inlined here — that
-/// fn is private to the lib crate, unreachable from this separate
-/// integration-test binary) and confirm the HONEST failure: a genuine
-/// mechanical-watch signal (not a 1 Hz quartz stepper) must be rejected as
-/// `NoTicks`/`Unstable`, never a fabricated ppm — matching
-/// `chrona_dsp::cal`'s own acceptance of either outcome for a signal the
-/// tracker can't lock a coherent 1 Hz fit onto (see `cal.rs`'s
-/// `unstable_corruption_yields_high_residual_or_no_ticks`). Finally
-/// reproduces `TempCaptureGuard::drop`'s own two-`remove_file`-call body
-/// (also private to the lib crate) and confirms both files are gone — the
-/// Discard/Cancel temp-file-cleanup path the spec also asks this test to
-/// cover.
+/// M4 Task 8 pre-review addition, split into two cases by Task 8b: the
+/// design spec's (2026-09-07-m4-trust-features-design.md §3)
+/// headless-testability bullet for the calibration wizard — "the capture
+/// stage's engine plumbing is tested on the Simulate source (flow, cancel,
+/// temp-file cleanup — cal reporting NoTicks/Unstable on a watch signal is
+/// itself the honest-failure path under test)" — which the task-8 brief's
+/// own dispatch had dropped. End to end through the real public `Engine`,
+/// same as every other test in this file: `StartRecording` into a temp dir
+/// (same shape `ui::cal_wizard`'s `apply_wizard_action` itself sends: no
+/// position, no watch metadata), confirm the path via the snapshot, record
+/// real audio, `StopRecording`, confirm the finalize, then run the same
+/// read-and-calibrate pipeline `ui::cal_wizard::analyze_wav` wraps
+/// (`SessionReader::open` + `calibrate_quartz`, inlined here — that fn is
+/// private to the lib crate, unreachable from this separate integration-test
+/// binary) and confirm the HONEST failure: a genuine mechanical-watch signal
+/// (not a 1 Hz quartz stepper) must be rejected, never given a fabricated
+/// ppm. Finally reproduces `TempCaptureGuard::drop`'s own
+/// two-`remove_file`-call body (also private to the lib crate) and confirms
+/// both files are gone — the Discard/Cancel temp-file-cleanup path the spec
+/// also asks this test to cover.
 ///
-/// **`snr: 0.0`, not the wizard's realistic default (~30 dB) — an empirical
-/// finding, not a guess:** a CLEAN Simulate watch signal (`snr: 30.0`, the
-/// value used elsewhere in this file) was tried first and, surprisingly,
-/// did NOT fail — `calibrate_quartz` returned `Ok(QuartzCalResult { ppm:
-/// -1.05, residual_ppm: 1.13, events: 381, .. })`. Root cause, worked out
-/// from the numbers: `chrona_dsp::synth::synthesize`'s beat grid (the
-/// engine's Simulate source always uses `SynthConfig::default()`'s bph,
-/// not configurable via `SourceSpec::Simulate`) runs at a rate that divides
+/// **Why this is now two functions:** a CLEAN Simulate watch signal (`snr:
+/// 30.0`, the value used elsewhere in this file) was tried first, during
+/// Task 8's own review, and, surprisingly, did NOT fail —
+/// `calibrate_quartz` returned `Ok(QuartzCalResult { ppm: -1.05,
+/// residual_ppm: 1.13, events: 381, .. })`. Root cause, worked out from the
+/// numbers: `chrona_dsp::synth::synthesize`'s beat grid (the engine's
+/// Simulate source always uses `SynthConfig::default()`'s bph, not
+/// configurable via `SourceSpec::Simulate`) runs at a rate that divides
 /// evenly into 1 second — true of every standard bph this app exposes
-/// (18k/21.6k/25.2k/28.8k/36k all give an integer beats/second) — so a
-/// beat lands at (very nearly) the same phase every integer second
-/// regardless of which second you look at, and `calibrate_quartz`'s ±50 ms
-/// gated tracker + per-cycle period re-estimate (`t_hat`) locks onto "the
-/// loudest beat nearest each integer second" just as reliably as it locks
-/// onto a genuine 1 Hz quartz tick — producing a plausible-looking but
-/// MEANINGLESS ppm. This is pre-existing `chrona_dsp::cal` behavior
-/// (unrelated to anything Task 8 touches, and `chrona-dsp` stays untouched
-/// per this task's constraints) — flagged in task-8-report.md as a
-/// real, separate concern rather than worked around silently. Lowering
-/// `snr` to `0.0` (tick-burst amplitude == noise RMS — an already-precedented
-/// "very poor recording" value in `chrona_dsp::synth`'s own tests) buries
-/// the beat energy at the noise floor, which correctly defeats the seed
-/// step ("strongest sample in the first 2 s must clear 5x the noise
-/// floor") — empirically confirmed deterministic (fixed `seed: 1`) at
-/// `Err(NoTicks)` across repeated runs.
+/// (18k/21.6k/25.2k/28.8k/36k all give an integer beats/second) — so a beat
+/// lands at (very nearly) the same phase every integer second regardless of
+/// which second you look at, and `calibrate_quartz`'s ±50 ms gated tracker +
+/// per-cycle period re-estimate (`t_hat`) locks onto "the loudest beat
+/// nearest each integer second" just as reliably as it locks onto a genuine
+/// 1 Hz quartz tick — producing a plausible-looking but MEANINGLESS ppm.
+/// Flagged in task-8-report.md as a real, separate concern rather than
+/// worked around silently (`chrona-dsp` stayed untouched per Task 8's own
+/// constraints) — Task 8b (task-8b-brief.md) is that follow-up: it adds
+/// `CalError::NotQuartz` (`cal.rs`) specifically to close this path. This
+/// fn keeps the ORIGINAL Task 8 case (`snr: 0.0`: tick-burst amplitude ==
+/// noise RMS, an already-precedented "very poor recording" value in
+/// `chrona_dsp::synth`'s own tests, burying the beat energy at the noise
+/// floor) — at that snr, the seed step may lose tick lock before the
+/// NotQuartz gate even has data to measure an off-gate ratio from, so
+/// either gate may fire first; this fn accepts all three honest outcomes.
+/// The sibling fn below,
+/// `cal_wizard_capture_on_simulate_snr30_yields_honest_not_quartz`, is the
+/// clean-signal (`snr: 30.0`) case and pins the SPECIFIC `NotQuartz` outcome
+/// — the exact silent-wrong path Task 8b closes.
 ///
-/// **Why 45 s of real sleep:** `calibrate_quartz` (`cal.rs`) rejects
-/// anything under its own `MIN_SECONDS = 300.0` with `CalError::TooShort`
-/// BEFORE it ever runs the tick-detection logic that could report
-/// `NoTicks`/`Unstable` — so this test needs the captured WAV to hold at
-/// least 300 SIMULATED seconds, not merely "some" audio. Turbo-mode
-/// throughput was measured empirically on a dev machine (not assumed): 9 s
-/// of real sleep produced 88.1 simulated seconds (~9.8 sim-s/real-s) via
-/// this exact StartRecording/sleep/StopRecording shape. 45 s of real sleep
-/// budgets roughly 400+ simulated seconds at that measured rate — about
-/// 1.3x margin over the 300 s minimum, with headroom for a slower CI
-/// machine. The `duration_s >= 300.0` assertion below still checks this
-/// directly against the finalized WAV before ever calling into
-/// `calibrate_quartz`, so an unexpectedly slow machine fails with a clear,
-/// self-diagnosing message ("only captured Xs") instead of a confusing
-/// wrong-error-variant mismatch.
+/// **Why 45 s of real sleep** (both this fn and its snr-30 sibling):
+/// `calibrate_quartz` (`cal.rs`) rejects anything under its own
+/// `MIN_SECONDS = 300.0` with `CalError::TooShort` BEFORE it ever runs the
+/// tick-detection logic that could report `NotQuartz`/`NoTicks`/`Unstable`
+/// — so this test needs the captured WAV to hold at least 300 SIMULATED
+/// seconds, not merely "some" audio. Turbo-mode throughput was measured
+/// empirically on a dev machine (not assumed): 9 s of real sleep produced
+/// 88.1 simulated seconds (~9.8 sim-s/real-s) via this exact
+/// StartRecording/sleep/StopRecording shape. 45 s of real sleep budgets
+/// roughly 400+ simulated seconds at that measured rate — about 1.3x margin
+/// over the 300 s minimum, with headroom for a slower CI machine. The
+/// `duration_s >= 300.0` assertion below still checks this directly against
+/// the finalized WAV before ever calling into `calibrate_quartz`, so an
+/// unexpectedly slow machine fails with a clear, self-diagnosing message
+/// ("only captured Xs") instead of a confusing wrong-error-variant mismatch.
 ///
 /// Holds `SESSION_WRITER_TEST_LOCK` (see its doc comment): calls
-/// `SessionWriter::create` via `StartRecording`.
+/// `SessionWriter::create` via `StartRecording`. Its snr-30 sibling holds
+/// the same lock, so the two 45 s-sleep captures serialize rather than
+/// overlap (~90 s combined, not ~45s) — see task-8b-report.md.
 #[test]
-fn cal_wizard_capture_on_simulate_yields_honest_no_ticks_or_unstable() {
+fn cal_wizard_capture_on_simulate_snr0_yields_honest_failure() {
     let _guard = lock_session_writer_tests();
     let mut eng = Engine::start_with_turbo(
         SourceSpec::Simulate {
@@ -1105,11 +1108,16 @@ fn cal_wizard_capture_on_simulate_yields_honest_no_ticks_or_unstable() {
         "only captured {duration_s:.1}s of simulated audio (need >= 300s) — turbo \
          throughput on this machine is lower than the ~9.8 sim-s/real-s this test's 45s \
          sleep budget assumed; calibrate_quartz would report TooShort here, not \
-         NoTicks/Unstable, which is not what this test is checking"
+         NotQuartz/NoTicks/Unstable, which is not what this test is checking"
     );
 
     // The honest-failure path itself (design spec §3): calibrate_quartz on
-    // a real mechanical-watch tick train — never a fabricated ppm.
+    // a real mechanical-watch tick train — never a fabricated ppm. At this
+    // snr (0.0, beat energy buried at the noise floor), the seed step may
+    // defeat tick detection before the NotQuartz gate (Task 8b) has tick
+    // data to measure an off-gate ratio from, so NotQuartz is also an
+    // acceptable honest outcome alongside the original NoTicks/Unstable —
+    // see this fn's doc comment.
     let result = chrona_session::SessionReader::open(&wav_path)
         .map_err(|e| e.to_string())
         .map(|r| chrona_dsp::cal::calibrate_quartz(&r.samples, r.sample_rate_hz));
@@ -1117,10 +1125,130 @@ fn cal_wizard_capture_on_simulate_yields_honest_no_ticks_or_unstable() {
     assert!(
         matches!(
             result,
-            Err(chrona_dsp::cal::CalError::NoTicks)
+            Err(chrona_dsp::cal::CalError::NotQuartz { .. })
+                | Err(chrona_dsp::cal::CalError::NoTicks)
                 | Err(chrona_dsp::cal::CalError::Unstable { .. })
         ),
-        "expected Err(NoTicks) or Err(Unstable) on a mechanical-watch signal, got {result:?}"
+        "expected Err(NotQuartz | NoTicks | Unstable) on a mechanical-watch signal, got \
+         {result:?}"
+    );
+
+    // Temp-file cleanup path (design spec: "the temp WAV is deleted after
+    // analysis regardless of outcome") — reproduces
+    // ui::cal_wizard::TempCaptureGuard::drop's own two-`remove_file`-call
+    // body (private to the lib crate, unreachable here) rather than
+    // constructing one.
+    let _ = std::fs::remove_file(&wav_path);
+    let _ = std::fs::remove_file(&sidecar_path);
+    assert!(!wav_path.exists(), "WAV should be gone after cleanup");
+    assert!(
+        !sidecar_path.exists(),
+        "sidecar should be gone after cleanup"
+    );
+}
+
+/// Task 8b's own addition: the clean-signal (`snr: 30.0`) sibling of
+/// `cal_wizard_capture_on_simulate_snr0_yields_honest_failure` above — see
+/// that fn's doc comment for the full shared context (setup shape, the
+/// 45s-sleep/300s-minimum rationale, `SESSION_WRITER_TEST_LOCK`). Pins the
+/// SPECIFIC outcome Task 8b exists to close: pre-Task-8b, this exact signal
+/// silently returned `Ok(QuartzCalResult { ppm: -1.05, residual_ppm: 1.13,
+/// events: 381, .. })` — a plausible bogus ppm from a mechanical watch,
+/// found during Task 8's own review (see the sibling fn's doc comment).
+/// After this task's `CalError::NotQuartz` gate (`cal.rs`), it must be
+/// rejected specifically as `NotQuartz`, not merely "some honest error" —
+/// the strongest assertion this file can make of the exact silent-wrong
+/// path being closed.
+#[test]
+fn cal_wizard_capture_on_simulate_snr30_yields_honest_not_quartz() {
+    let _guard = lock_session_writer_tests();
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let dir = tempfile::Builder::new()
+        .prefix("chrona-cal-test-")
+        .tempdir()
+        .unwrap();
+    eng.send(ControlMsg::StartRecording {
+        dir: dir.path().to_path_buf(),
+        meta_position: None,
+        watch: None,
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let wav_path = loop {
+        if let Some(path) = eng.snapshot().recording {
+            break path;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "StartRecording never took"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let sidecar_path = wav_path.with_extension("json");
+    assert!(
+        wav_path.exists(),
+        "WAV should already exist once recording is confirmed"
+    );
+    assert!(
+        sidecar_path.exists(),
+        "sidecar should already exist once recording is confirmed"
+    );
+
+    // Let enough SIMULATED audio accumulate to clear calibrate_quartz's own
+    // 300s minimum — see the sibling fn's doc comment for how 45s was
+    // chosen.
+    std::thread::sleep(std::time::Duration::from_secs(45));
+
+    eng.send(ControlMsg::StopRecording);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if eng.snapshot().recording.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "StopRecording never took"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(eng); // Shutdown + join must complete (test would hang otherwise)
+
+    let reader = chrona_session::SessionReader::open(&wav_path).expect("finalized WAV opens");
+    let duration_s = reader.samples.len() as f64 / reader.sample_rate_hz;
+    assert!(
+        duration_s >= 300.0,
+        "only captured {duration_s:.1}s of simulated audio (need >= 300s) — turbo \
+         throughput on this machine is lower than the ~9.8 sim-s/real-s this test's 45s \
+         sleep budget assumed; calibrate_quartz would report TooShort here, not NotQuartz, \
+         which is not what this test is checking"
+    );
+
+    // The exact silent-wrong path Task 8b closes (task-8b-brief.md): a
+    // clean mechanical-watch recording must be rejected as NotQuartz, never
+    // silently accepted with a plausible bogus ppm.
+    let result = chrona_session::SessionReader::open(&wav_path)
+        .map_err(|e| e.to_string())
+        .map(|r| chrona_dsp::cal::calibrate_quartz(&r.samples, r.sample_rate_hz));
+    let result = result.expect("WAV already confirmed to open above");
+    assert!(
+        matches!(result, Err(chrona_dsp::cal::CalError::NotQuartz { .. })),
+        "expected Err(NotQuartz{{..}}) on a clean mechanical-watch signal, got {result:?}"
     );
 
     // Temp-file cleanup path (design spec: "the temp WAV is deleted after

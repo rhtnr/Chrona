@@ -8,6 +8,22 @@ use crate::interp::parabolic3;
 const MIN_SECONDS: f64 = 300.0;
 const MAX_RESIDUAL_PPM: f64 = 2.0;
 
+/// NotQuartz discrimination gate (Task 8b): `off_gate_ratio` above this is
+/// rejected. See the doc comment on the off-gate-ratio computation inside
+/// `calibrate_quartz` (right after the gated-tracking loop) for the measured
+/// basis — real quartz vs. all five standard BPHs — behind this constant.
+///
+/// **Adjusted from the design's analytical estimate of 1.5** (which assumed
+/// off-gate peak count ≈ `bph/3600 − 1`, i.e. one off-gate peak per
+/// off-grid beat): measured behavior runs roughly 2× that prediction (a
+/// beat's unlocking/impulse sub-bursts, not just its drop, often each clear
+/// the shared threshold as their own contiguous run — see cal.rs's
+/// `not_quartz_rejects_every_standard_bph`). 3.0 keeps ≥2× margin below the
+/// measured watch floor (≈8.28, 18 000 bph) while every measured real-quartz
+/// case (clean and heavy-noise) stayed exactly at 0.0 — see task-8b-
+/// report.md for the full measured matrix.
+const OFF_GATE_RATIO_MAX: f64 = 3.0;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CalError {
     #[error("recording too short: {seconds:.0} s (need at least {required:.0} s of quartz tick)")]
@@ -18,6 +34,11 @@ pub enum CalError {
         "calibration fit unstable ({residual_ppm:.2} ppm residual) — re-record in a quieter setup"
     )]
     Unstable { residual_ppm: f64 },
+    #[error(
+        "this doesn't look like a quartz tick — beat activity between ticks (off-gate ratio \
+         {off_gate_ratio:.2}) is consistent with a mechanical watch, not a 1 Hz quartz stepper"
+    )]
+    NotQuartz { off_gate_ratio: f64 },
     #[error("bad input: {reason}")]
     BadInput { reason: String },
 }
@@ -79,8 +100,16 @@ pub fn calibrate_quartz(samples: &[f32], sample_rate_hz: f64) -> Result<QuartzCa
         return Err(CalError::NoTicks);
     }
 
-    // Gated tracking: predict each next tick at +T̂, search ±50 ms.
+    // Gated tracking: predict each next tick at +T̂, search ±50 ms. Also
+    // marks, in `in_gate`, exactly which envelope indices fall inside a
+    // per-second gate window (searched or accepted, no difference — a
+    // window the tracker looked at is "spent" either way) — used below by
+    // the NotQuartz discrimination.
     let gate = (0.05 * env_rate) as usize;
+    let mut in_gate = vec![false; env.len()];
+    for b in &mut in_gate[t0_idx.saturating_sub(gate)..(t0_idx + gate).min(env.len())] {
+        *b = true;
+    }
     let mut t_hat = env_rate; // one nominal second, in envelope samples
     let mut ticks: Vec<(f64, f64)> = vec![(0.0, t0_idx as f64)];
     let mut k = 1.0f64;
@@ -91,6 +120,9 @@ pub fn calibrate_quartz(samples: &[f32], sample_rate_hz: f64) -> Result<QuartzCa
         let hi = ((center + gate as i64) as usize).min(env.len().saturating_sub(2));
         if lo + 2 >= hi {
             break;
+        }
+        for b in &mut in_gate[lo..hi] {
+            *b = true;
         }
         let pk = (lo..hi)
             .max_by(|&i, &j| env[i].total_cmp(&env[j]))
@@ -105,6 +137,47 @@ pub fn calibrate_quartz(samples: &[f32], sample_rate_hz: f64) -> Result<QuartzCa
         if k > duration_s + 2.0 {
             break;
         }
+    }
+
+    // NotQuartz discrimination (Task 8b, frozen constant: `OFF_GATE_RATIO_
+    // MAX`). A real 1 Hz quartz tick is silent between ticks: every
+    // significant envelope peak falls inside one of the gate windows just
+    // marked above. A mechanical watch at any standard BPH is NOT silent
+    // there — `bph/3600` beats land per second, only one of which (the
+    // loudest, nearest the second boundary) the gated tracker above locks
+    // onto; the rest fall in the *off-gate* regions. Reusing the exact
+    // `env`/`thr` this function already computed (never a parallel
+    // detector): count off-gate activity as contiguous thr-crossing runs —
+    // one run is one significant peak, so a single beat's decay tail can't
+    // multi-count — and compare against the in-gate tick count.
+    //
+    // Measured (not assumed — swept via `cargo test`, see task-8b-report.md
+    // for the full matrix). Real quartz, every case: exactly 0.0 —
+    // `recovers_injected_ppm_within_half_ppm` (30 dB, ppm ∈
+    // {−80, 0, 50}) and `heavy_noise_quartz_still_calibrates` (20 dB, the
+    // heaviest noise this module's tracker still locks onto at all). The
+    // five standard BPHs (`not_quartz_rejects_every_standard_bph`, 30 dB):
+    // 18 000 ⇒ 8.28, 21 600 ⇒ 10.30, 25 200 ⇒ 12.43, 28 800 ⇒ 14.51,
+    // 36 000 ⇒ 18.88 — roughly 2× the design's analytical `bph/3600 − 1`
+    // estimate (see `OFF_GATE_RATIO_MAX`'s doc comment for why, and for why
+    // the constant was adjusted from the design's original 1.5 to 3.0 on
+    // this evidence). 3.0 sits ≥2.7× below the sparsest watch (18 000 bph)
+    // and has no real-quartz measurement anywhere close to it.
+    let mut off_gate_peak_count = 0usize;
+    let mut i = 0usize;
+    while i < env.len() {
+        if !in_gate[i] && env[i] >= thr {
+            off_gate_peak_count += 1;
+            while i < env.len() && !in_gate[i] && env[i] >= thr {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let off_gate_ratio = off_gate_peak_count as f64 / (ticks.len().max(1) as f64);
+    if off_gate_ratio > OFF_GATE_RATIO_MAX {
+        return Err(CalError::NotQuartz { off_gate_ratio });
     }
 
     let expected = (duration_s - 2.0).max(1.0);
@@ -149,7 +222,57 @@ pub fn calibrate_quartz(samples: &[f32], sample_rate_hz: f64) -> Result<QuartzCa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synth::synthesize_quartz;
+    use crate::synth::{SynthConfig, synthesize, synthesize_quartz};
+
+    /// Task 8b RED: a clean mechanical-watch recording (snr 30, `synthesize`
+    /// defaults except `bph`) at every standard BPH must be rejected as
+    /// `NotQuartz`, not silently accepted with a plausible bogus ppm. Every
+    /// standard bph divides 1 Hz evenly, so before this task's gate existed
+    /// `calibrate_quartz` phase-locked onto "the loudest beat nearest each
+    /// integer second" exactly as it would a genuine quartz tick (this is
+    /// the Task 8 capture-test finding this task closes — see
+    /// task-8b-brief.md).
+    #[test]
+    fn not_quartz_rejects_every_standard_bph() {
+        for bph in [18_000u32, 21_600, 25_200, 28_800, 36_000] {
+            let cfg = SynthConfig {
+                duration_s: 320.0,
+                bph,
+                snr_db: 30.0,
+                ..SynthConfig::default()
+            };
+            let x = synthesize(&cfg).expect("valid synth config");
+            match calibrate_quartz(&x, cfg.sample_rate_hz) {
+                Err(CalError::NotQuartz { off_gate_ratio }) => {
+                    assert!(
+                        off_gate_ratio > OFF_GATE_RATIO_MAX,
+                        "bph {bph}: off_gate_ratio {off_gate_ratio} should exceed \
+                         OFF_GATE_RATIO_MAX ({OFF_GATE_RATIO_MAX})"
+                    );
+                }
+                other => panic!("bph {bph}: expected Err(NotQuartz{{..}}), got {other:?}"),
+            }
+        }
+    }
+
+    /// Task 8b test 3 (brief): the NotQuartz gate must not false-positive on
+    /// noise. No noisy-quartz case existed in this module before this task;
+    /// 20 dB is well below every other quartz test's 30 dB. Chosen
+    /// empirically, not assumed: swept 25/20/18/15/12 dB against the
+    /// PRE-gate tracker (deterministic PRNG, seed 7) and confirmed 20 dB is
+    /// the heaviest noise still yielding `Ok` before this task's gate
+    /// exists — 15 dB already lost tick lock (`Err(NoTicks)`) on its own,
+    /// unrelated to the new gate. See task-8b-report.md for the swept
+    /// values and the measured off_gate_ratio at 20 dB.
+    #[test]
+    fn heavy_noise_quartz_still_calibrates() {
+        let x = synthesize_quartz(320.0, 48_000.0, 0.0, 20.0, 7).unwrap();
+        let r = calibrate_quartz(&x, 48_000.0);
+        assert!(
+            r.is_ok(),
+            "heavy-noise quartz should still calibrate: {r:?}"
+        );
+    }
 
     #[test]
     fn recovers_injected_ppm_within_half_ppm() {
