@@ -35,12 +35,7 @@ fn circular_parabolic(bins: &[f32], i: usize) -> f64 {
         bins[i] as f64,
         bins[(i + 1) % n] as f64,
     );
-    let denom = a - 2.0 * b + c;
-    let off = if denom.abs() < 1e-20 {
-        0.0
-    } else {
-        (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
-    };
+    let off = crate::interp::parabolic3(a, b, c);
     (i as f64 + off).rem_euclid(n as f64)
 }
 

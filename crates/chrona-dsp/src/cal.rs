@@ -3,6 +3,7 @@
 
 use crate::envelope::EnvelopeExtractor;
 use crate::filter::{Butterworth, DcBlocker};
+use crate::interp::parabolic3;
 
 const MIN_SECONDS: f64 = 300.0;
 const MAX_RESIDUAL_PPM: f64 = 2.0;
@@ -29,15 +30,6 @@ pub struct QuartzCalResult {
     pub residual_ppm: f64,
     pub events: usize,
     pub duration_s: f64,
-}
-
-fn parabolic3(a: f64, b: f64, c: f64) -> f64 {
-    let denom = a - 2.0 * b + c;
-    if denom.abs() < 1e-20 {
-        0.0
-    } else {
-        (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
-    }
 }
 
 /// Spec §3.4 quartz calibration: envelope → gated 1 Hz tick tracking →

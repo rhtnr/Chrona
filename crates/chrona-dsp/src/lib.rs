@@ -9,6 +9,7 @@ pub mod envelope;
 pub mod events;
 pub mod filter;
 pub mod fold;
+mod interp;
 pub mod metrics;
 pub mod period;
 pub mod ring;

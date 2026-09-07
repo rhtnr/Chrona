@@ -48,13 +48,7 @@ pub fn autocorrelate(x: &[f32]) -> Vec<f32> {
 
 /// Parabolic interpolation around integer peak `i` → fractional lag offset in (−0.5, 0.5).
 fn parabolic_offset(r: &[f32], i: usize) -> f64 {
-    let (a, b, c) = (r[i - 1] as f64, r[i] as f64, r[i + 1] as f64);
-    let denom = a - 2.0 * b + c;
-    if denom.abs() < 1e-20 {
-        0.0
-    } else {
-        (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
-    }
+    crate::interp::parabolic3(r[i - 1] as f64, r[i] as f64, r[i + 1] as f64)
 }
 
 /// Below this normalized autocorrelation value, a "local max" is FFT round-off
