@@ -6,8 +6,8 @@ mod format;
 mod trace;
 
 pub use format::{
-    day_label, format_amplitude, format_beat_error, format_bph_grouped, format_rate, source_label,
-    tier_label,
+    day_label, format_amplitude, format_beat_error, format_bph_grouped, format_clock_skew,
+    format_rate, source_label, tier_label,
 };
 pub use trace::{
     AmpAccum, BeatAccum, BeatPoint, GAP_BREAK_S, HORIZON_S, SPAN_DEFAULT_S, SPAN_MAX_S, SPAN_MIN_S,

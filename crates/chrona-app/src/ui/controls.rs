@@ -426,6 +426,7 @@ mod tests {
             silent_for_s: 10.0,
             clipped: 3,
             overruns: 2,
+            clock_skew: None,
         };
         assert_eq!(
             pick_banner(None, &everything_else_too, SourceKind::Mic),

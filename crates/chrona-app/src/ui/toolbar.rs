@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use chrona_session::ConfigStore;
 use eframe::egui;
 
-use crate::engine::{ControlMsg, Engine, EngineSnapshot, SourceSpec};
+use crate::engine::{ClockSkew, ControlMsg, Engine, EngineSnapshot, SourceSpec};
 use crate::history::HistoryIndex;
+use crate::presenter::format_clock_skew;
 use crate::theme::{self, Palette, Theme};
 use crate::ui::controls::{
     BphModeUi, ControlsState, current_device_name, device_picker, to_bph_mode,
@@ -141,7 +142,14 @@ pub fn toolbar_row(
         dirty |= lift_control(ui, palette, controls, engine, config);
         bph_combo(ui, palette, controls, engine, &mut state.bph_selection);
         averaging_combo(ui, palette, controls, engine);
-        dirty |= cal_ppm_control(ui, palette, controls, engine, config);
+        dirty |= cal_ppm_control(
+            ui,
+            palette,
+            controls,
+            engine,
+            config,
+            ctx.snap.health.clock_skew,
+        );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Added in reverse of visual left-to-right order (mockup:
@@ -429,14 +437,29 @@ fn averaging_combo(
 /// `egui::Popup::from_toggle_button_response` handles the open/close state
 /// (toggling on click) and, via `CloseOnClickOutside`, closing on an
 /// outside click; Esc-closing is built into `Popup::show` unconditionally.
+///
+/// M4 Task 7 adds the system-clock skew cross-check (binding spec §3.4)
+/// below the DragValue: a faint mono line plus a "use as correction"
+/// button, shown only when `clock_skew` is `Some` — which only happens once
+/// a MIC session has accumulated >= 120s of continuous span (never on
+/// Simulate/Replay/Idle — see `SkewTracker`'s doc comment in `engine.rs`)
+/// and is always measured against the system clock, whatever disciplines
+/// it (typically NTP, but never assumed correct on its own). Display-plus-
+/// explicit-adopt: the line is purely informational, and the button is the
+/// ONE path from a reading to an applied `SetPpm` — nothing here, or
+/// upstream of it, ever applies a skew reading on its own.
+///
 /// Returns `true` iff `config.device_ppm` changed this frame (same
-/// debounced-dirty contract the old `ppm_control` had).
+/// debounced-dirty contract the old `ppm_control` had) — for either the
+/// manual DragValue or the "use as correction" button, both of which funnel
+/// through the shared `apply_and_persist_ppm` helper below.
 fn cal_ppm_control(
     ui: &mut egui::Ui,
     palette: &Palette,
     controls: &mut ControlsState,
     engine: &Engine,
     config: &mut ConfigStore,
+    clock_skew: Option<ClockSkew>,
 ) -> bool {
     let button_resp = ui
         .add(
@@ -465,7 +488,7 @@ fn cal_ppm_control(
         .show(|ui| {
             ui.set_min_width(150.0);
             ui.label(muted_label(palette, "Timebase calibration"));
-            let changed = ui
+            let drag_changed = ui
                 .add(
                     egui::DragValue::new(&mut controls.ppm)
                         .range(-500.0..=500.0)
@@ -473,20 +496,51 @@ fn cal_ppm_control(
                         .suffix(" ppm"),
                 )
                 .changed();
-            if !changed {
-                return false;
-            }
-            engine.send(ControlMsg::SetPpm(controls.ppm));
-            match current_device_name(controls) {
-                Some(name) => {
-                    config.device_ppm.insert(name, controls.ppm);
-                    true
+            let mut ppm_to_apply = drag_changed.then_some(controls.ppm);
+
+            if let Some(skew) = clock_skew {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format_clock_skew(skew.ppm, skew.span_s))
+                        .font(egui::FontId::monospace(11.0))
+                        .color(palette.faint),
+                );
+                if ui.small_button("use as correction").clicked() {
+                    controls.ppm = skew.ppm;
+                    ppm_to_apply = Some(skew.ppm);
                 }
+            }
+
+            match ppm_to_apply {
+                Some(ppm) => apply_and_persist_ppm(engine, config, controls, ppm),
                 None => false,
             }
         })
         .map(|inner| inner.inner)
         .unwrap_or(false)
+}
+
+/// Sends `SetPpm(ppm)` and persists it into `config.device_ppm` for the
+/// currently selected device — the shared debounced-dirty `device_ppm` path
+/// `cal_ppm_control`'s manual DragValue and its "use as correction" button
+/// (M4 Task 7) both funnel through. Returns `true` iff a device was
+/// actually selected to persist against ("System default" has no single
+/// concrete device to key `device_ppm` by — same as before this button
+/// existed).
+fn apply_and_persist_ppm(
+    engine: &Engine,
+    config: &mut ConfigStore,
+    controls: &ControlsState,
+    ppm: f64,
+) -> bool {
+    engine.send(ControlMsg::SetPpm(ppm));
+    match current_device_name(controls) {
+        Some(name) => {
+            config.device_ppm.insert(name, ppm);
+            true
+        }
+        None => false,
+    }
 }
 
 fn outline_button(ui: &mut egui::Ui, palette: &Palette, text: &str) -> egui::Response {

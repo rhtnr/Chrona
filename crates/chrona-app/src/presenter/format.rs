@@ -45,6 +45,18 @@ pub fn format_amplitude(a: Option<f64>, gate: Option<AmplitudeGateFail>) -> Stri
     }
 }
 
+/// `"system-clock cross-check: +3.2 ppm over 14 min"` (binding spec §3.4):
+/// the toolbar cal popup's faint line, shown only when
+/// `HealthView::clock_skew` is `Some`. `span_s` is reported coarsely, in
+/// whole minutes (`(span_s / 60.0).round()`, away from zero on a tie,
+/// `f64::round`'s documented behavior) — this is a rough cross-check, not a
+/// precision figure. `ppm` always carries an explicit sign (matches
+/// `format_rate`'s own `{:+.1}` convention above).
+pub fn format_clock_skew(ppm: f64, span_s: f64) -> String {
+    let min = (span_s / 60.0).round() as i64;
+    format!("system-clock cross-check: {ppm:+.1} ppm over {min} min")
+}
+
 /// Header badge text for the current tier.
 pub fn tier_label(t: Tier) -> &'static str {
     match t {
@@ -149,6 +161,31 @@ mod tests {
             Some("regression")
         );
         assert_eq!(source_label(None), None);
+    }
+
+    #[test]
+    fn clock_skew_line_formatting() {
+        // M4 Task 7 (binding spec §3.4): the toolbar cal popup's faint
+        // system-clock cross-check line. `min` is `span_s / 60`, rounded to
+        // the nearest whole minute (a rough cross-check reports coarsely on
+        // purpose). Positive ppm carries an explicit `+` (matches
+        // `format_rate`'s own `{:+.1}` convention above).
+        assert_eq!(
+            format_clock_skew(3.2, 840.0), // 840s = 14min exactly
+            "system-clock cross-check: +3.2 ppm over 14 min"
+        );
+        assert_eq!(
+            format_clock_skew(-7.26, 900.0), // rounds to one decimal: -7.3
+            "system-clock cross-check: -7.3 ppm over 15 min"
+        );
+        assert_eq!(
+            format_clock_skew(0.0, 125.0), // 125/60 = 2.08... -> rounds to 2
+            "system-clock cross-check: +0.0 ppm over 2 min"
+        );
+        assert_eq!(
+            format_clock_skew(1.0, 150.0), // 150/60 = 2.5 -> rounds to 3 (half-up)
+            "system-clock cross-check: +1.0 ppm over 3 min"
+        );
     }
 
     #[test]

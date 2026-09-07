@@ -69,6 +69,15 @@ const MIC_RING_S: f64 = 5.0;
 /// `Analyzer` can always be built against it regardless of *why* the engine
 /// ended up idle.
 const IDLE_SAMPLE_RATE_HZ: f64 = 48_000.0;
+/// System-clock skew cross-check (binding spec §3.4): sample `SkewTracker`
+/// at this cadence, on the mic path only.
+const SKEW_SAMPLE_INTERVAL_S: f64 = 1.0;
+/// Minimum regression span `SkewTracker::skew` requires before it publishes
+/// anything (binding spec §3.4 — a short window's slope estimate is too
+/// noisy to trust, let alone show as a one-click "correction"). Display-
+/// plus-explicit-adopt only, never silently applied — see `SkewTracker`'s
+/// doc comment.
+const SKEW_MIN_SPAN_S: f64 = 120.0;
 
 // ---------------------------------------------------------------------
 // Public control-plane types (spec §7): what the UI sends the engine, and
@@ -135,6 +144,17 @@ pub enum SourceKind {
     Replay,
 }
 
+/// One system-clock skew reading (binding spec §3.4's NTP cross-check):
+/// `SkewTracker`'s fitted regression slope, in parts per million, and how
+/// much wall-clock span backs it. Display-plus-explicit-adopt only — see
+/// `SkewTracker`'s doc comment for the full contract this never violates on
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockSkew {
+    pub ppm: f64,
+    pub span_s: f64,
+}
+
 /// Live health counters, folded into every published snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct HealthView {
@@ -142,6 +162,11 @@ pub struct HealthView {
     pub clipped: u64,
     pub silent_for_s: f64,
     pub last_error: Option<String>,
+    /// The current system-clock skew cross-check reading (binding spec
+    /// §3.4), or `None` before enough mic-path span has accumulated (see
+    /// `SkewTracker`) — and always `None` on Simulate/Replay/Idle, whose
+    /// delivery isn't real audio hardware to cross-check against.
+    pub clock_skew: Option<ClockSkew>,
 }
 
 /// How urgently a [`Banner`] should read (spec §4). `Info` for notices that
@@ -593,6 +618,107 @@ impl SilenceTracker {
     }
 }
 
+/// System-clock skew regression (binding spec §3.4's NTP cross-check):
+/// least-squares slope of `audio_delivered_s − wall_elapsed_s` (accumulated
+/// drift, s) against `wall_elapsed_s` (elapsed wall time, s), fed by `push`
+/// once per second on the mic path only — `engine_loop` samples
+/// `wall_elapsed_s` from an `Instant` and `audio_delivered_s` from the mic
+/// stream's own delivered-frame count divided by its nominal sample rate
+/// (`SKEW_SAMPLE_INTERVAL_S`). The fitted slope, ×1e6, is the skew in ppm:
+/// a sound card whose crystal runs fast relative to the system clock
+/// (itself "whatever disciplines it, typically NTP" — never assumed
+/// correct on its own) drifts `audio_delivered_s` away from `wall_elapsed_s`
+/// linearly over time, and that's exactly the drift this regression
+/// recovers. `skew()` withholds a reading until `SKEW_MIN_SPAN_S` of span
+/// has accumulated — too short a window is too noisy to trust.
+///
+/// **Display-plus-explicit-adopt only** (binding spec §3.4/§10 deviation
+/// #4): nothing in this type, or in what feeds it, ever writes back into
+/// `EngineConfig` on its own. The only path from a reading to an applied
+/// correction is a human clicking the toolbar cal popup's "use as
+/// correction" button (`ui/toolbar.rs`), which sends an explicit `SetPpm`.
+///
+/// Pure and engine-independent — unit-tested on its own, without a running
+/// engine (see this module's `tests`).
+///
+/// Numerical care: every sample's `wall_elapsed_s` is re-centered on the
+/// FIRST pushed sample (`origin`) before folding it into the running
+/// regression sums, i.e. every sample after the first folds in `dx =
+/// wall_elapsed_s - origin`, not the raw value (shifting `x` by a constant
+/// doesn't change a least-squares slope — only the intercept, which nothing
+/// here reads). The textbook one-pass slope formula's denominator (`nΣx² -
+/// (Σx)²`) loses precision as `x` grows large relative to its own spread;
+/// re-centering keeps every accumulated sum bounded by the session's own
+/// length (since `reset` — see below — is the only thing that ever moves
+/// `origin`) rather than by whatever convention a caller's `wall_elapsed_s`
+/// happens to use, so this stays well-conditioned even across an
+/// hours-long uninterrupted mic session.
+#[derive(Debug, Default)]
+struct SkewTracker {
+    /// The first pushed sample's `wall_elapsed_s` — the regression's `x`
+    /// origin (see the type doc comment). `None` until the first `push`.
+    origin: Option<f64>,
+    n: u64,
+    sum_dx: f64,
+    sum_dx2: f64,
+    sum_dy: f64,
+    sum_dxdy: f64,
+    /// The most recent sample's `dx` (`wall_elapsed_s - origin`). Since
+    /// `origin` is itself the first sample, this doubles as the regression's
+    /// span so far — reused directly as `ClockSkew::span_s`, no separate
+    /// bookkeeping needed.
+    last_dx: f64,
+}
+
+impl SkewTracker {
+    /// Folds in one `(wall_elapsed_s, audio_delivered_s)` sample. See the
+    /// type doc comment for the regression this feeds and the `origin`
+    /// re-centering.
+    fn push(&mut self, wall_elapsed_s: f64, audio_delivered_s: f64) {
+        let origin = *self.origin.get_or_insert(wall_elapsed_s);
+        let dx = wall_elapsed_s - origin;
+        let dy = audio_delivered_s - wall_elapsed_s;
+        self.n += 1;
+        self.sum_dx += dx;
+        self.sum_dx2 += dx * dx;
+        self.sum_dy += dy;
+        self.sum_dxdy += dx * dy;
+        self.last_dx = dx;
+    }
+
+    /// The fitted skew, or `None` before `SKEW_MIN_SPAN_S` of span has
+    /// accumulated (binding spec §3.4: too short a window to trust) — see
+    /// the type doc comment for the "display-plus-explicit-adopt only"
+    /// contract this backs. Also `None` in the (practically unreachable
+    /// once the span gate is cleared) degenerate case of every sample
+    /// sharing the same `wall_elapsed_s`, which would otherwise divide by
+    /// zero.
+    fn skew(&self) -> Option<ClockSkew> {
+        if self.last_dx < SKEW_MIN_SPAN_S {
+            return None;
+        }
+        let n = self.n as f64;
+        let denom = n * self.sum_dx2 - self.sum_dx * self.sum_dx;
+        if denom == 0.0 {
+            return None;
+        }
+        let slope = (n * self.sum_dxdy - self.sum_dx * self.sum_dy) / denom;
+        Some(ClockSkew {
+            ppm: slope * 1e6,
+            span_s: self.last_dx,
+        })
+    }
+
+    /// Clears all accumulated state — called on every source rebuild (same
+    /// site `silence` resets at, in `engine_loop`'s `SwitchSource` success
+    /// arm): a regression that straddled two different sources (or two
+    /// different mic devices, with their own independent clocks) would be
+    /// measuring nothing meaningful.
+    fn reset(&mut self) {
+        *self = SkewTracker::default();
+    }
+}
+
 /// Read `n` samples starting at `*pos` from `buffer`, wrapping around when
 /// the read crosses the end. Assumes `n <= buffer.len()` (true for every
 /// caller: `n` is one tick's worth of audio, `buffer` is a 60 s loop).
@@ -983,6 +1109,22 @@ fn engine_loop(
     let mut writer: Option<SessionWriter> = None;
     let mut recording_path: Option<PathBuf> = None;
     let mut silence = SilenceTracker::default();
+    // System-clock skew cross-check (binding spec §3.4, M4 Task 7):
+    // `skew`'s own regression origin is internal (see `SkewTracker`'s doc
+    // comment), but computing its `wall_elapsed_s` input each tick needs a
+    // fixed zero point of our own — `skew_epoch`, reset alongside `skew`
+    // itself on every source rebuild below so the two can never drift out
+    // of sync. `mic_frames_delivered` is the matching audio-side counter
+    // (total mic-path frames pulled since the same reset), divided by the
+    // mic's nominal sample rate to get `audio_delivered_s`. `last_skew_
+    // sample_at` paces `skew.push` to ~once per `SKEW_SAMPLE_INTERVAL_S`
+    // (mirrors `ui::controls::device_picker`'s own `Instant`-polling idiom)
+    // — ticks run at ~50 ms, far faster than the 1 Hz this cross-check
+    // needs.
+    let mut skew = SkewTracker::default();
+    let mut skew_epoch = Instant::now();
+    let mut mic_frames_delivered: u64 = 0;
+    let mut last_skew_sample_at: Option<Instant> = None;
     // Mirrors the most recently published `MetricsSnapshot` (updated
     // alongside every publish below), independent of any one recording —
     // this is what every finalize path (`stop_summary`) summarizes at the
@@ -1073,6 +1215,18 @@ fn engine_loop(
                                 source = new_source;
                                 analyzer = a;
                                 silence = SilenceTracker::default();
+                                // System-clock skew (M4 Task 7): a fresh
+                                // source (even a different device on the
+                                // same Mic spec) has its own independent
+                                // clock — a regression straddling the old
+                                // and new source would be measuring
+                                // nothing meaningful. Reset in lockstep
+                                // with `skew` itself — see the `skew_epoch`
+                                // doc comment above this loop.
+                                skew.reset();
+                                skew_epoch = Instant::now();
+                                mic_frames_delivered = 0;
+                                last_skew_sample_at = None;
                                 // A mid-recording switch must not keep
                                 // teeing the old source's (now
                                 // semantically wrong, possibly
@@ -1213,7 +1367,27 @@ fn engine_loop(
         // ms/tick pace — over-generating Simulate/Replay audio and
         // over-triggering publishes for as long as the burst lasted.
         if turbo || Instant::now() >= next_tick {
-            let (_, write_error) = pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+            let (n, write_error) = pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+
+            // System-clock skew cross-check (binding spec §3.4, M4 Task 7):
+            // mic path only — Simulate/Replay/Idle's delivery isn't real
+            // audio hardware to cross-check against (see `SkewTracker`'s
+            // doc comment), so `skew` is simply never fed on those sources,
+            // which keeps `skew.skew()` reading `None` for them below (the
+            // regression never accumulates a span in the first place).
+            if matches!(source, SourceRuntime::Mic(_)) {
+                mic_frames_delivered += n as u64;
+                let now = Instant::now();
+                let due = last_skew_sample_at
+                    .is_none_or(|t| now.duration_since(t).as_secs_f64() >= SKEW_SAMPLE_INTERVAL_S);
+                if due {
+                    let wall_elapsed_s = now.duration_since(skew_epoch).as_secs_f64();
+                    let audio_delivered_s = mic_frames_delivered as f64 / source.sample_rate_hz();
+                    skew.push(wall_elapsed_s, audio_delivered_s);
+                    last_skew_sample_at = Some(now);
+                }
+            }
+
             if let Some(e) = write_error {
                 // M4 Task 4: the tee to `writer` failed (e.g. a full disk).
                 // Drop it — best-effort finalize; a second error here would
@@ -1247,6 +1421,7 @@ fn engine_loop(
                         SourceRuntime::Mic(s) => s.health.last_error(),
                         _ => None,
                     },
+                    clock_skew: skew.skew(),
                 };
                 publish(
                     buf_input,
@@ -1603,5 +1778,122 @@ mod tests {
         assert_eq!(config.ppm_correction, 0.0);
         assert_eq!(config.bph_mode, BphMode::Auto);
         assert_eq!(info, None);
+    }
+
+    // -------------------------------------------------------------------
+    // SkewTracker (M4 Task 7 — binding spec §3.4's NTP cross-check).
+    // -------------------------------------------------------------------
+
+    /// Deterministic, bounded ±2 ms jitter (no real RNG needed): a sine
+    /// whose period (2π/0.7 ≈ 9 samples) doesn't evenly divide the 300-
+    /// sample test span, so it doesn't correlate suspiciously well with the
+    /// linear trend by construction alone. Verified numerically before
+    /// writing these tests (not just assumed): at this exact frequency the
+    /// jitter biases the recovered slope by under 0.01 ppm — nowhere near
+    /// the ±0.5 ppm tolerance below (a scan across other frequencies/phases
+    /// found worst cases over 1 ppm, so this specific frequency choice is
+    /// deliberate, not incidental).
+    fn synthetic_jitter(i: u32) -> f64 {
+        0.002 * (i as f64 * 0.7).sin()
+    }
+
+    /// Pushes `n` once-per-second samples (wall = 1.0, 2.0, ..., n) built
+    /// from a target `slope` (fractional, e.g. 25e-6 for +25 ppm) plus
+    /// `synthetic_jitter`.
+    fn push_synthetic_series(t: &mut SkewTracker, n: u32, slope: f64) {
+        for i in 1..=n {
+            let wall = i as f64;
+            t.push(wall, wall + wall * slope + synthetic_jitter(i));
+        }
+    }
+
+    #[test]
+    fn skew_tracker_recovers_a_positive_slope_despite_jitter() {
+        let mut t = SkewTracker::default();
+        push_synthetic_series(&mut t, 300, 25e-6);
+        let skew = t.skew().expect("300s span clears the 120s gate");
+        assert!(
+            (skew.ppm - 25.0).abs() <= 0.5,
+            "expected ppm within ±0.5 of 25.0, got {}",
+            skew.ppm
+        );
+        assert!(
+            (skew.span_s - 299.0).abs() < 1e-9,
+            "span is the last sample's wall time minus the first's (300.0 - 1.0), got {}",
+            skew.span_s
+        );
+    }
+
+    #[test]
+    fn skew_tracker_recovers_a_negative_slope_despite_jitter() {
+        let mut t = SkewTracker::default();
+        push_synthetic_series(&mut t, 300, -18e-6);
+        let skew = t.skew().expect("300s span clears the 120s gate");
+        assert!(
+            (skew.ppm - (-18.0)).abs() <= 0.5,
+            "expected ppm within ±0.5 of -18.0, got {}",
+            skew.ppm
+        );
+    }
+
+    #[test]
+    fn skew_tracker_recovers_a_zero_slope_despite_jitter() {
+        let mut t = SkewTracker::default();
+        push_synthetic_series(&mut t, 300, 0.0);
+        let skew = t.skew().expect("300s span clears the 120s gate");
+        assert!(
+            skew.ppm.abs() <= 0.5,
+            "expected ppm within ±0.5 of 0.0, got {}",
+            skew.ppm
+        );
+    }
+
+    #[test]
+    fn skew_tracker_withholds_below_the_120s_span_gate() {
+        let mut t = SkewTracker::default();
+        // 60 once-per-second samples starting at wall=1.0 span only 59s
+        // (last sample 60.0 minus the first, 1.0) — below the gate.
+        push_synthetic_series(&mut t, 60, 25e-6);
+        assert_eq!(
+            t.skew(),
+            None,
+            "a 59s span must not publish (binding spec §3.4: min 120s)"
+        );
+    }
+
+    #[test]
+    fn skew_tracker_publishes_at_exactly_the_120s_boundary() {
+        let mut t = SkewTracker::default();
+        t.push(0.0, 0.0);
+        t.push(120.0, 120.0); // span exactly 120.0 — the documented ">= 120s"
+        assert!(
+            t.skew().is_some(),
+            "span exactly 120s must already publish (gate is inclusive)"
+        );
+    }
+
+    #[test]
+    fn skew_tracker_reset_clears_accumulated_state() {
+        let mut t = SkewTracker::default();
+        push_synthetic_series(&mut t, 300, 25e-6);
+        assert!(
+            t.skew().is_some(),
+            "sanity: a reading must be available before reset"
+        );
+        t.reset();
+        assert_eq!(
+            t.skew(),
+            None,
+            "reset must clear every accumulated regression sum"
+        );
+        // A fresh push after reset establishes its OWN origin/span from
+        // scratch — proof this isn't just a lucky `None` from stale state
+        // that happens to still fail the gate.
+        t.push(500.0, 500.0);
+        assert_eq!(
+            t.skew(),
+            None,
+            "a single post-reset sample has zero span, regardless of its wall value"
+        );
     }
 }

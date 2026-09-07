@@ -802,6 +802,33 @@ fn recording_write_failure_surfaces_warn_banner_and_stops_recording() {
         snap.recording.is_none(),
         "recording must clear once the writer is dropped on a write failure"
     );
+
+    // RIDER (Task 4 review): the engine's post-failure state must actually
+    // accept new recordings, not just fail cleanly once — a fresh
+    // StartRecording, into a fresh temp dir, with the fault seam DISARMED
+    // (`clear_env` already dropped above, so `CHRONA_TEST_FAIL_PUSH_AFTER`
+    // is unset — "re-arm" here is just "don't set it again"), must start
+    // recording normally. Still inside `_guard` (held until the end of this
+    // function): this StartRecording calls `SessionWriter::create` too.
+    let dir2 = tempfile::tempdir().unwrap();
+    eng.send(ControlMsg::StartRecording {
+        dir: dir2.path().to_path_buf(),
+        meta_position: None,
+        watch: None,
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if eng.snapshot().recording.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "recovery StartRecording after a write failure never took — the engine's \
+             post-failure state must still accept new recordings"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
     // Shutdown + join must complete (test would hang otherwise) — also
     // confirms the engine thread is still alive and responsive, not
     // panicked/dead, i.e. no panic occurred.
@@ -876,6 +903,54 @@ fn config_changes_do_not_clear_the_idle_error_banner() {
             "never recovered to Tier 3 — engine loop likely dead"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(eng);
+}
+
+#[test]
+fn simulate_source_snapshots_never_carry_a_clock_skew_reading() {
+    // M4 Task 7 (binding spec §3.4's NTP cross-check, §10 deviation #4): the
+    // system-clock skew regression samples the MIC path only — Simulate's
+    // delivery is synthetic (generated in-process, not actually clocked
+    // against real audio hardware), so cross-checking it against the system
+    // clock would measure nothing real. `SkewTracker`'s own unit tests (in
+    // engine.rs, same-crate — it's private) cover the regression math in
+    // isolation; this confirms the engine wiring never feeds it on a
+    // Simulate source, end to end through a real published snapshot, across
+    // several publish cycles (not just the first one).
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut checked = 0;
+    while checked < 20 {
+        let s = eng.snapshot();
+        if s.metrics.is_some() {
+            assert_eq!(
+                s.health.clock_skew, None,
+                "a Simulate snapshot published a clock_skew reading — synthetic \
+                 delivery must never feed the skew regression"
+            );
+            checked += 1;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never observed 20 metrics-bearing snapshots to check"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     drop(eng);
 }
