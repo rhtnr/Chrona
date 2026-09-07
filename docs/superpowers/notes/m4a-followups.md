@@ -32,6 +32,9 @@ info-banners-render-red items (annotated there). This file adds the redesign's o
 - Session-history table is a deliberate global log (newest 50 across all watches);
   only the position-comparison card is watch-scoped.
 - `day_label`/`session_time_label` use UTC day bucketing (GUI label approximation).
+  **DISCHARGED by M4 (Task 6, commit 28957fc):** both now bucket by the
+  injected `TimeZone`'s local calendar day via `jiff` — see item 1 under "final
+  whole-branch review" below for the full writeup.
 
 ## Process notes
 
@@ -53,6 +56,18 @@ info-banners-render-red items (annotated there). This file adds the redesign's o
    IST session lists as 09:02). Ordering, durations, and honesty are unaffected. The
    fix needs a timezone source (std has none): decide `time` crate vs libc at the next
    milestone's dependency review. (Final-review I-3; the milestone's top rider.)
+   **DISCHARGED by M4 (Task 6, commit 28957fc):** `session_time_label` and
+   `day_label` both now take an injected `jiff::tz::TimeZone` and bucket/format in
+   that zone's real local calendar day and wall-clock time — `jiff` (not `time`/
+   libc) is the dependency chosen, built with `tzdb-bundle-always` so the IANA
+   database ships embedded in the binary on every platform (verified: with jiff's
+   bare defaults, neither `jiff-tzdb` nor `jiff-tzdb-platform` appears anywhere in
+   `cargo tree -p chrona-app -e features` on this host, so a CI runner without
+   `/usr/share/zoneinfo` would otherwise be unable to resolve any zone at all).
+   Production resolves the zone ONCE via `TimeZone::system()` in `ChronaApp::new`
+   (see `ChronaApp::tz`'s doc comment — an OS tz change mid-session is explicitly
+   out of scope). See `presenter::format::day_label`,
+   `ui::history_ui::session_time_label`, and task-6-report.md.
 2. **Beat-trace x-gridlines anchor to absolute multiples of the step**, so live
    fractional `end` yields labels like "-17s" and the "now" label almost never renders.
    Anchor gridlines to `end` instead: fixed on-screen positions, round labels, "now" at
