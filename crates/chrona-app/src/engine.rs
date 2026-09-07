@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrona_audio::{CaptureStream, StreamInfo};
 use chrona_dsp::synth::{SynthConfig, synthesize};
 use chrona_dsp::{
-    Analyzer, AnalyzerConfig, AnalyzerError, BphMode, MetricsSnapshot, TapeEvent, Tier,
+    Analyzer, AnalyzerConfig, AnalyzerError, BeatScope, BphMode, MetricsSnapshot, TapeEvent, Tier,
 };
 use chrona_session::{
     SIDECAR_SCHEMA_VERSION, SessionMeta, SessionReader, SessionSummary, SessionWriter,
@@ -144,6 +144,12 @@ pub enum ControlMsg {
     DoctorCapture {
         seconds: f64,
     },
+    /// M4 Task 11 (spec §6): toggles the "Scope" view. `true` makes every
+    /// subsequent publish call `Analyzer::beat_scope` once per tick and
+    /// attach its result to `EngineSnapshot::scope`; `false` reverts that
+    /// field to `None`. No analyzer rebuild — purely a per-tick gate the UI
+    /// flips when it opens/closes the Scope panel (Task 12).
+    SetScope(bool),
     Shutdown,
 }
 
@@ -245,6 +251,20 @@ pub struct EngineSnapshot {
     /// unconditionally) to give the UI a real chance to observe that one
     /// snapshot rather than skip over it.
     pub doctor_capture: Option<(Arc<Vec<f32>>, f64)>,
+    /// M4 Task 11 (spec §6, "Scope" view): the newest ≤16 per-beat waveform
+    /// windows, refreshed on every publish while the view is open —
+    /// `Some` (possibly empty, e.g. before the analyzer has ever folded)
+    /// whenever `ControlMsg::SetScope(true)` is the last one received,
+    /// `None` otherwise (unlike `doctor_capture`, this is NOT one-shot: it
+    /// stays populated for as long as the view is on). Computed by
+    /// `Analyzer::beat_scope`, called once per publish tick only while on
+    /// — cheap (≤16 windows of ~300 native-rate `f32` samples each). At
+    /// ~16×300×4 B ≈ 20 KB when on, this is a real but small addition to
+    /// every publish's cost: `publish`'s own `snap.clone()` (for `last_
+    /// snapshot`) doubles it to ~40 KB/publish at the ~10 Hz snapshot
+    /// cadence — still negligible next to `doctor_capture`'s up-to-
+    /// several-MB buffers.
+    pub scope: Option<Vec<BeatScope>>,
     /// M4 Task 10: bumped once for every successful `ControlMsg::
     /// SwitchSource` (never on startup, never on a config-only change —
     /// see `engine_loop`'s `SwitchSource` handler, the only place this
@@ -1204,6 +1224,13 @@ fn engine_loop(
     // doc comments on `EngineSnapshot`/`DoctorCaptureState`.
     let mut doctor_capture: Option<DoctorCaptureState> = None;
     let mut doctor_ready: Option<(Arc<Vec<f32>>, f64)> = None;
+    // M4 Task 11 (spec §6): whether the "Scope" view is open — see
+    // `ControlMsg::SetScope`'s doc comment. Not reset on `SwitchSource`
+    // (same as `lift_angle_deg`/`averaging_s`): it's a UI-level display
+    // toggle independent of which source is active, and `beat_scope` on a
+    // freshly-rebuilt (cache-less) `Analyzer` already degrades to an empty
+    // `Vec` honestly on its own.
+    let mut scope_on = false;
     // M4 Task 10: bumped on every successful `SwitchSource` below — see
     // `EngineSnapshot::source_generation`'s doc comment.
     let mut source_generation: u64 = 0;
@@ -1484,6 +1511,7 @@ fn engine_loop(
                     // either.
                     doctor_ready = None;
                 }
+                ControlMsg::SetScope(on) => scope_on = on,
             }
         }
 
@@ -1561,6 +1589,10 @@ fn engine_loop(
                 let metrics = analyzer.current_metrics();
                 last_metrics = metrics;
                 let tape = analyzer.tape_events();
+                // M4 Task 11: only pay for `beat_scope`'s ring copies while
+                // the Scope view is actually open — see `ControlMsg::
+                // SetScope`'s and `EngineSnapshot::scope`'s doc comments.
+                let scope = scope_on.then(|| analyzer.beat_scope(16));
                 let health = HealthView {
                     overruns: match &source {
                         SourceRuntime::Mic(s) => s.health.overruns(),
@@ -1589,6 +1621,7 @@ fn engine_loop(
                         banner: banner.clone(),
                         doctor_capture: doctor_ready.take(),
                         source_generation,
+                        scope,
                     },
                 );
             }

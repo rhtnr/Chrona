@@ -1,7 +1,7 @@
 //! Streaming analyzer: precondition → envelope → period → fold → events → regression → amplitude → tier (spec §5, stages 1–7).
 
 use crate::envelope::{DECIMATION, EnvelopeExtractor};
-use crate::events::{BeatEvent, extract_events_anchored};
+use crate::events::{BeatEvent, Parity, extract_events_anchored};
 use crate::filter::{Butterworth, DcBlocker, FilterError};
 use crate::fold::{FoldProfile, fold_with_octave_guard};
 use crate::metrics::{AmplitudeGateFail, amplitude_from_events, regress_unlocking};
@@ -102,6 +102,68 @@ pub struct TapeEvent {
     pub parity: crate::events::Parity,
     pub t_unlock_s: Option<f64>,
     pub t_drop_corr_s: f64,
+}
+
+/// `beat_scope`'s raw window: how far before/after the drop anchor each
+/// `BeatScope::samples` extends (spec §6: "~20 ms" — 25 ms here, split
+/// asymmetrically to keep most of the trailing pulse tail in view).
+const SCOPE_PRE_DROP_S: f64 = 0.010;
+const SCOPE_POST_DROP_S: f64 = 0.015;
+/// Plain-stride decimation factor for the display trace (every 4th raw
+/// sample kept) — see `BeatScope`'s doc comment for why no anti-alias
+/// filter precedes it.
+const SCOPE_DECIMATION: usize = 4;
+/// Hard cap on how many beats `beat_scope` ever returns, regardless of the
+/// caller's `n` (spec §6: a fixed small stack, not an unbounded list).
+const SCOPE_MAX_EVENTS: usize = 16;
+
+/// One extracted per-beat waveform window for the UI's "Scope" view (spec
+/// §6: "stacked per-beat waveform, ~20 ms, pulse markers"). Built by
+/// `Analyzer::beat_scope`; see its doc comment for the extraction, anchor,
+/// and omission rules.
+///
+/// `samples` holds the raw ring's own signal: DC-blocked then 3 kHz
+/// high-pass filtered (exactly what `Analyzer::push_samples` feeds every
+/// other stage), at native sample rate, decimated ×4 by plain stride
+/// sampling (every 4th sample kept, the rest dropped) — NOT further
+/// band-limited first. Stated honestly: a high-pass-filtered signal's
+/// surviving energy sits at the HIGH end of the spectrum, which is exactly
+/// where naive stride decimation aliases worst, so this trace can show
+/// minor aliasing artifacts. That's accepted deliberately, not overlooked —
+/// this is a coarse, illustrative waveform for a human to eyeball pulse
+/// shape and timing against the drop/unlock markers, never an input to any
+/// further measurement. Every actual metric (drop/unlock edge times,
+/// amplitude, rate, …) is computed upstream of this decimation, from the
+/// undecimated native-rate signal or the properly-decimated envelope.
+#[derive(Debug, Clone)]
+pub struct BeatScope {
+    /// Matched-filter drop time (the correlator estimate), absolute
+    /// nominal-clock seconds — copied straight from `BeatEvent::
+    /// t_drop_corr_s` for display/labeling only; window placement below
+    /// uses a different, more precise anchor when one is available (see
+    /// `beat_scope`'s doc comment).
+    pub t_drop_corr_s: f64,
+    pub parity: Parity,
+    /// ~25 ms of filtered native-rate signal, decimated ×4 — see the type
+    /// doc comment.
+    pub samples: Vec<f32>,
+    /// Seconds between consecutive `samples` entries: `4.0 / sr_eff` where
+    /// `sr_eff` is the analyzer's configured `sample_rate_hz` (the raw ring
+    /// itself is never decimated — only this display trace is).
+    pub sample_step_s: f64,
+    /// `samples[0]`'s time minus the drop anchor's time, seconds (≈ −0.010).
+    /// Not a fixed constant: the raw window start is rounded to a whole raw
+    /// sample, so this varies from event to event by less than half a raw
+    /// sample period.
+    pub window_start_rel_drop_s: f64,
+    /// The event's unlocking edge time minus the drop anchor's time,
+    /// seconds — `None` when `BeatEvent::t_unlock_s` wasn't resolved for
+    /// this beat (never fabricated).
+    pub t_unlock_rel_s: Option<f64>,
+    /// The event's correlator SNR, dB. Always `Some` today — every cached
+    /// event already cleared `events::DETECT_SNR_DB` to exist at all — kept
+    /// `Option` to mirror `t_unlock_rel_s` and match the binding interface.
+    pub snr_db: Option<f64>,
 }
 
 /// Incremental analysis state (M3): the fold/extraction results from the
@@ -222,6 +284,97 @@ impl Analyzer {
                 t_drop_corr_s: e.t_drop_corr_s,
             })
             .collect()
+    }
+
+    /// Up to `min(n, 16)` per-beat waveform windows for the UI's "Scope"
+    /// view (spec §6), newest event first (matches Task 12's stack layout,
+    /// "newest first"). Read-only, cheap — intended to be called once per
+    /// publish tick by the engine thread, only while the view is on.
+    ///
+    /// Each candidate is drawn from `self`'s cached events
+    /// (`AnalysisCache::events`, already pruned to the newest ~32 s),
+    /// walked newest to oldest. Its raw window spans 10 ms before the
+    /// anchor through 15 ms after it, where `anchor` is `BeatEvent::
+    /// t_drop_edge_s` when the envelope-edge pass resolved one for that
+    /// beat, else `BeatEvent::t_drop_corr_s` (the coarser matched-filter
+    /// correlation estimate, always present).
+    ///
+    /// **Time base (CONTROLLER RULING R3):** both `t_drop_edge_s` and
+    /// `t_drop_corr_s` on `BeatEvent` are, per `events.rs`'s own doc
+    /// comments and the arithmetic that actually produces them
+    /// (`(raw_start_abs + idx) / sample_rate_hz` in both
+    /// `extract_events_anchored` and `fill_edges`), absolute NOMINAL-clock
+    /// seconds since stream start — plain raw-sample-index ÷
+    /// `sample_rate_hz`, with no ppm correction folded in at this layer.
+    /// `Analyzer::config.ppm_correction` is only ever applied later, to
+    /// *derived aggregate* quantities in `current_metrics` (`period.
+    /// t_osc_s`, `onset_jitter_ms`, `beat_error_ms`) — never to a per-event
+    /// timestamp. So converting either field to a raw sample index via `×
+    /// sample_rate_hz` recovers the ORIGINAL sample index exactly (mod
+    /// float rounding), self-consistent with `raw_ring`'s own absolute,
+    /// nominal-sample-count indexing (`ring.rs` has no ppm concept at all).
+    /// In today's code there is in fact no per-event field that carries a
+    /// ppm-corrected time to mix up in the first place — `t_drop_edge_s` is
+    /// still deliberately preferred over `t_drop_corr_s` here, not to dodge
+    /// a ppm mismatch, but because it is the more PRECISE of the two: it
+    /// comes from a dedicated native-rate low-pass + half-height-crossing
+    /// pass built specifically for sub-ms precision (`fill_edges`'s own doc
+    /// comment: "a Δt bias of only ~0.1 ms can blow the amplitude gate"),
+    /// and it is literally what `BeatScope::window_start_rel_drop_s` is
+    /// documented as relative to — "the drop edge".
+    ///
+    /// A candidate is OMITTED (never zero-padded) when its raw window isn't
+    /// fully inside the CURRENT raw ring — `SampleRing::copy_range_abs`
+    /// already detects both an evicted start (too old) and a not-yet-pushed
+    /// end (too new) — or when the anchor itself is non-finite or would
+    /// imply a negative raw start (an event within the first ~10 ms of the
+    /// stream). Omission never cuts the search short: older candidates keep
+    /// being tried until `n` windows are collected or the cache is
+    /// exhausted.
+    pub fn beat_scope(&self, n: usize) -> Vec<BeatScope> {
+        let cap = n.min(SCOPE_MAX_EVENTS);
+        if cap == 0 {
+            return Vec::new();
+        }
+        let Some(cache) = &self.cache else {
+            return Vec::new();
+        };
+        let sr = self.config.sample_rate_hz;
+        let raw_window_len = ((SCOPE_PRE_DROP_S + SCOPE_POST_DROP_S) * sr).round() as usize;
+        let mut out = Vec::with_capacity(cap);
+        let mut raw_buf = Vec::new();
+        for e in cache.events.iter().rev() {
+            if out.len() >= cap {
+                break;
+            }
+            let anchor = e.t_drop_edge_s.unwrap_or(e.t_drop_corr_s);
+            if !anchor.is_finite() {
+                continue;
+            }
+            let raw_start_f = (anchor * sr - SCOPE_PRE_DROP_S * sr).round();
+            if raw_start_f < 0.0 {
+                continue;
+            }
+            let raw_start_abs = raw_start_f as u64;
+            if !self
+                .raw_ring
+                .copy_range_abs(raw_start_abs, raw_window_len, &mut raw_buf)
+            {
+                continue; // evicted or not-yet-pushed: omit, never pad
+            }
+            let samples: Vec<f32> = raw_buf.iter().step_by(SCOPE_DECIMATION).copied().collect();
+            let window_start_rel_drop_s = raw_start_abs as f64 / sr - anchor;
+            out.push(BeatScope {
+                t_drop_corr_s: e.t_drop_corr_s,
+                parity: e.parity,
+                samples,
+                sample_step_s: SCOPE_DECIMATION as f64 / sr,
+                window_start_rel_drop_s,
+                t_unlock_rel_s: e.t_unlock_s.map(|u| u - anchor),
+                snr_db: Some(e.snr_db as f64),
+            });
+        }
+        out
     }
 
     /// Incremental metrics (M3 breaking window). Refolds (recomputing the
@@ -1120,5 +1273,192 @@ mod tests {
             p50 < std::time::Duration::from_millis(bar_ms),
             "p50 {p50:?} (bar: {bar_ms} ms release)"
         );
+    }
+
+    fn tier3_analyzer(cfg: &SynthConfig) -> Analyzer {
+        let x = synthesize(cfg).expect("valid synth config");
+        let mut a = Analyzer::new(AnalyzerConfig {
+            sample_rate_hz: cfg.sample_rate_hz,
+            ..AnalyzerConfig::default()
+        })
+        .unwrap();
+        a.push_samples(&x);
+        let snap = a.current_metrics().expect("snapshot");
+        assert_eq!(
+            snap.tier,
+            crate::tier::Tier::T3,
+            "test setup must reach T3, got {:?}",
+            snap.tier
+        );
+        a
+    }
+
+    /// Standard T3-reaching synth config, matching `full_metrics_at_tier3`
+    /// and the frozen headless CLI pin (rate 12 s/d, beat error 0.8 ms,
+    /// amplitude 270 deg, 30 dB SNR) — reused across the `beat_scope` tests
+    /// below so they exercise the exact scenario the rest of the suite
+    /// already trusts to detect nearly every beat cleanly.
+    fn scope_test_cfg() -> SynthConfig {
+        SynthConfig {
+            beat_error_ms: 0.8,
+            amplitude_deg: 270.0,
+            rate_s_per_day: 12.0,
+            snr_db: 30.0,
+            ..SynthConfig::default()
+        }
+    }
+
+    #[test]
+    fn beat_scope_returns_requested_windows_with_expected_shape() {
+        let cfg = scope_test_cfg();
+        let a = tier3_analyzer(&cfg);
+        let scopes = a.beat_scope(8);
+        assert_eq!(
+            scopes.len(),
+            8,
+            "beat_scope(8) must return exactly 8 windows on a clean T3 signal"
+        );
+
+        let expected_len = (0.025 * cfg.sample_rate_hz / 4.0).round() as isize;
+        for s in &scopes {
+            assert!(
+                (s.samples.len() as isize - expected_len).abs() <= 1,
+                "decimated length {} want ~{expected_len}",
+                s.samples.len()
+            );
+            assert!(
+                (s.sample_step_s - 4.0 / cfg.sample_rate_hz).abs() < 1e-12,
+                "sample_step_s {} want {}",
+                s.sample_step_s,
+                4.0 / cfg.sample_rate_hz
+            );
+        }
+        for w in scopes.windows(2) {
+            assert_ne!(
+                w[0].parity, w[1].parity,
+                "adjacent scope windows must alternate parity"
+            );
+        }
+    }
+
+    #[test]
+    fn beat_scope_windows_center_the_drop_within_two_milliseconds() {
+        // Regression pin for CONTROLLER RULING R3: window placement must use
+        // the NOMINAL (raw-sample) time base consistently with how
+        // `raw_ring` itself is indexed. A mix-up (e.g. treating a field as
+        // ppm-corrected and then multiplying it by the raw sample rate
+        // anyway) would show up here as the loudest sample landing
+        // off-center.
+        let cfg = scope_test_cfg();
+        let a = tier3_analyzer(&cfg);
+        let scopes = a.beat_scope(8);
+        assert_eq!(scopes.len(), 8);
+        for s in &scopes {
+            let max_idx = s
+                .samples
+                .iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.abs().total_cmp(&y.abs()))
+                .map(|(i, _)| i)
+                .expect("non-empty window");
+            // Sample `i`'s time relative to the drop anchor: window start
+            // (relative to drop) plus i steps forward.
+            let max_t_rel_to_drop = s.window_start_rel_drop_s + max_idx as f64 * s.sample_step_s;
+            assert!(
+                max_t_rel_to_drop.abs() < 2e-3,
+                "max-abs sample at {max_t_rel_to_drop:.5}s relative to the drop \
+                 (t_drop_corr_s={}), want within +/-2ms",
+                s.t_drop_corr_s
+            );
+        }
+    }
+
+    #[test]
+    fn beat_scope_unlock_offset_matches_the_source_event() {
+        let cfg = scope_test_cfg();
+        let a = tier3_analyzer(&cfg);
+        let scopes = a.beat_scope(8);
+        let cache_events = &a.cache.as_ref().expect("primed cache").events;
+        let mut checked = 0;
+        for s in &scopes {
+            let e = cache_events
+                .iter()
+                .find(|e| e.t_drop_corr_s == s.t_drop_corr_s)
+                .expect("every returned scope must trace back to a cached event");
+            // Boundary events extracted right at the ring's current
+            // frontier can legitimately still have an unresolved edge (see
+            // `beat_scope`'s doc comment) — skip those rather than assert
+            // against a field that was never the anchor to begin with.
+            let Some(edge) = e.t_drop_edge_s else {
+                continue;
+            };
+            match (s.t_unlock_rel_s, e.t_unlock_s) {
+                (Some(rel), Some(u)) => {
+                    checked += 1;
+                    assert!(
+                        (rel - (u - edge)).abs() < 1e-4,
+                        "t_unlock_rel_s {rel} want {} (t_unlock_s {u} - t_drop_edge_s {edge})",
+                        u - edge
+                    );
+                }
+                (None, None) => {}
+                (Some(bad), None) => {
+                    panic!("BeatScope fabricated t_unlock_rel_s={bad} with no source t_unlock_s")
+                }
+                (None, Some(u)) => {
+                    panic!("BeatScope dropped a resolved t_unlock_s={u} (edge={edge})")
+                }
+            }
+        }
+        assert!(checked > 0, "test never exercised a resolved unlock");
+    }
+
+    #[test]
+    fn beat_scope_omits_evicted_windows_after_the_ring_advances() {
+        let cfg = scope_test_cfg();
+        let x = synthesize(&cfg).expect("valid synth config");
+        let sr = cfg.sample_rate_hz;
+        let mut a = Analyzer::new(AnalyzerConfig {
+            sample_rate_hz: sr,
+            ..AnalyzerConfig::default()
+        })
+        .unwrap();
+        a.push_samples(&x);
+        let snap = a.current_metrics().expect("snapshot");
+        assert_eq!(snap.tier, crate::tier::Tier::T3);
+
+        let before = a.beat_scope(16);
+        assert!(!before.is_empty(), "must have windows before eviction");
+        // `before` is newest-first (see `beat_scope`'s doc comment) — the
+        // oldest entry is last.
+        let oldest_before_t = before.last().expect("non-empty").t_drop_corr_s;
+
+        // Push 40 more seconds — well past the ~32s raw ring's capacity, so
+        // every sample backing `before`'s windows is now evicted.
+        a.push_samples(&x);
+        let snap2 = a.current_metrics().expect("snapshot after eviction");
+        assert_eq!(snap2.tier, crate::tier::Tier::T3);
+
+        let after = a.beat_scope(16);
+        assert!(
+            !after.is_empty(),
+            "must still have fresh windows after eviction"
+        );
+        assert!(
+            after.iter().all(|s| s.t_drop_corr_s > oldest_before_t),
+            "an evicted event's window leaked into the post-eviction result"
+        );
+        // Every returned window is a full, un-truncated extraction (fixed
+        // decimated length) — `copy_range_abs` is all-or-nothing, so
+        // anything short of this length would mean a padded/truncated
+        // window slipped through instead of being omitted.
+        let expected_len = (0.025 * sr / 4.0).round() as isize;
+        for s in &after {
+            assert!(
+                (s.samples.len() as isize - expected_len).abs() <= 1,
+                "window length {} want ~{expected_len}",
+                s.samples.len()
+            );
+        }
     }
 }

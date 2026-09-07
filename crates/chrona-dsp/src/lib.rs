@@ -18,8 +18,8 @@ pub mod synth;
 pub mod tier;
 
 pub use analyzer::{
-    Analyzer, AnalyzerConfig, AnalyzerError, BphMode, MetricsSnapshot, Quality, RateSource,
-    TapeEvent,
+    Analyzer, AnalyzerConfig, AnalyzerError, BeatScope, BphMode, MetricsSnapshot, Quality,
+    RateSource, TapeEvent,
 };
 pub use metrics::AmplitudeGateFail;
 pub use period::PeriodEstimate;

@@ -1444,3 +1444,68 @@ fn doctor_capture_clamps_seconds_below_minimum() {
     );
     drop(eng);
 }
+
+/// M4 Task 11 (spec §6, "Scope" view): `ControlMsg::SetScope` gates whether
+/// `EngineSnapshot::scope` is populated at all. Unlike `DoctorCapture`,
+/// this is NOT one-shot — once on, every publish carries a fresh
+/// `Some(..)` for as long as the view stays open — so, like the T3/tape
+/// test above, this runs on `start_with_turbo` rather than real-time
+/// pacing.
+#[test]
+fn set_scope_gates_the_published_scope_field() {
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+    assert!(
+        eng.snapshot().scope.is_none(),
+        "scope must default to None (SetScope never sent)"
+    );
+
+    eng.send(ControlMsg::SetScope(true));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let snap = loop {
+        let s = eng.snapshot();
+        if s.metrics
+            .as_ref()
+            .is_some_and(|m| m.tier == chrona_dsp::Tier::T3)
+            && s.scope.as_ref().is_some_and(|v| !v.is_empty())
+        {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached T3 with a non-empty scope (last tier {:?}, scope {:?})",
+            s.metrics.as_ref().map(|m| m.tier),
+            s.scope.as_ref().map(|v| v.len())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(!snap.scope.expect("checked Some above").is_empty());
+
+    eng.send(ControlMsg::SetScope(false));
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if eng.snapshot().scope.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline2,
+            "scope never cleared back to None after SetScope(false)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    drop(eng);
+}
