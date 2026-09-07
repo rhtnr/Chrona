@@ -9,6 +9,24 @@ version.workspace = true
 rtrb = { workspace = true }
 thiserror = { workspace = true }
 cpal = { workspace = true }
+# M4 Task 5: guards the cpal data-callback body against accidental
+# allocation in debug builds (see `lib.rs`'s `ALLOC_GUARD` doc comment for
+# the full story). Default features (`disable_release` only) apply to a
+# plain build; see `[dev-dependencies]` below for the test-only addition.
+assert_no_alloc = "1.1.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cpal = { workspace = true, features = ["pipewire"] }
+
+[dev-dependencies]
+# Unions with the `[dependencies]` entry above for test/bench builds only
+# (Cargo feature unification does not leak dev-dependency-only features
+# into a plain `cargo build`/`cargo run`). `warn_debug` swaps
+# assert_no_alloc's DEFAULT violation response — `std::alloc::
+# handle_alloc_error`, which aborts the whole process and is not a
+# catchable panic — for a counted, in-process-observable one
+# (`assert_no_alloc::violation_count()`), which is what `capture.rs`'s
+# tests read. This only affects chrona-audio's own `cargo test`: production
+# debug behavior (this crate built normally, e.g. as chrona-app's
+# dependency) keeps the strict abort-on-violation default.
+assert_no_alloc = { version = "1.1.2", features = ["warn_debug"] }

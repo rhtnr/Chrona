@@ -159,17 +159,30 @@ impl CaptureStream {
             .build_input_stream(
                 config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    data_health.bump_callback();
-                    average_into(data, channels as usize, &mut scratch);
-                    let requested = scratch.len().min(producer.slots());
-                    let written = match producer.write_chunk_uninit(requested) {
-                        Ok(chunk) => chunk.fill_from_iter(scratch.iter().copied()),
-                        Err(_) => 0,
-                    };
-                    let dropped = scratch.len() - written;
-                    if dropped > 0 {
-                        data_health.add_overrun(dropped as u64);
-                    }
+                    // M4 Task 5 (spec §2.6): guards the real-time audio
+                    // callback against accidental allocation in debug
+                    // builds. See `lib.rs`'s `ALLOC_GUARD` doc comment for
+                    // where this is actually armed (chrona-audio's own
+                    // debug test binary only) versus merely present; and
+                    // `process_callback`'s own tests for the direct proof.
+                    #[cfg(debug_assertions)]
+                    assert_no_alloc::assert_no_alloc(|| {
+                        process_callback(
+                            data,
+                            channels as usize,
+                            &mut scratch,
+                            &mut producer,
+                            &data_health,
+                        );
+                    });
+                    #[cfg(not(debug_assertions))]
+                    process_callback(
+                        data,
+                        channels as usize,
+                        &mut scratch,
+                        &mut producer,
+                        &data_health,
+                    );
                 },
                 move |err: cpal::Error| error_health.set_error(err.to_string()),
                 None,
@@ -191,6 +204,39 @@ impl CaptureStream {
             health,
             _stream: stream,
         })
+    }
+}
+
+/// The data-callback body: mono-average `data` into `scratch`, then drain
+/// `scratch` into the ring, counting anything the ring couldn't hold as an
+/// overrun. Split out of the cpal closure in `CaptureStream::start` (M4
+/// Task 5) for two reasons: it's the exact call that closure now wraps in
+/// the debug-only `assert_no_alloc` guard, and — the reason it's worth
+/// naming — it's directly callable from a test with a synthetic
+/// ring/health pair, no cpal `Device`/`Stream` (no audio hardware) needed
+/// at all. `scratch`/`producer`/`health` are all long-lived, reused every
+/// call (never rebuilt here) — matching `CaptureStream::start`'s own
+/// once-per-stream construction of each — which is exactly what makes the
+/// steady-state body allocation-free: `average_into`'s `clear()`+`extend`
+/// fills `scratch`'s pre-reserved capacity in place (see its own doc
+/// comment), and `rtrb`'s ring never allocates after construction either.
+fn process_callback(
+    data: &[f32],
+    channels: usize,
+    scratch: &mut Vec<f32>,
+    producer: &mut rtrb::Producer<f32>,
+    health: &CaptureHealth,
+) {
+    health.bump_callback();
+    average_into(data, channels, scratch);
+    let requested = scratch.len().min(producer.slots());
+    let written = match producer.write_chunk_uninit(requested) {
+        Ok(chunk) => chunk.fill_from_iter(scratch.iter().copied()),
+        Err(_) => 0,
+    };
+    let dropped = scratch.len() - written;
+    if dropped > 0 {
+        health.add_overrun(dropped as u64);
     }
 }
 
@@ -228,4 +274,81 @@ fn negotiate(device: &cpal::Device) -> Result<(f64, u16), CaptureError> {
         .unwrap_or((widest.max_sample_rate() as f64, widest.channels()));
 
     Ok(choose_config(&candidates, default))
+}
+
+// Module-level `debug_assertions` gate (not just per-`#[test]` fn): every
+// test in this module exists to exercise the alloc guard, which is itself
+// only meaningfully testable in debug (see the tests' own doc comments) —
+// gating here once, rather than on each fn, also avoids an unused-import
+// warning on `use super::*` in a hypothetical `cargo test --release` run.
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    /// M4 Task 5: proves the no-alloc guard is actually armed in
+    /// chrona-audio's own debug test binary (`lib.rs`'s `ALLOC_GUARD`,
+    /// `cfg(all(test, debug_assertions))`) — a deliberate allocation inside
+    /// `assert_no_alloc` is detected.
+    ///
+    /// This does NOT use `#[should_panic]`. Read from `assert_no_alloc`'s
+    /// own source (`~/.cargo/registry/.../assert_no_alloc-1.1.2/src/
+    /// lib.rs`) before writing this: with only the crate's default
+    /// features (`disable_release`), a violation calls
+    /// `std::alloc::handle_alloc_error`, which *aborts the whole process*
+    /// — not a catchable `panic!`. Using that default here would take down
+    /// the entire test binary (every other test running in the same
+    /// process) the moment this one ran, not fail this test cleanly. The
+    /// `warn_debug` feature (this crate's `[dev-dependencies]` entry —
+    /// unioned in for test builds only, see Cargo.toml's comment) swaps
+    /// that abort for a counted, in-process-observable violation instead
+    /// (`assert_no_alloc::violation_count()`), which is what's actually
+    /// safe to assert on in a test — and is a strictly more precise proof
+    /// than "did not panic" would have been anyway.
+    #[test]
+    fn assert_no_alloc_flags_a_forbidden_allocation() {
+        assert_no_alloc::reset_violation_count();
+        assert_no_alloc::assert_no_alloc(|| {
+            let v: Vec<u8> = Vec::with_capacity(64); // deliberate alloc
+            std::hint::black_box(v);
+        });
+        assert!(
+            assert_no_alloc::violation_count() > 0,
+            "a Vec::with_capacity(64) inside assert_no_alloc should have tripped the guard"
+        );
+    }
+
+    /// M4 Task 5: the real callback body, fed a synthetic chunk under the
+    /// guard, does not allocate. Mirrors `CaptureStream::start`'s own
+    /// recipe (ring buffer + a pre-reserved scratch buffer, both built
+    /// once and reused) without any cpal `Device`/`Stream` — hardware-free,
+    /// same spirit as this crate's other pure-logic tests
+    /// (`devices.rs`/`monoize.rs`). Reads `violation_count()` rather than
+    /// relying on "did not panic" for the same reason as the test above.
+    #[test]
+    fn process_callback_does_not_allocate_in_steady_state() {
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(4_096);
+        let mut scratch: Vec<f32> = Vec::with_capacity(8_192); // pre-reserved, as in `start`
+        let health = CaptureHealth::new();
+
+        // Two-channel interleaved input, mirroring a real stereo device.
+        let data: Vec<f32> = (0..2_048).map(|i| (i % 7) as f32 * 0.01).collect();
+
+        assert_no_alloc::reset_violation_count();
+        assert_no_alloc::assert_no_alloc(|| {
+            process_callback(&data, 2, &mut scratch, &mut producer, &health);
+        });
+        assert_eq!(
+            assert_no_alloc::violation_count(),
+            0,
+            "process_callback's steady-state path must not allocate"
+        );
+
+        assert_eq!(health.callbacks(), 1);
+        assert_eq!(scratch.len(), 1_024, "1024 stereo frames averaged to mono");
+        assert_eq!(
+            consumer.slots(),
+            1_024,
+            "all 1024 mono samples fit in the 4096-capacity ring"
+        );
+    }
 }
