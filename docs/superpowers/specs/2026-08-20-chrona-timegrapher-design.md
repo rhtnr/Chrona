@@ -4,6 +4,7 @@
 - **Status:** Approved design (egui native GUI, full tiered metric scope)
 - **Amended:** 2026-08-22 — §5.2 envelope LP cutoff, §5.3 divisor threshold, Hann-taper note (M1 final review; see docs/superpowers/notes/m1-followups.md)
 - **Amended:** 2026-08-22 — §5.5 edge timing on native-rate envelope (M2 Task 9 measurement; see plan T9 fix round)
+- **Amended:** 2026-09-07 — §4 control-channel line corrected from crossbeam to `std::sync::mpsc`, matching the implementation since M3 (M4 Task 5 spec text sync)
 - **Repo:** empty at time of writing; this spec is the project's founding document
 
 ## 1. Overview
@@ -235,7 +236,7 @@ docs/superpowers/specs/   This document and successors.
 
 Raw audio is teed from the DSP thread to the session recorder (buffered file writes off
 the audio thread). UI → DSP control messages (BPH override, lift angle, reset) go over a
-crossbeam channel.
+`std::sync::mpsc` channel.
 
 ## 5. DSP pipeline (`chrona-dsp`)
 

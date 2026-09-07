@@ -87,7 +87,7 @@ position/session strip's right side beside the elapsed timer.
   `last_watch: Option<String>`. Toolbar combo lists watches + `+ Add new watch…`;
   choosing it opens the add-watch modal (mockup copy; Enter saves, Esc cancels, blank
   rejected, duplicate selects the existing entry). Selected watch persists and stamps
-  new recordings. No watch selected (fresh install) → combo shows `No watch` and
+  new recordings. No watch selected (fresh install) → combo shows `Select watch` and
   recordings simply carry no watch (never blocks recording).
 
 ## 6. Sidecar schema v2 (amends spec §8)
@@ -117,8 +117,10 @@ supplies the summary from its last published snapshot at `StopRecording` finaliz
 
 - Index source of truth = the recordings directory: scan `*.json` sidecars at startup
   (background-friendly: it's a directory listing + small JSON reads at app start) and
-  upsert after each finalized recording. Entry order: `recorded_at` desc, falling back
-  to the filename's civil timestamp, then file mtime.
+  upsert after each finalized recording. Entry order: `started_unix_s` desc, falling
+  back to the sidecar file's mtime (when `started_unix_s` is absent/zero — a synthetic
+  or otherwise timestamp-less sidecar; the WAV's mtime is not used, since the sidecar
+  is the record and may outlive the audio — see `chrona-app/src/history.rs`).
 - Table per the mockup (Watch / Pos / Time / Rate / Beat err / Ampl); missing values
   render `—`; the header's right label shows the newest entry's day (Today / Yesterday
   / date). Display cap 50 rows. Clicking a row starts replay of that session (same path
@@ -235,6 +237,12 @@ gridlines (lo/mid/hi). Below T3 the strip shows `amplitude requires Tier 3 · <r
     per-device DragValue semantics, persisted via `device_ppm`) — because manual-protocol
     B.7 and per-device calibration depend on in-app entry. M4's calibration wizard may
     absorb it.
+11. §7's history ordering, as actually implemented, resolves each entry's timestamp as
+    `meta.started_unix_s` when nonzero, else the sidecar file's own mtime (never the
+    WAV's) — not the three-level `recorded_at` / filename civil timestamp / file mtime
+    text this section originally described (M4 Task 5 spec text sync).
+12. §5's "no watch selected" combo copy is `Select watch`, not `No watch` (M4 Task 5
+    spec text sync — the app's toolbar has always rendered the former).
 
 ## 15. Protocol & docs updates (in this milestone)
 

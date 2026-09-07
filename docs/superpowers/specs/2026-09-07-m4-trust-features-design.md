@@ -38,10 +38,13 @@ detection, first-launch auto-run; raw WASAPI path; positions beyond what M4a shi
    "recording write failed: <e> — recording stopped", writer dropped (finalize
    attempted best-effort), recording state cleared. External fault injection is not
    portable here (POSIX writes to an already-open fd succeed even after unlink), so
-   `SessionWriter` gains a **test-only injection seam**: `#[cfg(test)]
-   fail_push_after: Option<u64>` making `push` return an Err after N samples. The
-   engine test records on Simulate with the seam armed and asserts the Warn banner +
-   recording cleared + no panic.
+   `SessionWriter` gains a **test-only injection seam**: as implemented (M4 Task 5 spec
+   text sync, per pre-flight ruling R1 — plain `#[cfg(test)]` is invisible across the
+   chrona-session/chrona-app crate boundary), a `test-fault-injection` Cargo feature
+   gates a `fail_push_after: Option<u64>` field, armed via the `CHRONA_TEST_FAIL_PUSH_AFTER`
+   env var, making `push` return an Err after N samples. The engine test records on
+   Simulate with the seam armed and asserts the Warn banner + recording cleared + no
+   panic.
 4. **Overrun banner re-baselines** like ClipTracker: a watermark reset on source
    rebuild + a 5 s quiet window (mirror `ClipTracker`, generalize it to
    `CountWatermark` used by both). Tests mirror ClipTracker's.
