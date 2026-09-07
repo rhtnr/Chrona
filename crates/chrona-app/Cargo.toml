@@ -20,3 +20,12 @@ directories = { workspace = true }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# M4 Task 4: re-declares the normal chrona-session dependency above with its
+# `test-fault-injection` feature turned on. Cargo unifies features for a
+# package that's both a normal and a dev-dependency of the same crate
+# whenever dev-dependencies are part of the build (tests/benches/examples),
+# so this activates the feature for chrona-app's own lib + test build —
+# without it ever reaching a plain `cargo build`/`cargo build --release`
+# (dev-dependencies aren't part of that build's graph at all). Verified with
+# `cargo tree -e features`; see task-4-report.md.
+chrona-session = { path = "../chrona-session", features = ["test-fault-injection"] }

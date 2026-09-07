@@ -64,9 +64,10 @@ const SILENT_BANNER_S: f64 = 3.0;
 /// deliberately reclassifies these — clipping in particular — as transient
 /// health notices, not faults).
 ///
-/// PURE: all temporal/stateful judgment — "clipped within the last 5s"
-/// tolerating counter resets (see `ClipTracker`), debounced retries — is the
-/// caller's job before calling this; `h.clipped` here is taken as-is.
+/// PURE: all temporal/stateful judgment — "clipped/overran within the last
+/// 5s" tolerating counter resets (see `CountWatermark`), debounced retries —
+/// is the caller's job before calling this; `h.clipped`/`h.overruns` here
+/// are taken as-is.
 pub fn pick_banner(
     engine_banner: Option<&Banner>,
     h: &HealthView,
@@ -124,33 +125,52 @@ pub fn resolve_app_banner(
     }
 }
 
-/// Trailing window `ClipTracker` treats a clip as still "current" for.
-const CLIP_WINDOW_S: f64 = 5.0;
+/// Trailing window a `CountWatermark` treats a hit as still "current" for —
+/// shared by the clip and overrun watermarks `app.rs` keeps (M4 Task 4: one
+/// `CountWatermark` instance per counter, each independently re-baselined).
+pub const WATERMARK_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Turns `HealthView::clipped`'s raw, ever-increasing-until-rebuild counter
-/// into a "clipping happened recently" signal for `pick_banner`'s clipped-
-/// count check, so a single clipped sample early in a session doesn't leave
-/// the banner stuck on forever (controller ruling: "delta over last 5s").
-/// The analyzer rebuilds (resetting the counter to 0) on any config change;
-/// a decrease from the last-seen count re-baselines rather than
-/// underflowing or misreading the reset itself as a fresh clip.
-#[derive(Debug, Default)]
-pub struct ClipTracker {
-    last_count: u64,
-    last_clip_at: Option<std::time::Instant>,
+/// Turns a raw, ever-increasing-until-rebuild counter (`HealthView::
+/// clipped`, `HealthView::overruns`, ...) into a "this happened recently"
+/// signal for `pick_banner`'s clipped-count/overrun-count checks, so a
+/// single blip early in a session doesn't leave the banner stuck on forever
+/// (controller ruling: "delta over last 5s"). The analyzer rebuilds
+/// (resetting the counter to 0) on any config change or source rebuild; a
+/// decrease from the last-seen count re-baselines rather than underflowing
+/// or misreading the reset itself as a fresh hit.
+///
+/// Generalizes what was M3/M4a's `ClipTracker` (clip-counter-only) — M4 Task
+/// 4 gave the overrun banner its own independent instance of the identical
+/// mechanism (see `app.rs`'s `clip_tracker`/`overrun_tracker` fields)
+/// instead of reading `HealthView::overruns` raw.
+#[derive(Debug)]
+pub struct CountWatermark {
+    last: u64,
+    last_hit: Option<std::time::Instant>,
+    window: std::time::Duration,
 }
 
-impl ClipTracker {
+impl CountWatermark {
+    /// A fresh watermark, no hits observed yet, treating a hit as current
+    /// for `window` after it's last seen to rise.
+    pub fn new(window: std::time::Duration) -> CountWatermark {
+        CountWatermark {
+            last: 0,
+            last_hit: None,
+            window,
+        }
+    }
+
     /// Feeds this frame's raw cumulative count; returns the windowed count
     /// to hand `pick_banner` (0, or a nonzero placeholder while still
     /// inside the trailing window).
     pub fn observe(&mut self, count: u64, now: std::time::Instant) -> u64 {
-        if count > self.last_count {
-            self.last_clip_at = Some(now);
+        if count > self.last {
+            self.last_hit = Some(now);
         }
-        self.last_count = count;
-        match self.last_clip_at {
-            Some(t) if now.duration_since(t).as_secs_f64() < CLIP_WINDOW_S => 1,
+        self.last = count;
+        match self.last_hit {
+            Some(t) if now.duration_since(t) < self.window => 1,
             _ => 0,
         }
     }
@@ -509,9 +529,16 @@ mod tests {
         );
     }
 
+    /// Pin (M4 Task 4): `CountWatermark`'s behavior here — used for clip
+    /// tracking via a `WATERMARK_WINDOW`-second instance — is byte-for-byte
+    /// the same windowing/reset-tolerance contract `ClipTracker` (the type
+    /// this generalizes) had before this task; only the construction call
+    /// changed (`CountWatermark::new(WATERMARK_WINDOW)` instead of
+    /// `ClipTracker::default()`). Every assertion and value below is
+    /// unchanged.
     #[test]
     fn clip_tracker_windows_and_tolerates_resets() {
-        let mut t = ClipTracker::default();
+        let mut t = CountWatermark::new(WATERMARK_WINDOW);
         let t0 = std::time::Instant::now();
         assert_eq!(t.observe(0, t0), 0, "no clipping yet");
         assert_eq!(t.observe(3, t0), 1, "count rose -> inside window");
@@ -537,6 +564,48 @@ mod tests {
             t.observe(1, t0 + std::time::Duration::from_secs(6)),
             1,
             "a genuine new clip right after a reset re-enters the window"
+        );
+    }
+
+    /// New for M4 Task 4 (Step 1(b) of the brief): the same `CountWatermark`
+    /// mechanism, exercised as the overrun banner's own instance would use
+    /// it — proving the generalized type works identically for a different
+    /// raw counter, not just clip counts. Three cases: a count jump from 0
+    /// registers a nonzero windowed value; that value decays to 0 once the
+    /// window has elapsed with no further hits; and — the case that most
+    /// distinguishes "re-baselined" from "merely decayed" — a count
+    /// *decrease* (source rebuild resetting the raw cumulative overrun
+    /// counter) is tolerated immediately (proven by the follow-up genuine
+    /// hit correctly re-entering the window, exactly as the pinned clip
+    /// test above proves it for clipping).
+    #[test]
+    fn count_watermark_overrun_case_rebaselines_on_reset() {
+        let mut t = CountWatermark::new(WATERMARK_WINDOW);
+        let t0 = std::time::Instant::now();
+        assert_eq!(t.observe(0, t0), 0, "no overruns yet");
+        assert_eq!(
+            t.observe(3, t0),
+            1,
+            "count jumped 0 -> 3: inside the window"
+        );
+        assert_eq!(
+            t.observe(3, t0 + std::time::Duration::from_secs(5)),
+            0,
+            "quiet for the full window with no new overruns"
+        );
+        // Source rebuild resets the raw cumulative overrun count; this must
+        // not itself read as a fresh overrun.
+        assert_eq!(
+            t.observe(0, t0 + std::time::Duration::from_secs(5)),
+            0,
+            "count dropping (source rebuild) is tolerated, not a fresh overrun"
+        );
+        assert_eq!(
+            t.observe(1, t0 + std::time::Duration::from_secs(5)),
+            1,
+            "a genuine new overrun right after the reset re-enters the window \
+             (proves the watermark was actually re-baselined, not just coincidentally \
+             past its window already)"
         );
     }
 

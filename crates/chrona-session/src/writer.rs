@@ -10,6 +10,17 @@ pub struct SessionWriter {
     wav_path: PathBuf,
     meta: SessionMeta,
     samples_written: u64,
+    /// M4 Task 4 fault-injection seam (see the `test-fault-injection`
+    /// feature doc comment in Cargo.toml). `push` fails once
+    /// `samples_written` has already reached this many samples, simulating
+    /// e.g. a full disk mid-recording. `pub` under this feature only, so a
+    /// same-crate test can also set it directly (no env var, no risk of
+    /// racing another test's `create` call — see `push`'s doc comment).
+    /// `None` (the default: unset env var, untouched by a test) never
+    /// fires — every non-test build, and most tests even under the
+    /// feature.
+    #[cfg(feature = "test-fault-injection")]
+    pub fail_push_after: Option<u64>,
 }
 
 impl SessionWriter {
@@ -34,10 +45,35 @@ impl SessionWriter {
             wav_path,
             meta,
             samples_written: 0,
+            #[cfg(feature = "test-fault-injection")]
+            fail_push_after: std::env::var("CHRONA_TEST_FAIL_PUSH_AFTER")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         })
     }
 
+    /// Writes `samples` to the WAV.
+    ///
+    /// Under the `test-fault-injection` feature (M4 Task 4), fails with an
+    /// error instead once `samples_written` has already reached
+    /// `fail_push_after` — simulating a mid-recording write failure (e.g. a
+    /// full disk) for the engine's write-failure banner to exercise end to
+    /// end, without a real one. An empty `samples` never trips this (there
+    /// is nothing to fail to write); `fail_push_after: None` (the default —
+    /// see its doc comment) never does either, so this is a no-op change
+    /// for every non-test build and most tests even under the feature.
     pub fn push(&mut self, samples: &[f32]) -> Result<()> {
+        #[cfg(feature = "test-fault-injection")]
+        if !samples.is_empty()
+            && self
+                .fail_push_after
+                .is_some_and(|limit| self.samples_written >= limit)
+        {
+            anyhow::bail!(
+                "fault injection: simulated write failure after {} samples",
+                self.samples_written
+            );
+        }
         for &s in samples {
             self.writer.write_sample(s)?;
         }
@@ -62,6 +98,7 @@ impl SessionWriter {
             wav_path,
             mut meta,
             samples_written,
+            ..
         } = self;
         writer.finalize()?;
         let duration_s = samples_written as f64 / meta.sample_rate_hz;
@@ -157,5 +194,34 @@ mod tests {
 
         let loaded = read_meta(&wav_path).expect("sidecar present");
         assert!(loaded.summary.is_none());
+    }
+
+    /// Pins `push`'s fault-injection threshold semantics directly (no env
+    /// var, so this can't race another test's `create` call over the
+    /// process-global environment — see `fail_push_after`'s and `push`'s
+    /// doc comments; the engine-level env-var path is covered separately
+    /// by chrona-app's `tests/engine.rs`).
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn push_fails_once_the_configured_sample_count_is_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = test_meta(48_000.0);
+        let mut w = SessionWriter::create(dir.path(), meta).unwrap();
+        assert_eq!(
+            w.fail_push_after, None,
+            "no env var set for this test process: must default to None"
+        );
+        w.fail_push_after = Some(10);
+
+        w.push(&[0.0f32; 10]).unwrap(); // exactly at the limit: still fine
+        let err = w.push(&[0.0f32]).unwrap_err(); // one more: fails
+        assert!(
+            err.to_string().contains("10 samples"),
+            "unexpected error message: {err}"
+        );
+
+        // An empty push never trips it, even past the limit — nothing was
+        // actually being written.
+        w.push(&[]).unwrap();
     }
 }

@@ -5,6 +5,51 @@
 
 use chrona_app::engine::*;
 
+/// M4 Task 4: guards every test in this file that (directly, or via
+/// `ControlMsg::StartRecording`) calls `chrona_session::SessionWriter::
+/// create` against `recording_write_failure_surfaces_warn_banner_and_stops_
+/// recording` below, which arms chrona-session's `test-fault-injection`
+/// fault seam via the process-global `CHRONA_TEST_FAIL_PUSH_AFTER` env var
+/// — `create` (chrona-session, this crate's own dependency) reads it
+/// whenever the feature is on, which it unconditionally is for this crate's
+/// test builds (see task-4-report.md). `cargo test` runs the test functions
+/// in this binary as parallel threads of the *same process* by default, so
+/// without this lock, another thread's `create` call could transiently
+/// observe the env var set and get spuriously fault-injected — empirically
+/// confirmed during development (two unrelated tests failed with "…never
+/// took" once in ~5 unlocked runs; see task-4-report.md's RED/race
+/// evidence). `Mutex<()>` guards nothing but mutual exclusion itself, so a
+/// poisoned lock (an earlier holder panicking) is recovered from rather
+/// than cascaded into every later test.
+static SESSION_WRITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_session_writer_tests() -> std::sync::MutexGuard<'static, ()> {
+    SESSION_WRITER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII cleanup for `CHRONA_TEST_FAIL_PUSH_AFTER`: clears it on drop,
+/// including on an early return via a panicking `assert!` unwinding through
+/// it (libtest catches the unwind per-test, so this scope's locals — this
+/// guard included — still run their `Drop` before the *next* test gets a
+/// turn). Without this, a failure in the fault-injection test itself (e.g.
+/// its deadline actually elapsing) would leave the var stuck "on" for
+/// whichever `SESSION_WRITER_TEST_LOCK`-holding test runs next in this same
+/// process, turning one genuine failure into several confusing ones.
+struct ClearFailPushAfterOnDrop;
+
+impl Drop for ClearFailPushAfterOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: only ever constructed immediately after `set_var`ing the
+        // same key, while `SESSION_WRITER_TEST_LOCK` is held — see that
+        // static's doc comment for why that makes this safe.
+        unsafe {
+            std::env::remove_var("CHRONA_TEST_FAIL_PUSH_AFTER");
+        }
+    }
+}
+
 #[test]
 fn simulate_source_reaches_tier3_and_publishes_tape() {
     // The engine paces itself by wall clock (~50 ms/tick) so a real-time run
@@ -149,6 +194,11 @@ fn start_recording_failure_clears_stale_recording_path() {
     // (while the first is still active) into a directory that's actually a
     // regular file — `SessionWriter::create`'s `dir.join(..)` then can't be
     // created (not a directory).
+    //
+    // Holds `SESSION_WRITER_TEST_LOCK` (see its doc comment): this test
+    // calls `SessionWriter::create` (via `StartRecording`) and must not run
+    // concurrently with the fault-injection test below.
+    let _guard = lock_session_writer_tests();
     let mut eng = Engine::start_with_turbo(
         SourceSpec::Simulate {
             rate: 0.0,
@@ -228,6 +278,11 @@ fn switch_to_replay_with_sidecar_surfaces_settings_banner() {
     // it's private) cover the exact mutation in isolation; this confirms
     // the `SwitchSource` control-message call site actually wires it
     // through to a real published snapshot.
+    //
+    // Holds `SESSION_WRITER_TEST_LOCK` (see its doc comment): this test
+    // calls `SessionWriter::create` directly (setup, below) and must not
+    // run concurrently with the fault-injection test below.
+    let _guard = lock_session_writer_tests();
     let dir = tempfile::tempdir().unwrap();
     let meta = chrona_session::SessionMeta {
         schema_version: 1,
@@ -292,6 +347,11 @@ fn stop_recording_writes_summary_sidecar() {
     // T3: `StartRecording` carries `watch` through to the sidecar, and
     // `StopRecording` writes a stop-time `SessionSummary` (tier + headline
     // metrics, from the engine's last-published `MetricsSnapshot`) into it.
+    //
+    // Holds `SESSION_WRITER_TEST_LOCK` (see its doc comment): this test
+    // calls `SessionWriter::create` (via `StartRecording`) and must not run
+    // concurrently with the fault-injection test below.
+    let _guard = lock_session_writer_tests();
     let mut eng = Engine::start_with_turbo(
         SourceSpec::Simulate {
             rate: 12.0,
@@ -637,6 +697,114 @@ fn start_recording_while_idle_fails_without_creating_a_writer() {
         "no writer may exist while idle, got {:?}",
         snap.recording
     );
+    drop(eng);
+}
+
+#[test]
+fn recording_write_failure_surfaces_warn_banner_and_stops_recording() {
+    // M4 Task 4: `SessionWriter::push` failing mid-recording (e.g. a full
+    // disk) must not be silently swallowed — the engine should drop the
+    // writer, clear `recording`, and surface a Warn banner (spec §4: a
+    // write failure is a recoverable notice, not a fault — Warn, not
+    // Error). Armed via chrona-session's `test-fault-injection` feature
+    // (unconditionally enabled for this crate's own test builds by this
+    // crate's own [dev-dependencies] entry for chrona-session — see
+    // task-4-report.md's feature-unification verification), which makes
+    // `SessionWriter::create` read `CHRONA_TEST_FAIL_PUSH_AFTER` (samples)
+    // and fail every `push` once that many samples have already been
+    // written.
+    //
+    // `CHRONA_TEST_FAIL_PUSH_AFTER` is a process-global env var read by
+    // *any* `SessionWriter::create` call in this process — holding
+    // `SESSION_WRITER_TEST_LOCK` for this test's whole body (see its doc
+    // comment) is what makes setting it here safe: no other test in this
+    // binary can be inside its own `create` call while this one has it
+    // set. (An earlier, unlocked version of this test empirically produced
+    // exactly the corruption this guards against — two unrelated tests'
+    // own recordings silently failed once in ~5 runs; see
+    // task-4-report.md's RED/race evidence.)
+    let _guard = lock_session_writer_tests();
+    let mut eng = Engine::start_with_turbo(
+        SourceSpec::Simulate {
+            rate: 12.0,
+            beat_error: 0.8,
+            amplitude: 270.0,
+            snr: 30.0,
+        },
+        EngineConfig {
+            lift_angle_deg: 52.0,
+            averaging_s: 30.0,
+            bph_mode: chrona_dsp::BphMode::Auto,
+            ppm_correction: 0.0,
+        },
+        None,
+        true,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    // SAFETY: `SESSION_WRITER_TEST_LOCK` (held for this whole test, until
+    // `_guard` drops at the end) ensures no other thread's
+    // `SessionWriter::create` call can read this env var while it's set —
+    // the only other possible reader in this process. Deliberately *not*
+    // cleared as soon as `SessionWriter::create` has merely run (i.e. once
+    // `recording` is next observed `Some`): at a 4800-sample threshold and
+    // turbo pacing, the fault can trip — dropping the writer and clearing
+    // `recording` straight back to `None` — before this test's own next
+    // poll ever observes that transient `Some`, same as it did to two
+    // *other* tests during development before this lock existed (see
+    // task-4-report.md's RED/race evidence). So this stays set until
+    // `clear_env` drops (test end, including on a panicking `assert!`
+    // below) — safe precisely because the lock, not the env var's
+    // lifetime, is what protects every other test.
+    unsafe {
+        std::env::set_var("CHRONA_TEST_FAIL_PUSH_AFTER", "4800"); // 0.1s @ 48kHz
+    }
+    let clear_env = ClearFailPushAfterOnDrop;
+    eng.send(ControlMsg::StartRecording {
+        dir: dir.path().to_path_buf(),
+        meta_position: None,
+        watch: None,
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let snap = loop {
+        let s = eng.snapshot();
+        if s.banner
+            .as_ref()
+            .is_some_and(|b| b.text.contains("recording write failed"))
+        {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no 'recording write failed' banner within 5s of the fault tripping \
+             (last banner {:?}, recording {:?})",
+            s.banner,
+            s.recording,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // The fault has now demonstrably already fired — safe to clear early
+    // rather than waiting for `clear_env` to drop at the end of the
+    // function (no other test can observe the difference either way, since
+    // `_guard` is held until then regardless).
+    drop(clear_env);
+    let b = snap.banner.as_ref().expect("banner present");
+    assert_eq!(
+        b.severity,
+        BannerSeverity::Warn,
+        "a write failure is a recoverable notice (spec §4), not a fault — and this \
+         must not be the panic-containment 'analysis thread fault' Error banner \
+         either (text: {})",
+        b.text
+    );
+    assert!(
+        snap.recording.is_none(),
+        "recording must clear once the writer is dropped on a write failure"
+    );
+    // Shutdown + join must complete (test would hang otherwise) — also
+    // confirms the engine thread is still alive and responsive, not
+    // panicked/dead, i.e. no panic occurred.
     drop(eng);
 }
 

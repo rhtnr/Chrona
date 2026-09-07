@@ -27,9 +27,9 @@ use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
     AddWatchModalState, BottomGridCtx, BphComboItem, BphModeUi, ChartsCtx, ChartsUiState,
-    ClipTracker, ControlsState, HelpTopicId, SessionPanelState, StripCtx, ToolbarCtx, ToolbarState,
-    bottom_grid, charts_section, default_recordings_dir, metrics_cards, pick_banner,
-    position_strip, render_help_modal, resolve_app_banner, toolbar_row,
+    ControlsState, CountWatermark, HelpTopicId, SessionPanelState, StripCtx, ToolbarCtx,
+    ToolbarState, WATERMARK_WINDOW, bottom_grid, charts_section, default_recordings_dir,
+    metrics_cards, pick_banner, position_strip, render_help_modal, resolve_app_banner, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -68,7 +68,11 @@ pub struct ChronaApp {
     /// subsequent edit), so a continuous drag still saves within a bounded
     /// ~1s window instead of never catching up — cleared once saved.
     dirty_since: Option<Instant>,
-    clip_tracker: ClipTracker,
+    clip_tracker: CountWatermark,
+    /// Mirrors `clip_tracker` for `HealthView::overruns` (M4 Task 4): its
+    /// own `CountWatermark` instance (same `WATERMARK_WINDOW`), so a quiet
+    /// clip count can't mask a still-recent overrun, or vice versa.
+    overrun_tracker: CountWatermark,
     next_mic_retry: Option<Instant>,
     session: SessionPanelState,
     /// `<platform data dir>/chrona/recordings` (T10); falls back to a
@@ -179,7 +183,8 @@ impl ChronaApp {
             amp_accum: AmpAccum::default(),
             trace_view: TraceView::default(),
             dirty_since: None,
-            clip_tracker: ClipTracker::default(),
+            clip_tracker: CountWatermark::new(WATERMARK_WINDOW),
+            overrun_tracker: CountWatermark::new(WATERMARK_WINDOW),
             next_mic_retry: None,
             session: SessionPanelState::default(),
             recordings_dir,
@@ -305,21 +310,24 @@ impl eframe::App for ChronaApp {
             snap.metrics.as_ref().and_then(|m| m.amplitude_deg),
         );
 
-        // Clip windowing (controller ruling: "delta over last 5s",
+        // Clip/overrun windowing (controller ruling: "delta over last 5s",
         // tolerating the counter resetting on analyzer rebuild) happens
-        // here, outside the pure `pick_banner`; the windowed count is
+        // here, outside the pure `pick_banner`; the windowed counts are
         // spliced into a copy of the snapshot's health before deciding the
         // banner. Computed before the top panel (not after, as M3 did) so
         // the banner can render inside it, directly below the toolbar —
         // matching the design spec's §2 layout order (toolbar · banner ·
         // strip · ...); M4a Task 10's layout pass confirms this as the
         // banner's permanent home, not the provisional one M4a Task 6
-        // started with.
-        let windowed_clipped = self
-            .clip_tracker
-            .observe(snap.health.clipped, Instant::now());
+        // started with. M4 Task 4 gave overruns their own `CountWatermark`
+        // instance (`overrun_tracker`), mirroring `clip_tracker` exactly —
+        // see `CountWatermark`'s doc comment.
+        let now = Instant::now();
+        let windowed_clipped = self.clip_tracker.observe(snap.health.clipped, now);
+        let windowed_overruns = self.overrun_tracker.observe(snap.health.overruns, now);
         let health_for_banner = HealthView {
             clipped: windowed_clipped,
+            overruns: windowed_overruns,
             ..snap.health.clone()
         };
         let banner = pick_banner(snap.banner.as_ref(), &health_for_banner, snap.source_kind);

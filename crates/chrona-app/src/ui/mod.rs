@@ -16,7 +16,8 @@ mod toolbar;
 pub use cards::metrics_cards;
 pub use charts::{ChartsCtx, ChartsUiState, charts_section};
 pub use controls::{
-    BphModeUi, ClipTracker, ControlsState, pick_banner, resolve_app_banner, to_bph_mode,
+    BphModeUi, ControlsState, CountWatermark, WATERMARK_WINDOW, pick_banner, resolve_app_banner,
+    to_bph_mode,
 };
 pub use history_ui::{
     BottomGridCtx, ComparisonRow, bottom_grid, comparison_rows, session_time_label,

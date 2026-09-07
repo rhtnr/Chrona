@@ -773,35 +773,35 @@ fn publish(
 /// Pulls one tick's worth of audio from `source` into `analyzer`, teeing it
 /// to `writer` if recording and folding it into the silence tracker.
 /// Returns the number of samples pulled (0 for a starved mic, or a replay
-/// that has already finished).
+/// that has already finished) and, if the tee to `writer` failed this tick
+/// (M4 Task 4 — e.g. a full disk), that write error's message: state the
+/// caller (`engine_loop`, the only owner of `recording_path`/`banner`) still
+/// needs to turn into the write-failure banner and a dropped writer.
 fn pull_tick(
     source: &mut SourceRuntime,
     analyzer: &mut Analyzer,
     writer: &mut Option<SessionWriter>,
     silence: &mut SilenceTracker,
-) -> usize {
+) -> (usize, Option<String>) {
     match source {
         SourceRuntime::Mic(stream) => {
             let avail = stream.consumer.slots();
             if avail == 0 {
-                return 0;
+                return (0, None);
             }
             let Ok(chunk) = stream.consumer.read_chunk(avail) else {
-                return 0;
+                return (0, None);
             };
             let (a, b) = chunk.as_slices();
             analyzer.push_samples(a);
             analyzer.push_samples(b);
-            if let Some(w) = writer {
-                let _ = w.push(a);
-                let _ = w.push(b);
-            }
+            let write_error = push_tee(writer, a).or_else(|| push_tee(writer, b));
             let sr = stream.info.sample_rate_hz;
             silence.push(a, sr);
             silence.push(b, sr);
             let n = a.len() + b.len();
             chunk.commit_all();
-            n
+            (n, write_error)
         }
         SourceRuntime::Simulate {
             buffer,
@@ -811,11 +811,9 @@ fn pull_tick(
             let n = sim_chunk_len(*sample_rate_hz);
             let chunk = read_looping(buffer, pos, n);
             analyzer.push_samples(&chunk);
-            if let Some(w) = writer {
-                let _ = w.push(&chunk);
-            }
+            let write_error = push_tee(writer, &chunk);
             silence.push(&chunk, *sample_rate_hz);
-            chunk.len()
+            (chunk.len(), write_error)
         }
         SourceRuntime::Replay {
             samples,
@@ -824,22 +822,20 @@ fn pull_tick(
             done,
         } => {
             if *done {
-                return 0;
+                return (0, None);
             }
             let n = ((REPLAY_CHUNK_S * *sample_rate_hz).round() as usize).max(1);
             let end = (*pos + n).min(samples.len());
             let chunk = &samples[*pos..end];
             analyzer.push_samples(chunk);
-            if let Some(w) = writer {
-                let _ = w.push(chunk);
-            }
+            let write_error = push_tee(writer, chunk);
             silence.push(chunk, *sample_rate_hz);
             let pulled = chunk.len();
             *pos = end;
             if *pos >= samples.len() {
                 *done = true;
             }
-            pulled
+            (pulled, write_error)
         }
         // Deliberately a no-op (spec/M4 T3): no samples, so nothing reaches
         // `analyzer`, `writer`, or `silence` — see `SourceRuntime::Idle`'s
@@ -847,8 +843,20 @@ fn pull_tick(
         // `SilenceTracker` would otherwise eventually raise its own
         // silence banner on top of the real Error banner explaining why
         // there's no source at all).
-        SourceRuntime::Idle(_) => 0,
+        SourceRuntime::Idle(_) => (0, None),
     }
+}
+
+/// Tees `samples` to `writer` if one is currently recording. `None` when not
+/// recording, or the push succeeded; `Some(message)` on a write failure —
+/// `pull_tick`'s callers each stop at the first failure (mirroring what a
+/// broken/full-disk writer would do on a second write anyway) rather than
+/// attempting a same-tick second push against a writer already known to be
+/// broken. Leaves `writer` itself untouched either way — dropping it is
+/// `engine_loop`'s job, alongside the `recording_path`/`banner` state that
+/// lives there too (see `pull_tick`'s doc comment).
+fn push_tee(writer: &mut Option<SessionWriter>, samples: &[f32]) -> Option<String> {
+    writer.as_mut()?.push(samples).err().map(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------
@@ -1186,7 +1194,23 @@ fn engine_loop(
         // ms/tick pace — over-generating Simulate/Replay audio and
         // over-triggering publishes for as long as the burst lasted.
         if turbo || Instant::now() >= next_tick {
-            pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+            let (_, write_error) = pull_tick(&mut source, &mut analyzer, &mut writer, &mut silence);
+            if let Some(e) = write_error {
+                // M4 Task 4: the tee to `writer` failed (e.g. a full disk).
+                // Drop it — best-effort finalize; a second error here would
+                // just be noise on top of the one already driving this
+                // banner, so it's ignored — clear the recording path, and
+                // surface a Warn banner (spec §4: a write failure is a
+                // recoverable notice, not a fault).
+                if let Some(w) = writer.take() {
+                    let _ = w.finalize();
+                }
+                recording_path = None;
+                banner = Some(Banner {
+                    severity: BannerSeverity::Warn,
+                    text: format!("recording write failed: {e} — recording stopped"),
+                });
+            }
 
             tick += 1;
             if tick.is_multiple_of(SNAPSHOT_EVERY) {

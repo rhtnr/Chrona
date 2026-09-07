@@ -17,3 +17,14 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# M4 Task 4: arms a `SessionWriter::push` fault-injection seam (see
+# writer.rs), keyed by the `CHRONA_TEST_FAIL_PUSH_AFTER` env var. Not
+# `cfg(test)` — that's invisible across the crate boundary to chrona-app's
+# own test builds — instead enabled unconditionally by chrona-app's
+# [dev-dependencies] entry for this crate, so it's live for chrona-app's
+# test/integration builds (where dev-dependency features unify with the
+# normal-dependency edge for the whole build graph) without ever being
+# compiled into a release build.
+test-fault-injection = []
