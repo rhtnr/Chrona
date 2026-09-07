@@ -176,7 +176,13 @@ fn detect_hum(samples: &[f32], sample_rate_hz: f64) -> Option<HumReport> {
 /// a throwaway `Analyzer` (spec §3.2) rather than a separate detector.
 #[derive(Debug, Clone, Copy)]
 pub struct TickReport {
-    pub tier: Tier,
+    /// `None` iff the throwaway analysis produced no metrics at all
+    /// (`Analyzer::current_metrics() == None` — "Tier 0" in the analyzer's
+    /// own vocabulary, spec §5.7). `Tier::T1` implies a defensible rate
+    /// estimate exists; reporting it for a no-signal buffer would misstate
+    /// capability that isn't there (this crate's honesty rule), so the
+    /// no-metrics case is represented as the absence of a tier, not as T1.
+    pub tier: Option<Tier>,
     pub band_snr_db: Option<f64>,
     pub clipped: u64,
 }
@@ -185,18 +191,14 @@ pub struct TickReport {
 /// and reports the achieved tier, mean per-beat matched-filter SNR (from
 /// `Quality::mean_beat_snr_db`), and clipped-sample count.
 ///
-/// When the analyzer can't produce ANY snapshot (`current_metrics()`
-/// returns `None` — "Tier 0" in the analyzer's own vocabulary, spec §5.7),
-/// this reports the lowest tier `Tier` can represent (`T1`) with
-/// `band_snr_db: None` — `Tier` has no variant below T1, so this is the
-/// honest floor within the type, not a fabricated T1 detection; the clip
-/// count still comes through (clipping is meaningful even absent a beat
-/// signal, mirroring `Analyzer::clipped_samples`'s own doc comment). An
-/// unusable `sample_rate_hz` (analyzer construction failure) degrades the
-/// same way, with `clipped: 0` — this function never panics.
+/// `tier` is `None` when the analyzer can't produce ANY snapshot — the
+/// clip count still comes through even then (clipping is meaningful even
+/// absent a beat signal, mirroring `Analyzer::clipped_samples`'s own doc
+/// comment). An unusable `sample_rate_hz` (analyzer construction failure)
+/// degrades the same way, with `clipped: 0` — this function never panics.
 pub fn tick_report(samples: &[f32], sample_rate_hz: f64) -> TickReport {
     let no_beat = TickReport {
-        tier: Tier::T1,
+        tier: None,
         band_snr_db: None,
         clipped: 0,
     };
@@ -209,7 +211,7 @@ pub fn tick_report(samples: &[f32], sample_rate_hz: f64) -> TickReport {
     analyzer.push_samples(samples);
     match analyzer.current_metrics() {
         Some(snap) => TickReport {
-            tier: snap.tier,
+            tier: Some(snap.tier),
             band_snr_db: snap.quality.mean_beat_snr_db,
             clipped: snap.quality.clipped_samples,
         },
@@ -365,59 +367,75 @@ pub struct DoctorScore {
 /// Step 5 (setup score, minus the OS-specific checks which land in M5):
 /// starts at 100 and applies fixed deductions for whatever evidence is
 /// present — a `None` input contributes no penalty ("not run" is never
-/// scored as a failure, honesty gate). Lists the applicable advice
-/// strings (binding spec §3.2's fix list) ranked by the size of the
-/// deduction that triggered them; when two triggers share a fix (AGC and
-/// gate both being "the OS is processing the signal") the string appears
-/// once, at its higher rank. `tier < T2` deducts the single biggest
-/// penalty on its own (a weak/absent signal is the worst outcome) but
-/// contributes no advice text of its own — it's a consequence of whatever
-/// more specific fault is present, and that fault's own advice is what's
-/// actionable.
+/// scored as a failure, honesty gate).
+///
+/// Advice ranking rule (causes rank first, symptom ranks last): the five
+/// CAUSE deductions (clipping, AGC, gate, hum, noise floor) each carry an
+/// advice string from the binding spec §3.2 fix list and rank AMONG
+/// THEMSELVES by deduction size (when two share a fix — AGC and gate both
+/// being "the OS is processing the signal" — the string appears once, at
+/// its higher rank). `tier < T2` (or no metrics at all, `tier: None` —
+/// scored identically, see below) is the single biggest deduction but is
+/// a SYMPTOM, not an independent cause: it's what a weak/missing pickup
+/// looks like, and its own advice
+/// (`"try pressing wired earbuds against the crown"` — the spec's
+/// remedial for weak pickup) is always appended LAST, after every cause
+/// advice, regardless of its deduction being the largest. This keeps
+/// specific, actionable findings ahead of the general "signal is weak"
+/// conclusion, and is what makes a combined case (e.g. a gated signal
+/// that's also below T2) list the gate fix first.
 pub fn doctor_score(
     silence: Option<&SilenceReport>,
     tick: Option<&TickReport>,
     agc: Option<&AgcReport>,
 ) -> DoctorScore {
     let mut score: i32 = 100;
-    let mut hits: Vec<(i32, &'static str)> = Vec::new();
+    let mut cause_hits: Vec<(i32, &'static str)> = Vec::new();
+    let mut weak_tier = false;
 
     if let Some(t) = tick {
         if t.clipped > 0 {
             score -= 20;
-            hits.push((20, "lower input gain"));
+            cause_hits.push((20, "lower input gain"));
         }
-        if t.tier < Tier::T2 {
+        // No metrics at all is at least as bad as a defensible-but-weak T1
+        // — both score as the same symptom.
+        let below_t2 = t.tier.is_none_or(|tier| tier < Tier::T2);
+        if below_t2 {
             score -= 30;
+            weak_tier = true;
         }
     }
     if let Some(a) = agc {
         if a.gate_db.is_some() {
             score -= 25;
-            hits.push((25, "disable enhancements"));
+            cause_hits.push((25, "disable enhancements"));
         }
         if a.agc_db.is_some() {
             score -= 15;
-            hits.push((15, "disable enhancements"));
+            cause_hits.push((15, "disable enhancements"));
         }
     }
     if let Some(s) = silence {
         if s.hum.as_ref().is_some_and(|h| h.strength_db >= 20.0) {
             score -= 10;
-            hits.push((10, "use wired mic"));
+            cause_hits.push((10, "use wired mic"));
         }
         if s.noise_floor_dbfs > -50.0 {
             score -= 10;
-            hits.push((10, "a $10 piezo contact pickup reaches Tier 3"));
+            cause_hits.push((10, "a $10 piezo contact pickup reaches Tier 3"));
         }
     }
 
-    hits.sort_by_key(|&(deduction, _)| std::cmp::Reverse(deduction)); // stable: ties keep insertion order
+    cause_hits.sort_by_key(|&(deduction, _)| std::cmp::Reverse(deduction)); // stable: ties keep insertion order
     let mut advice: Vec<&'static str> = Vec::new();
-    for (_, text) in hits {
+    for (_, text) in cause_hits {
         if !advice.contains(&text) {
             advice.push(text);
         }
+    }
+    if weak_tier {
+        advice.push("try pressing wired earbuds against the crown");
     }
 
     DoctorScore {
@@ -511,7 +529,7 @@ mod tests {
         };
         let x = synthesize(&cfg).expect("valid synth config");
         let r = tick_report(&x, cfg.sample_rate_hz);
-        assert_eq!(r.tier, Tier::T3, "report: {r:?}");
+        assert_eq!(r.tier, Some(Tier::T3), "report: {r:?}");
         assert!(r.band_snr_db.is_some(), "band_snr_db must be Some at T3");
         assert_eq!(r.clipped, 0);
     }
@@ -589,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_score_gated_signal_scores_low_with_gate_advice_first() {
+    fn doctor_score_gated_signal_scores_low_with_gate_advice_first_and_earbuds_last() {
         // agc_depth 0.99 / recovery 5 s alone (at the default 30 dB SNR)
         // only tanks the AGC/gate signature — tier stays T3, since ducking
         // scales signal and noise together and largely preserves LOCAL
@@ -607,7 +625,11 @@ mod tests {
         let x = synthesize(&cfg).expect("valid synth config");
         let tick = tick_report(&x, cfg.sample_rate_hz);
         let agc = agc_report(&x, cfg.sample_rate_hz);
-        assert!(tick.tier < Tier::T2, "fixture sanity: tier {:?}", tick.tier);
+        assert!(
+            tick.tier.is_none_or(|t| t < Tier::T2),
+            "fixture sanity: tier {:?}",
+            tick.tier
+        );
         assert!(agc.gate_db.is_some(), "fixture sanity: {agc:?}");
 
         let ds = doctor_score(None, Some(&tick), Some(&agc));
@@ -618,9 +640,47 @@ mod tests {
             tick.tier,
             ds.advice
         );
+        // Causes-rank-first, symptom-ranks-last: gate's fix leads even
+        // though tier<T2's own deduction (−30) is bigger than gate's
+        // (−25); the tier-driven "earbuds" advice is always appended last.
         assert_eq!(
             ds.advice.first(),
             Some(&"disable enhancements"),
+            "advice {:?}",
+            ds.advice
+        );
+        assert_eq!(
+            ds.advice.last(),
+            Some(&"try pressing wired earbuds against the crown"),
+            "advice {:?}",
+            ds.advice
+        );
+    }
+
+    #[test]
+    fn doctor_score_weak_tier_alone_scores_70_with_only_earbuds_advice() {
+        // No clipping, no AGC/gate, no hum, no bad noise floor — just a
+        // tier that never reaches T2 (silence/agc not run at all here, so
+        // neither can contribute a deduction or advice).
+        let cfg = SynthConfig {
+            duration_s: 4.0,
+            snr_db: 10.0,
+            ..SynthConfig::default()
+        };
+        let x = synthesize(&cfg).expect("valid synth config");
+        let tick = tick_report(&x, cfg.sample_rate_hz);
+        assert!(
+            tick.tier.is_none_or(|t| t < Tier::T2),
+            "fixture sanity: tier {:?}",
+            tick.tier
+        );
+        assert_eq!(tick.clipped, 0, "fixture sanity: {tick:?}");
+
+        let ds = doctor_score(None, Some(&tick), None);
+        assert_eq!(ds.score, 70, "tier {:?} advice {:?}", tick.tier, ds.advice);
+        assert_eq!(
+            ds.advice,
+            vec!["try pressing wired earbuds against the crown"],
             "advice {:?}",
             ds.advice
         );
