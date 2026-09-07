@@ -70,6 +70,34 @@ pub fn fold_envelope(env: &[f32], t_osc_env: f64) -> Option<FoldProfile> {
         *bin = bucket[..keep].iter().sum::<f32>() / keep as f32;
     }
 
+    // Empty bins (zero samples) only arise when t_osc_env is an exact-integer
+    // number of env samples smaller than NBINS — real 48 kHz pipelines use a
+    // fractional t_osc_env (derived from bph/env_rate) that always populates
+    // every bin, so this is unreached there (M2-followups #7). Left as 0.0,
+    // an empty bin can drag the median to zero (clamped to a 1e-12 floor
+    // below) and blow `contrast` up to ~1e12; fill each with the circular
+    // mean of its nearest non-empty neighbors instead, since `fold_envelope`
+    // is public and must return sane output for any finite, in-range period.
+    let empty: Vec<bool> = buckets.iter().map(Vec::is_empty).collect();
+    if empty.iter().any(|&e| e) && empty.iter().any(|&e| !e) {
+        let nearest_non_empty = |i: usize, step: isize| {
+            (1..=NBINS)
+                .map(|d| (i as isize + step * d as isize).rem_euclid(NBINS as isize) as usize)
+                .find(|&j| !empty[j])
+                .expect("at least one non-empty bin, checked above")
+        };
+        let fill: Vec<(usize, f32)> = (0..NBINS)
+            .filter(|&i| empty[i])
+            .map(|i| {
+                let (left, right) = (nearest_non_empty(i, -1), nearest_non_empty(i, 1));
+                (i, (bins[left] + bins[right]) / 2.0)
+            })
+            .collect();
+        for (i, v) in fill {
+            bins[i] = v;
+        }
+    }
+
     // Anchor A: global max, parabolic-refined on the circle.
     let a_idx = bins
         .iter()
@@ -306,6 +334,36 @@ mod tests {
         assert!(fold_envelope(&env, 750.0).is_none()); // 1.3 cycles < 8
         assert!(fold_envelope(&env, f64::NAN).is_none());
         assert!(fold_envelope(&env, 0.0).is_none());
+    }
+
+    /// M2-followups #7: a folding period that's an exact integer number of
+    /// env samples AND smaller than NBINS makes the phase→bin map
+    /// `floor(k · NBINS/period)` step by more than one bin per k, so most of
+    /// the 512 bins never receive a sample. Real 48 kHz pipelines never hit
+    /// this (t_osc_env is an irrational-ish float derived from bph/env_rate,
+    /// so every bin gets filled), but `fold_envelope` is public and must not
+    /// hand back nonsense for an in-range, finite period.
+    #[test]
+    fn fold_envelope_fills_empty_bins_and_keeps_contrast_sane() {
+        let period = 250usize; // < NBINS=512, exact integer -> guaranteed empty bins
+        let cycles_n = 40; // well above the cycles>=8 floor
+        let mut env = Vec::with_capacity(period * cycles_n);
+        for _ in 0..cycles_n {
+            for k in 0..period {
+                env.push(if k < 10 { 1.0f32 } else { 0.1f32 });
+            }
+        }
+        let profile = fold_envelope(&env, period as f64).expect("enough cycles");
+        assert!(
+            profile.bins.iter().all(|b| b.is_finite()),
+            "non-finite bin in {:?}",
+            profile.bins
+        );
+        assert!(
+            profile.contrast.is_finite() && profile.contrast < 1e6,
+            "contrast {} not sane",
+            profile.contrast
+        );
     }
 
     #[test]

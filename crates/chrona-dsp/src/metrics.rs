@@ -186,7 +186,11 @@ mod tests {
 
     #[test]
     fn beat_error_sweep_meets_the_bar() {
-        // M2 bar (Global Constraints): BE within ±0.1 ms at 30 dB.
+        // M2 bar (Global Constraints): BE within ±0.1 ms at 30 dB. Collect
+        // every case's failures instead of asserting inline: an inline
+        // assert stops the sweep at the first bad case, hiding any later
+        // one (this is how M2 missed a real 330° amplitude failure).
+        let mut failures = Vec::new();
         for be_true in [0.0f64, 0.3, 0.8, 2.0] {
             let cfg = SynthConfig {
                 beat_error_ms: be_true,
@@ -195,19 +199,31 @@ mod tests {
                 ..SynthConfig::default()
             };
             let events = pipeline_to_events(&cfg);
-            let r = regress_unlocking(&events).expect("regression");
-            assert!(
-                (r.beat_error_ms - be_true).abs() <= 0.1,
-                "be {be_true}: got {}",
-                r.beat_error_ms
-            );
+            let Some(r) = regress_unlocking(&events) else {
+                failures.push(format!("be {be_true}: regression returned None"));
+                continue;
+            };
+            if (r.beat_error_ms - be_true).abs() > 0.1 {
+                failures.push(format!("be {be_true}: BE got {}", r.beat_error_ms));
+            }
             // Rate from the regressed beat period: ±0.3 s/d bar.
             let rate = 86_400.0 * (crate::bph::t_beat_s(cfg.bph) - r.t_beat_s)
                 / crate::bph::t_beat_s(cfg.bph);
-            assert!((rate - 12.0).abs() <= 0.3, "be {be_true}: rate {rate}");
-            assert!(r.jitter_ms < 0.5, "jitter {}", r.jitter_ms);
-            assert!(r.events_used >= 12);
+            if (rate - 12.0).abs() > 0.3 {
+                failures.push(format!("be {be_true}: rate {rate}"));
+            }
+            if r.jitter_ms >= 0.5 {
+                failures.push(format!("be {be_true}: jitter {}", r.jitter_ms));
+            }
+            if r.events_used < 12 {
+                failures.push(format!("be {be_true}: events_used {}", r.events_used));
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "sweep failures:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -287,7 +303,10 @@ mod tests {
 
     #[test]
     fn amplitude_sweep_meets_the_bar() {
-        // M2 bar: ±5° at 30 dB, averaged output.
+        // M2 bar: ±5° at 30 dB, averaged output. Collect every case's
+        // failures instead of asserting inline (see beat_error_sweep's
+        // comment — an inline assert once hid a real 330° failure).
+        let mut failures = Vec::new();
         for amp_true in [200.0f64, 240.0, 270.0, 300.0, 330.0] {
             let cfg = SynthConfig {
                 amplitude_deg: amp_true,
@@ -296,15 +315,26 @@ mod tests {
             };
             let events = pipeline_to_events(&cfg);
             let t_osc = crate::bph::t_osc_s(cfg.bph);
-            let a = amplitude_from_events(&events, t_osc, cfg.lift_angle_deg)
-                .unwrap_or_else(|g| panic!("amp {amp_true}: gate {g:?}"));
-            assert!(
-                (a.degrees - amp_true).abs() <= 5.0,
-                "amp {amp_true}: got {}",
-                a.degrees
-            );
-            assert!((a.tic_degrees - a.toc_degrees).abs() < 60.0);
+            match amplitude_from_events(&events, t_osc, cfg.lift_angle_deg) {
+                Ok(a) => {
+                    if (a.degrees - amp_true).abs() > 5.0 {
+                        failures.push(format!("amp {amp_true}: got {}", a.degrees));
+                    }
+                    if (a.tic_degrees - a.toc_degrees).abs() >= 60.0 {
+                        failures.push(format!(
+                            "amp {amp_true}: tic/toc disagree {} vs {}",
+                            a.tic_degrees, a.toc_degrees
+                        ));
+                    }
+                }
+                Err(g) => failures.push(format!("amp {amp_true}: gate {g:?}")),
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "sweep failures:\n{}",
+            failures.join("\n")
+        );
     }
 
     fn fabricated(dt_tic_s: f64, dt_toc_s: f64, n_per_parity: usize) -> Vec<BeatEvent> {
