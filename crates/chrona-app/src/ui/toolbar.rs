@@ -76,13 +76,16 @@ pub fn export_enabled(selected_watch: Option<&str>, has_sessions: bool) -> bool 
 /// `config.last_watch`), which BPH combo row is active (distinct from
 /// `ControlsState::bph_mode_ui`, which only ever holds the free-text
 /// buffer for the `Other…` case — see `apply_bph_selection`), the add-watch
-/// modal, and the export-report request flag the Export button sets
-/// (consumed each frame by `ChronaApp::run_export`, M4a Task 9).
+/// modal, the export-report request flag the Export button sets (consumed
+/// each frame by `ChronaApp::run_export`, M4a Task 9), and the calibration-
+/// wizard request flag the cal-ppm popup's "Calibrate…" row sets (M4 Task
+/// 8, same "set here, consumed next frame" shape as `export_requested`).
 pub struct ToolbarState {
     pub selected_watch: Option<String>,
     pub bph_selection: BphComboItem,
     pub add_watch_modal: AddWatchModalState,
     pub export_requested: bool,
+    pub cal_wizard_requested: bool,
 }
 
 /// Borrowed, per-frame context `toolbar_row` needs beyond `ToolbarState`:
@@ -149,6 +152,7 @@ pub fn toolbar_row(
             engine,
             config,
             ctx.snap.health.clock_skew,
+            &mut state.cal_wizard_requested,
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -453,6 +457,13 @@ fn averaging_combo(
 /// debounced-dirty contract the old `ppm_control` had) — for either the
 /// manual DragValue or the "use as correction" button, both of which funnel
 /// through the shared `apply_and_persist_ppm` helper below.
+///
+/// M4 Task 8 adds the "Calibrate…" row below the DragValue/skew line: the
+/// calibration wizard's entry point. A click only sets
+/// `*cal_wizard_requested = true`; `ChronaApp::ui` consumes it on the next
+/// frame the same way it consumes `ToolbarState::export_requested` — the
+/// popup itself doesn't know about `CalWizard` at all, keeping the wizard's
+/// state machine entirely out of this module.
 fn cal_ppm_control(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -460,6 +471,7 @@ fn cal_ppm_control(
     engine: &Engine,
     config: &mut ConfigStore,
     clock_skew: Option<ClockSkew>,
+    cal_wizard_requested: &mut bool,
 ) -> bool {
     let button_resp = ui
         .add(
@@ -511,6 +523,15 @@ fn cal_ppm_control(
                 }
             }
 
+            ui.separator();
+            if ui
+                .small_button("Calibrate…")
+                .on_hover_text("Guided quartz-watch calibration (~10\u{2013}15 min)")
+                .clicked()
+            {
+                *cal_wizard_requested = true;
+            }
+
             match ppm_to_apply {
                 Some(ppm) => apply_and_persist_ppm(engine, config, controls, ppm),
                 None => false,
@@ -527,7 +548,12 @@ fn cal_ppm_control(
 /// actually selected to persist against ("System default" has no single
 /// concrete device to key `device_ppm` by — same as before this button
 /// existed).
-fn apply_and_persist_ppm(
+///
+/// `pub(crate)` (M4 Task 8): the calibration wizard's Result screen "Save
+/// for <device>" button reuses this SAME fn for its own persistence —
+/// deliberately not a second copy of the `SetPpm` + `device_ppm.insert`
+/// logic — see `ui::cal_wizard`.
+pub(crate) fn apply_and_persist_ppm(
     engine: &Engine,
     config: &mut ConfigStore,
     controls: &ControlsState,

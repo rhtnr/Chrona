@@ -27,10 +27,11 @@ use crate::history::{HistoryIndex, POSITIONS, PositionRates, SessionEntry, posit
 use crate::presenter::{AmpAccum, BeatAccum, TraceView};
 use crate::theme::{self, Theme};
 use crate::ui::{
-    AddWatchModalState, BottomGridCtx, BphComboItem, BphModeUi, ChartsCtx, ChartsUiState,
-    ControlsState, CountWatermark, HelpTopicId, SessionPanelState, StripCtx, ToolbarCtx,
-    ToolbarState, WATERMARK_WINDOW, bottom_grid, charts_section, default_recordings_dir,
-    metrics_cards, pick_banner, position_strip, render_help_modal, resolve_app_banner, toolbar_row,
+    AddWatchModalState, BottomGridCtx, BphComboItem, BphModeUi, CalWizard, CalWizardCtx, ChartsCtx,
+    ChartsUiState, ControlsState, CountWatermark, HelpTopicId, SessionPanelState, StripCtx,
+    TempCaptureGuard, ToolbarCtx, ToolbarState, WATERMARK_WINDOW, bottom_grid, charts_section,
+    default_recordings_dir, metrics_cards, pick_banner, position_strip, render_cal_wizard,
+    render_help_modal, resolve_app_banner, toolbar_row,
 };
 
 /// `ConfigStore::save` debounce (behavior contract: save at most once per
@@ -146,6 +147,22 @@ pub struct ChronaApp {
     /// for this one slot isn't worth the risk of missing one and leaving a
     /// stale banner stuck forever.
     app_banner: Option<(BannerSeverity, String)>,
+    /// The quartz calibration wizard's state machine (M4 Task 8, binding
+    /// spec §3.4), `None` when the wizard isn't open. Opened by the
+    /// toolbar cal-ppm popup's "Calibrate…" row (`toolbar.
+    /// cal_wizard_requested`, consumed each frame in `ChronaApp::ui` the
+    /// same way `toolbar.export_requested` is).
+    cal_wizard: Option<CalWizard>,
+    /// UI-only "are you sure you want to discard this capture?" flag for
+    /// the wizard's `Capturing` screen — kept OUTSIDE `CalWizard` itself
+    /// since a `Capturing -> Analyzing`/`None` transition replaces the
+    /// whole enum value (see `ui::cal_wizard`'s module doc comment).
+    cal_wizard_confirm_cancel: bool,
+    /// Drop-guard that deletes the wizard's temp WAV+sidecar — see
+    /// `ui::cal_wizard::TempCaptureGuard`'s doc comment for why this lives
+    /// here (a plain `ChronaApp` field) rather than nested inside
+    /// `cal_wizard`, and for the OS-crash caveat this can't cover.
+    cal_capture_guard: Option<TempCaptureGuard>,
 }
 
 impl ChronaApp {
@@ -157,6 +174,7 @@ impl ChronaApp {
             bph_selection: BphComboItem::Auto,
             add_watch_modal: AddWatchModalState::default(),
             export_requested: false,
+            cal_wizard_requested: false,
         };
 
         let theme = theme::theme_from_config(config.theme.as_deref());
@@ -213,6 +231,9 @@ impl ChronaApp {
             selected_position: 0,
             open_help: None,
             app_banner: None,
+            cal_wizard: None,
+            cal_wizard_confirm_cancel: false,
+            cal_capture_guard: None,
         }
     }
 
@@ -410,6 +431,27 @@ impl eframe::App for ChronaApp {
             self.toolbar.export_requested = false;
             self.run_export();
         }
+
+        // M4 Task 8: the cal-ppm popup's "Calibrate…" row sets this; opening
+        // at `CalWizard::Intro` and consuming the flag here is the same
+        // "set on click, consumed next frame" shape `export_requested` uses.
+        if self.toolbar.cal_wizard_requested {
+            self.toolbar.cal_wizard_requested = false;
+            self.cal_wizard = Some(CalWizard::Intro);
+        }
+        render_cal_wizard(
+            ui.ctx(),
+            theme::Palette::of(self.theme),
+            &mut self.cal_wizard,
+            &mut self.cal_wizard_confirm_cancel,
+            &mut self.cal_capture_guard,
+            CalWizardCtx {
+                engine: &self.engine,
+                snap: &snap,
+                controls: &mut self.controls,
+                config: &mut self.config,
+            },
+        );
 
         self.maybe_retry_mic(snap.health.last_error.is_some());
         self.maybe_save_config();

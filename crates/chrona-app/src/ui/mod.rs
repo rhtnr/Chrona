@@ -5,6 +5,7 @@
 //! the toolbar (`controls`), and the position/session strip (M4a Task 7,
 //! `strip`).
 
+mod cal_wizard;
 mod cards;
 mod charts;
 mod controls;
@@ -13,6 +14,7 @@ mod modals;
 mod strip;
 mod toolbar;
 
+pub use cal_wizard::{CalWizard, CalWizardCtx, TempCaptureGuard, render_cal_wizard};
 pub use cards::metrics_cards;
 pub use charts::{ChartsCtx, ChartsUiState, charts_section};
 pub use controls::{
