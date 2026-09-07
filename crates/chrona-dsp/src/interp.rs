@@ -1,9 +1,10 @@
 //! Shared parabolic-vertex interpolation core.
 //!
-//! Three sites in this crate each independently computed the same
+//! Four sites in this crate each independently computed the same
 //! three-point parabolic vertex offset before this module existed:
 //! `cal.rs`'s quartz-tick refinement, `autocorr.rs`'s autocorrelation-peak
-//! refinement, and `fold.rs`'s circular fold-bin refinement. Read side by
+//! refinement, `fold.rs`'s circular fold-bin refinement, and
+//! `events.rs`'s matched-filter correlation-peak refinement. Read side by
 //! side, their formulas — denominator, degenerate-guard threshold, and
 //! clamp bounds — were byte-for-byte identical:
 //!
@@ -14,9 +15,9 @@
 //!
 //! so [`parabolic3`] below unifies that formula, guard, and clamp into one
 //! core (the interface's clamp-unification precondition — "only if the
-//! three copies agree" — holds). What differed, and stays differing in each
-//! call site's own thin wrapper, is how the three input samples are located
-//! and how the offset is combined back with the vertex index:
+//! copies agree" — holds). What differed, and stays differing in each call
+//! site's own thin wrapper, is how the three input samples are located and
+//! how the offset is combined back with the vertex index:
 //!
 //! - **`cal.rs::calibrate_quartz`** extracts its triple by direct linear
 //!   indexing at the call site itself (`env[pk-1], env[pk], env[pk+1]`) and
@@ -25,6 +26,14 @@
 //!   `parabolic3`. The caller's own search bounds (`lo = (center-gate).max(1)`,
 //!   `hi = (center+gate).min(env.len()-2)`) keep `pk` interior. The offset
 //!   is added to `pk as f64` by the caller; the core never sees the index.
+//! - **`events.rs::correlate_in_gate`** follows the exact same shape as
+//!   `cal.rs`: it extracts its triple at the call site
+//!   (`corr[pi-1].abs(), corr[pi].abs(), corr[pi+1].abs()`, as `f64`) and
+//!   calls the core directly, with no wrapper function. Its interior-index
+//!   guard is an explicit `if pi == 0 || pi + 1 == corr.len() { 0.0 } else
+//!   { .. }` at the call site rather than a search-bound invariant, but the
+//!   effect — the core only ever sees an interior triple — is the same. The
+//!   offset is added to `lo as f64 + pi as f64` by the caller.
 //! - **`autocorr.rs::parabolic_offset(r, i)`** indexes its slice *linearly*
 //!   inside the wrapper (`r[i-1], r[i], r[i+1]`) — this relies on the
 //!   caller keeping `i` interior, which `find_peak_in_band` guarantees via
@@ -35,17 +44,10 @@
 //!   *circularly* (`bins[(i+n-1)%n], bins[i], bins[(i+1)%n]`), so it is safe
 //!   for every `i` in `0..n` including the array ends — the fold's bin
 //!   array is a phase circle, not a line. Its return contract also differs
-//!   from the other two: instead of a bare offset, it adds the vertex index
-//!   itself and wraps the sum into `[0, n)` via `.rem_euclid`, returning an
-//!   absolute (wrapped) bin position rather than an offset for the caller
-//!   to add.
-//!
-//! A fourth, pre-existing copy at `events.rs::parabolic3`, called from
-//! `correlate_in_gate`, is byte-identical to `cal.rs`'s pre-unification body
-//! and shares `cal.rs`'s "caller extracts the triple and adds the index"
-//! contract. It is deliberately NOT migrated onto this core here: it fell
-//! outside this unification's authorized file list. Follow-up debt, not a
-//! correctness concern.
+//!   from the other three: instead of a bare offset, it adds the vertex
+//!   index itself and wraps the sum into `[0, n)` via `.rem_euclid`,
+//!   returning an absolute (wrapped) bin position rather than an offset for
+//!   the caller to add.
 
 /// Vertex offset, in `[-0.5, 0.5]`, of the parabola through `(-1,a), (0,b),
 /// (1,c)`. Degenerate (near-flat or non-concave) triples — `|denom| < 1e-20`

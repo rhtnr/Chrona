@@ -4,6 +4,7 @@
 use crate::envelope::DECIMATION;
 use crate::filter::Butterworth;
 use crate::fold::FoldProfile;
+use crate::interp::parabolic3;
 
 /// Correlation-peak SNR (dB) below which a beat is not emitted.
 pub const DETECT_SNR_DB: f32 = 6.0;
@@ -26,15 +27,6 @@ pub struct BeatEvent {
     /// Envelope leading-edge times (Task 7); None until extracted or when not found.
     pub t_drop_edge_s: Option<f64>,
     pub t_unlock_s: Option<f64>,
-}
-
-fn parabolic3(a: f64, b: f64, c: f64) -> f64 {
-    let denom = a - 2.0 * b + c;
-    if denom.abs() < 1e-20 {
-        0.0
-    } else {
-        (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
-    }
 }
 
 /// Build one parity's unit-energy drop template from max-|x|-anchored windows.
