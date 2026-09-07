@@ -5,6 +5,7 @@ pub mod analyzer;
 pub mod autocorr;
 pub mod bph;
 pub mod cal;
+pub mod doctor;
 pub mod envelope;
 pub mod events;
 pub mod filter;
