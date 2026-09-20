@@ -1006,26 +1006,57 @@ fn simulate_source_snapshots_never_carry_a_clock_skew_reading() {
 /// clean-signal (`snr: 30.0`) case and pins the SPECIFIC `NotQuartz` outcome
 /// — the exact silent-wrong path Task 8b closes.
 ///
-/// **Why 45 s of real sleep** (both this fn and its snr-30 sibling):
-/// `calibrate_quartz` (`cal.rs`) rejects anything under its own
+/// **Why the capture is POLLED, not slept** (both this fn and its snr-30
+/// sibling): `calibrate_quartz` (`cal.rs`) rejects anything under its own
 /// `MIN_SECONDS = 300.0` with `CalError::TooShort` BEFORE it ever runs the
 /// tick-detection logic that could report `NotQuartz`/`NoTicks`/`Unstable`
 /// — so this test needs the captured WAV to hold at least 300 SIMULATED
-/// seconds, not merely "some" audio. Turbo-mode throughput was measured
-/// empirically on a dev machine (not assumed): 9 s of real sleep produced
-/// 88.1 simulated seconds (~9.8 sim-s/real-s) via this exact
-/// StartRecording/sleep/StopRecording shape. 45 s of real sleep budgets
-/// roughly 400+ simulated seconds at that measured rate — about 1.3x margin
-/// over the 300 s minimum, with headroom for a slower CI machine. The
-/// `duration_s >= 300.0` assertion below still checks this directly against
-/// the finalized WAV before ever calling into `calibrate_quartz`, so an
-/// unexpectedly slow machine fails with a clear, self-diagnosing message
-/// ("only captured Xs") instead of a confusing wrong-error-variant mismatch.
+/// seconds, not merely "some" audio. The original version slept a fixed
+/// 45 real seconds budgeted from a dev-machine turbo measurement
+/// (~9.8 sim-s/real-s, ~1.3x margin); the first CI run proved that rate
+/// does not transfer — shared runners delivered 4.6–5.6 sim-s/real-s and
+/// under-filled the capture (206 s/254 s), tripping the duration guard on
+/// two OSes. `wait_for_captured_sim_seconds` removes the throughput
+/// assumption entirely: it watches the growing WAV until the target is
+/// actually reached, finishing FASTER on quick machines and adapting to
+/// slow ones. The `duration_s >= 300.0` assertion below still re-checks
+/// the finalized WAV before ever calling into `calibrate_quartz` — the
+/// belt to the poll's suspenders.
 ///
 /// Holds `SESSION_WRITER_TEST_LOCK` (see its doc comment): calls
 /// `SessionWriter::create` via `StartRecording`. Its snr-30 sibling holds
-/// the same lock, so the two 45 s-sleep captures serialize rather than
-/// overlap (~90 s combined, not ~45s) — see task-8b-report.md.
+/// the same lock, so the two polled captures serialize rather than
+/// overlap — see task-8b-report.md.
+/// Polls the in-progress capture WAV until it holds at least `target_s`
+/// SIMULATED seconds of audio, so the test never assumes a turbo
+/// sim-s/real-s throughput (see the doc comment on the snr-0 test above —
+/// the first CI run proved dev-machine rates don't transfer to shared
+/// runners). File size tracks delivered audio closely: the engine writes
+/// f32 mono at 48 kHz (4 bytes/sample) through hound's BufWriter, whose
+/// ≤8 KB buffering lag is noise against the ~58 MB target. The deadline
+/// converts a pathologically slow machine (< ~1.3 sim-s/real-s, 4x under
+/// the slowest rate ever observed) into a clear self-diagnosing failure
+/// rather than a hang.
+fn wait_for_captured_sim_seconds(wav_path: &std::path::Path, target_s: f64) {
+    const BYTES_PER_SIM_SECOND: f64 = 48_000.0 * 4.0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    loop {
+        let bytes = std::fs::metadata(wav_path).map(|m| m.len()).unwrap_or(0);
+        let sim_s = bytes as f64 / BYTES_PER_SIM_SECOND;
+        if sim_s >= target_s {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {sim_s:.1}s of simulated audio captured within the 240s deadline \
+             (need >= {target_s}s) — turbo throughput on this machine is far below any \
+             observed rate; calibrate_quartz would report TooShort, which is not what \
+             this test is checking"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 #[test]
 fn cal_wizard_capture_on_simulate_snr0_yields_honest_failure() {
     let _guard = lock_session_writer_tests();
@@ -1084,8 +1115,9 @@ fn cal_wizard_capture_on_simulate_snr0_yields_honest_failure() {
     );
 
     // Let enough SIMULATED audio accumulate to clear calibrate_quartz's own
-    // 300s minimum — see this test's doc comment for how 45s was chosen.
-    std::thread::sleep(std::time::Duration::from_secs(45));
+    // 300s minimum — polled, not slept (see this test's doc comment); 305
+    // gives margin over the gate plus write-buffering slack.
+    wait_for_captured_sim_seconds(&wav_path, 305.0);
 
     eng.send(ControlMsg::StopRecording);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1105,10 +1137,10 @@ fn cal_wizard_capture_on_simulate_snr0_yields_honest_failure() {
     let duration_s = reader.samples.len() as f64 / reader.sample_rate_hz;
     assert!(
         duration_s >= 300.0,
-        "only captured {duration_s:.1}s of simulated audio (need >= 300s) — turbo \
-         throughput on this machine is lower than the ~9.8 sim-s/real-s this test's 45s \
-         sleep budget assumed; calibrate_quartz would report TooShort here, not \
-         NotQuartz/NoTicks/Unstable, which is not what this test is checking"
+        "only captured {duration_s:.1}s of simulated audio (need >= 300s) despite the \
+         polled wait reporting success — the WAV shrank or the finalize dropped samples; \
+         calibrate_quartz would report TooShort here, not NotQuartz/NoTicks/Unstable, \
+         which is not what this test is checking"
     );
 
     // The honest-failure path itself (design spec §3): calibrate_quartz on
@@ -1150,7 +1182,7 @@ fn cal_wizard_capture_on_simulate_snr0_yields_honest_failure() {
 /// Task 8b's own addition: the clean-signal (`snr: 30.0`) sibling of
 /// `cal_wizard_capture_on_simulate_snr0_yields_honest_failure` above — see
 /// that fn's doc comment for the full shared context (setup shape, the
-/// 45s-sleep/300s-minimum rationale, `SESSION_WRITER_TEST_LOCK`). Pins the
+/// polled-capture/300s-minimum rationale, `SESSION_WRITER_TEST_LOCK`). Pins the
 /// SPECIFIC outcome Task 8b exists to close: pre-Task-8b, this exact signal
 /// silently returned `Ok(QuartzCalResult { ppm: -1.05, residual_ppm: 1.13,
 /// events: 381, .. })` — a plausible bogus ppm from a mechanical watch,
@@ -1211,9 +1243,8 @@ fn cal_wizard_capture_on_simulate_snr30_yields_honest_not_quartz() {
     );
 
     // Let enough SIMULATED audio accumulate to clear calibrate_quartz's own
-    // 300s minimum — see the sibling fn's doc comment for how 45s was
-    // chosen.
-    std::thread::sleep(std::time::Duration::from_secs(45));
+    // 300s minimum — polled, not slept (see the sibling fn's doc comment).
+    wait_for_captured_sim_seconds(&wav_path, 305.0);
 
     eng.send(ControlMsg::StopRecording);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1233,10 +1264,10 @@ fn cal_wizard_capture_on_simulate_snr30_yields_honest_not_quartz() {
     let duration_s = reader.samples.len() as f64 / reader.sample_rate_hz;
     assert!(
         duration_s >= 300.0,
-        "only captured {duration_s:.1}s of simulated audio (need >= 300s) — turbo \
-         throughput on this machine is lower than the ~9.8 sim-s/real-s this test's 45s \
-         sleep budget assumed; calibrate_quartz would report TooShort here, not NotQuartz, \
-         which is not what this test is checking"
+        "only captured {duration_s:.1}s of simulated audio (need >= 300s) despite the \
+         polled wait reporting success — the WAV shrank or the finalize dropped samples; \
+         calibrate_quartz would report TooShort here, not NotQuartz, which is not what \
+         this test is checking"
     );
 
     // The exact silent-wrong path Task 8b closes (task-8b-brief.md): a
