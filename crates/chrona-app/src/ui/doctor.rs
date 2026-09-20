@@ -253,6 +253,12 @@ enum PendingCapture {
         step: DoctorStep,
         started: Instant,
         seconds: f64,
+        /// The `ControlMsg::DoctorCapture::id` this request was sent with —
+        /// Phase 1 adopts only a snapshot buffer echoing this exact id (see
+        /// `pending_capturing_step`), which is what makes the engine's
+        /// LATCHED delivery safe: a still-latched buffer from a cancelled
+        /// or older request can never be misattributed to this step.
+        id: u64,
     },
     Analyzing {
         step: DoctorStep,
@@ -260,22 +266,27 @@ enum PendingCapture {
     },
 }
 
-/// The step whose buffer a `doctor_capture` arrival should be handed off
-/// to this frame, if any — `None` whenever `pending` isn't `Some(
-/// Capturing{..})`. That covers three cases: nothing pending at all, a
-/// step already past capturing and into `Analyzing`, and — the case fix
-/// round 1 (post-review) adds Cancel for — right after a Cancel cleared
-/// `pending` back to `None`.
+/// The step a `doctor_capture` arrival tagged `buffer_id` should be handed
+/// off to this frame, if any — `None` whenever `pending` isn't `Some(
+/// Capturing{..})` OR the ids don't match. The state cases cover: nothing
+/// pending at all, a step already past capturing and into `Analyzing`, and
+/// — the case fix round 1 (post-review) adds Cancel for — right after a
+/// Cancel cleared `pending` back to `None`. The ID case closes what the
+/// final review called the cancel-then-run-other misattribution window:
+/// with the engine's LATCHED delivery, a buffer from a cancelled/older
+/// request can still be sitting on every snapshot when a NEW step starts
+/// capturing — the id mismatch keeps this fn returning `None` for it, so
+/// the new step only ever adopts its own audio.
 ///
 /// This is the ENTIRE safety argument for Cancel being a purely panel-side
 /// decision with no matching engine-side "cancel" message: a cancelled
-/// request's buffer, however late the engine eventually publishes it,
-/// arrives to find this fn returning `None` and is silently ignored by
+/// request's buffer, however long the engine latches it, arrives to find
+/// this fn returning `None` and is silently ignored by
 /// `render_doctor_panel`'s Phase 1 — never fabricated into a report for a
 /// step nobody is waiting on. PURE, tested in `tests` below.
-fn pending_capturing_step(pending: &Option<PendingCapture>) -> Option<DoctorStep> {
+fn pending_capturing_step(pending: &Option<PendingCapture>, buffer_id: u64) -> Option<DoctorStep> {
     match pending {
-        Some(PendingCapture::Capturing { step, .. }) => Some(*step),
+        Some(PendingCapture::Capturing { step, id, .. }) if *id == buffer_id => Some(*step),
         _ => None,
     }
 }
@@ -299,6 +310,10 @@ pub struct DoctorPanel {
     /// The `EngineSnapshot::source_generation` last observed — see the
     /// module doc comment's honesty "stale setup" rule.
     last_source_generation: u64,
+    /// Monotonic counter for `ControlMsg::DoctorCapture::id` — incremented
+    /// before each Run so every request this panel ever sends carries a
+    /// distinct id (`Default` starts at 0; the first request is 1).
+    next_capture_id: u64,
 }
 
 impl DoctorPanel {
@@ -363,8 +378,8 @@ pub fn render_doctor_panel(
     // `ui::cal_wizard`'s own Capturing -> Analyzing handoff. Also the
     // "ignore a cancelled request's late buffer" guard — see `pending_
     // capturing_step`'s doc comment.
-    if let Some(step) = pending_capturing_step(&panel.pending)
-        && let Some((samples, sample_rate_hz)) = dctx.snap.doctor_capture.clone()
+    if let Some((buffer_id, samples, sample_rate_hz)) = dctx.snap.doctor_capture.clone()
+        && let Some(step) = pending_capturing_step(&panel.pending, buffer_id)
     {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -463,11 +478,14 @@ fn apply_doctor_action(action: DoctorAction, panel: &mut DoctorPanel, engine: &E
             // refuses to double-start if that's ever bypassed.
             if panel.pending.is_none() {
                 let seconds = step.capture_seconds();
-                engine.send(ControlMsg::DoctorCapture { seconds });
+                panel.next_capture_id += 1;
+                let id = panel.next_capture_id;
+                engine.send(ControlMsg::DoctorCapture { seconds, id });
                 panel.pending = Some(PendingCapture::Capturing {
                     step,
                     started: Instant::now(),
                     seconds,
+                    id,
                 });
             }
         }
@@ -593,6 +611,7 @@ fn render_step_row(
             step: s,
             started,
             seconds,
+            ..
         }) if *s == step => Some((*started, *seconds)),
         _ => None,
     };
@@ -935,25 +954,36 @@ mod tests {
     #[test]
     fn pending_capturing_step_ignores_everything_but_a_matching_capturing_step() {
         assert_eq!(
-            pending_capturing_step(&None),
+            pending_capturing_step(&None, 7),
             None,
             "nothing pending (including right after a Cancel): ignore"
         );
+        let capturing = Some(PendingCapture::Capturing {
+            step: DoctorStep::Tick,
+            started: Instant::now(),
+            seconds: 10.0,
+            id: 7,
+        });
         assert_eq!(
-            pending_capturing_step(&Some(PendingCapture::Capturing {
-                step: DoctorStep::Tick,
-                started: Instant::now(),
-                seconds: 10.0,
-            })),
+            pending_capturing_step(&capturing, 7),
             Some(DoctorStep::Tick),
-            "actively capturing Tick: consume for Tick"
+            "actively capturing Tick with the MATCHING id: consume for Tick"
+        );
+        assert_eq!(
+            pending_capturing_step(&capturing, 6),
+            None,
+            "a still-latched buffer from an OLDER request (id mismatch): ignore — \
+             the cancel-then-run-other misattribution guard"
         );
         let (_tx, rx) = mpsc::channel();
         assert_eq!(
-            pending_capturing_step(&Some(PendingCapture::Analyzing {
-                step: DoctorStep::Agc,
-                rx,
-            })),
+            pending_capturing_step(
+                &Some(PendingCapture::Analyzing {
+                    step: DoctorStep::Agc,
+                    rx,
+                }),
+                7
+            ),
             None,
             "already past Capturing into Analyzing: ignore (nothing left to hand off)"
         );

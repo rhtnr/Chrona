@@ -133,16 +133,33 @@ pub enum ControlMsg {
     /// samples at all, so a request against it simply never completes — an
     /// honest "no data yet", never a fabricated one.
     ///
-    /// One-shot: the completed buffer is attached to EXACTLY the next
-    /// published `EngineSnapshot::doctor_capture`, then cleared back to
-    /// `None` on every publish after that (`engine_loop`'s `doctor_ready.
-    /// take()`). Overlapping requests: a second `DoctorCapture` arriving
-    /// before the first has completed (or been delivered) discards whatever
-    /// the first had accumulated/finished and restarts against its own
-    /// `seconds` — see `engine_loop`'s handler, the one place this is
+    /// LATCHED delivery: the completed buffer is attached, tagged with this
+    /// request's `id`, to EVERY published `EngineSnapshot::doctor_capture`
+    /// until a newer `DoctorCapture` supersedes it or a successful
+    /// `SwitchSource` discards it. It was one-shot originally — attached to
+    /// exactly one snapshot — but a one-shot window is a single ~100 ms
+    /// publish interval, and BOTH known consumers can miss it: the first CI
+    /// run proved a 5 ms-polling test loses the race under scheduler
+    /// contention, and the real UI's frame-rate polling has the same
+    /// exposure across a stalled frame (the panel would sit "finishing up"
+    /// until Cancel). Latching removes the deadline; the `id` echo is what
+    /// makes latching SAFE on the consumer side — `ui::doctor` only adopts
+    /// a buffer whose id matches the request it has pending, so a stale
+    /// latched buffer from a cancelled/older request can never be
+    /// misattributed to a newer step (the final review's "generation tag"
+    /// fix, closing its cancel-then-run-other window exactly).
+    ///
+    /// Overlapping requests: a second `DoctorCapture` arriving before the
+    /// first has completed (or while its result is still latched) discards
+    /// the older accumulation/result and restarts against its own
+    /// `seconds`/`id` — see `engine_loop`'s handler, the one place this is
     /// applied.
     DoctorCapture {
         seconds: f64,
+        /// Caller-chosen tag echoed in `EngineSnapshot::doctor_capture`.
+        /// `ui::doctor` uses a monotonically increasing counter; the engine
+        /// treats it as opaque.
+        id: u64,
     },
     /// M4 Task 11 (spec §6): toggles the "Scope" view. `true` makes every
     /// subsequent publish call `Analyzer::beat_scope` once per tick and
@@ -238,19 +255,20 @@ pub struct EngineSnapshot {
     pub recording: Option<PathBuf>,
     pub banner: Option<Banner>,
     /// M4 Task 10 (Mic Doctor): the completed `ControlMsg::DoctorCapture`
-    /// buffer, `(samples, sample_rate_hz)` — bundled as one tuple rather
-    /// than a parallel `doctor_capture_sr` field so the two can never
-    /// desync (e.g. a stale sample rate surviving next to a `None`
-    /// buffer). `Arc`, not a plain `Vec`, so cloning a snapshot (every
-    /// `publish`, and `Engine::snapshot()`'s own `.clone()`) shares the one
-    /// allocation instead of deep-copying up to 30s of audio. `Some` on
-    /// EXACTLY the one snapshot published right after the requested length
-    /// was reached, `None` on every other — see `ControlMsg::
-    /// DoctorCapture`'s doc comment for the full one-shot contract. Relies
-    /// on `publish`'s existing `request_repaint()` (fired on every publish,
-    /// unconditionally) to give the UI a real chance to observe that one
-    /// snapshot rather than skip over it.
-    pub doctor_capture: Option<(Arc<Vec<f32>>, f64)>,
+    /// buffer, `(request_id, samples, sample_rate_hz)` — bundled as one
+    /// tuple rather than parallel fields so the three can never desync.
+    /// `Arc`, not a plain `Vec`, so cloning a snapshot (every `publish`,
+    /// and `Engine::snapshot()`'s own `.clone()`) shares the one
+    /// allocation instead of deep-copying up to 30s of audio. LATCHED:
+    /// `Some` on every snapshot from completion until a newer
+    /// `DoctorCapture` supersedes it or a successful `SwitchSource`
+    /// discards it — see `ControlMsg::DoctorCapture`'s doc comment for why
+    /// (a one-shot window proved missable under scheduler contention) and
+    /// for the `id` echo that makes latching safe to consume. Memory note:
+    /// the latch holds the last capture (typically ≤2 MB for the Doctor's
+    /// 5–10 s steps, ≤5.8 MB at the 30 s clamp) until superseded/discarded
+    /// — one buffer, shared by `Arc`, never stacked.
+    pub doctor_capture: Option<(u64, Arc<Vec<f32>>, f64)>,
     /// M4 Task 11 (spec §6, "Scope" view): the newest ≤16 per-beat waveform
     /// windows, refreshed on every publish while the view is open —
     /// `Some` (possibly empty, e.g. before the analyzer has ever folded)
@@ -1091,6 +1109,9 @@ fn push_tee(writer: &mut Option<SessionWriter>, samples: &[f32]) -> Option<Strin
 /// — see `EngineSnapshot::source_generation`'s doc comment) rather than let
 /// a buffer silently splice old-source audio with new-source audio.
 struct DoctorCaptureState {
+    /// The request's caller-chosen tag, echoed on delivery — see
+    /// `ControlMsg::DoctorCapture::id`.
+    id: u64,
     buffer: Vec<f32>,
     target_len: usize,
     sample_rate_hz: f64,
@@ -1218,12 +1239,13 @@ fn engine_loop(
     let mut writer: Option<SessionWriter> = None;
     let mut recording_path: Option<PathBuf> = None;
     // M4 Task 10 (Mic Doctor): `doctor_capture` accumulates the in-flight
-    // `ControlMsg::DoctorCapture` request, if any; `doctor_ready` holds a
-    // just-completed one until the next `publish` attaches it to exactly
-    // one `EngineSnapshot` and clears it via `.take()` — see both fields'
-    // doc comments on `EngineSnapshot`/`DoctorCaptureState`.
+    // `ControlMsg::DoctorCapture` request, if any; `doctor_ready` LATCHES a
+    // completed one — every publish attaches a clone (cheap: the samples
+    // are behind an `Arc`) until a newer request or a source switch clears
+    // it — see both fields' doc comments on
+    // `EngineSnapshot`/`DoctorCaptureState`.
     let mut doctor_capture: Option<DoctorCaptureState> = None;
-    let mut doctor_ready: Option<(Arc<Vec<f32>>, f64)> = None;
+    let mut doctor_ready: Option<(u64, Arc<Vec<f32>>, f64)> = None;
     // M4 Task 11 (spec §6): whether the "Scope" view is open — see
     // `ControlMsg::SetScope`'s doc comment. Not reset on `SwitchSource`
     // (same as `lift_angle_deg`/`averaging_s`): it's a UI-level display
@@ -1494,19 +1516,20 @@ fn engine_loop(
                     }
                     recording_path = None;
                 }
-                ControlMsg::DoctorCapture { seconds } => {
+                ControlMsg::DoctorCapture { seconds, id } => {
                     // Defensive clamp (task brief) — see MIN/MAX_DOCTOR_
                     // CAPTURE_S's own doc comment.
                     let seconds = seconds.clamp(MIN_DOCTOR_CAPTURE_S, MAX_DOCTOR_CAPTURE_S);
                     let sr = source.sample_rate_hz();
                     let target_len = ((seconds * sr).round() as usize).max(1);
                     doctor_capture = Some(DoctorCaptureState {
+                        id,
                         buffer: Vec::with_capacity(target_len),
                         target_len,
                         sample_rate_hz: sr,
                     });
                     // "Second replaces first" (task brief) covers a
-                    // not-yet-delivered completed capture too, not just an
+                    // still-latched completed capture too, not just an
                     // in-progress accumulation — a fresh request supersedes
                     // either.
                     doctor_ready = None;
@@ -1535,9 +1558,11 @@ fn engine_loop(
             // M4 Task 10: once the in-progress capture's buffer has reached
             // its target length, hand it off to `doctor_ready` (`Arc`'d
             // here, once, so every later `EngineSnapshot::clone()` shares
-            // this one allocation rather than deep-copying it) — the next
-            // publish below attaches it to exactly that one snapshot, via
-            // `doctor_ready.take()`.
+            // this one allocation rather than deep-copying it). LATCHED:
+            // every publish from here on attaches it (id-tagged) until a
+            // newer request or a source switch clears it — see
+            // `ControlMsg::DoctorCapture`'s doc comment for why one-shot
+            // delivery proved missable.
             if doctor_capture
                 .as_ref()
                 .is_some_and(|c| c.buffer.len() >= c.target_len)
@@ -1545,7 +1570,11 @@ fn engine_loop(
                 let finished = doctor_capture
                     .take()
                     .expect("is_some_and above just proved this is Some");
-                doctor_ready = Some((Arc::new(finished.buffer), finished.sample_rate_hz));
+                doctor_ready = Some((
+                    finished.id,
+                    Arc::new(finished.buffer),
+                    finished.sample_rate_hz,
+                ));
             }
 
             // System-clock skew cross-check (binding spec §3.4, M4 Task 7):
@@ -1619,7 +1648,7 @@ fn engine_loop(
                         health,
                         recording: recording_path.clone(),
                         banner: banner.clone(),
-                        doctor_capture: doctor_ready.take(),
+                        doctor_capture: doctor_ready.clone(),
                         source_generation,
                         scope,
                     },

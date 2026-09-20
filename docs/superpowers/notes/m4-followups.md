@@ -86,6 +86,13 @@ to what's still open from earlier milestones. **M5 planning starts here.**
    panel checks exactly, not just "is some step pending") would close this precisely
    instead of relying on the ~100 ms window being narrow in practice. See `ui/doctor.rs`'s
    module doc comment ("Cancel (fix round 1, post-review)") and `pending_capturing_step`.
+   **DISCHARGED post-merge (commit `poll/latch fix`, 2026-09-20):** the first CI run
+   proved the one-shot delivery window itself was missable under scheduler contention
+   (macOS lost the race at 5 ms polling — and a stalled UI frame has the same exposure),
+   so the fix went further than this item asked: `DoctorCapture` now carries the
+   per-request `id`, delivery is LATCHED (attached to every snapshot until superseded or
+   the source switches), and `pending_capturing_step` consumes only an exact id match —
+   closing both the misattribution window described here AND the missed-delivery hang.
 8. **Overrun banner always says "1 buffer overrun(s)".** `ui::controls::CountWatermark`
    (used for both the clip and overrun trackers, `app.rs`'s `clip_tracker`/
    `overrun_tracker`) returns a 0/1 "is this still current" placeholder, not a real
